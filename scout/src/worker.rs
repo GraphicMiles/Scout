@@ -218,11 +218,22 @@ impl WorkerState {
                 crate::adapters::youtube::extract(page, limit, &self.cfg.youtube_hosts)?
             }
         };
+        // Page-level warnings travel with the extraction too. A caller that
+        // only ever calls /v1/extract must still be told when the page is a
+        // JS shell that rendered nothing or a sign-in wall, instead of
+        // receiving an empty result with no explanation.
+        let mut all = page.warnings.clone();
+        for w in warnings {
+            if !all.contains(&w) {
+                all.push(w);
+            }
+        }
+
         // The page identity travels with the result so the caller never has to
         // ask a second time (and never has to guess).
         Ok(json!({
             "data": data,
-            "warnings": warnings,
+            "warnings": all,
             "page": { "url": page.url, "status": page.status },
         }))
     }
@@ -378,14 +389,44 @@ fn js_warnings(doc: &scraper::Html) -> Vec<Value> {
         })
         .unwrap_or(false);
 
-    if (scripts > 0 && visible < 200) || noscript_needs_js {
-        vec![json!({
+    let links = selector::compile("a[href]")
+        .ok()
+        .map(|s| doc.select(&s).count())
+        .unwrap_or(0);
+    let password_fields = selector::compile("input[type=password]")
+        .ok()
+        .map(|s| doc.select(&s).count())
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+
+    // A script-heavy page that rendered nothing is a shell: the content
+    // arrives over fetch/XHR after load, which Scout does not execute. An
+    // empty extraction that looks like "a page with nothing on it" is the one
+    // result a caller cannot safely act on, so it is named.
+    if scripts >= 5 && visible < 1_000 && links == 0 {
+        out.push(json!({
+            "code": "js_shell_not_rendered",
+            "message": "The page ran its scripts but rendered no links or content. It almost                         certainly builds its DOM from fetch/XHR after load, which Scout does not                         execute: there is no in-page fetch and no event loop. Any extraction from                         this page is empty, not authoritative."
+        }));
+    } else if (scripts > 0 && visible < 200) || noscript_needs_js {
+        out.push(json!({
             "code": "js_required_likely",
             "message": "Page appears to render its content with JavaScript. Scout runs page scripts against the parsed document and rebuilds it, but there is no event loop, no in-page fetch and no layout, so some content may still be missing.",
-        })]
-    } else {
-        Vec::new()
+        }));
     }
+
+    // A thin page whose only form is a credential form is a sign-in wall, not
+    // a broken extraction. Saying so is both more useful and more honest, and
+    // Scout does not attempt to get past it.
+    if password_fields > 0 && visible < 3_000 && links < 60 {
+        out.push(json!({
+            "code": "auth_wall_likely",
+            "message": "This page appears to be a sign-in wall. Scout does not bypass                         authentication, access controls or anti-bot protections; supply an                         authenticated session or target a page that does not require one."
+        }));
+    }
+
+    out
 }
 
 /// A pool of worker threads; sessions are pinned to one by index.
