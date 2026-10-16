@@ -10,7 +10,7 @@ use crate::security::{guarded_fetch, FetchRequest, Fetched};
 use crate::session::{Session, SessionManager};
 use crate::tasks::TaskManager;
 use crate::validate::{clamp_timeout, ExtractReq, InteractReq, NavigateReq, TaskReq};
-use crate::worker::{Cmd, StrategySpec, WorkerPool};
+use crate::worker::{Cmd, ScriptSource, StrategySpec, WorkerPool};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -145,15 +145,117 @@ impl Scout {
         let fetched = self.fetch(session, nav, timeout, abort).await?;
 
         // Parsing and DOM construction happen on the page worker.
-        let mut collected: Vec<(String, String)> = Vec::new();
-        let _ = &mut collected;
-        self.workers
+        let loaded = self
+            .workers
             .call(worker, |reply| Cmd::Load {
                 session: session.id.clone(),
                 fetched: Box::new(fetched),
                 reply,
             })
+            .await?;
+
+        if loaded.scripts.is_empty() {
+            return Ok(loaded.summary);
+        }
+
+        // External scripts are fetched on the async side through the same
+        // guarded client as the document, so the SSRF policy applies to them
+        // too rather than being bypassed by a page that loads its own code.
+        let bodies = self
+            .fetch_scripts(session, &loaded.summary, &loaded.scripts, timeout, abort)
+            .await;
+
+        let mut summary = loaded.summary;
+        match self
+            .workers
+            .call(worker, |reply| Cmd::RunScripts {
+                session: session.id.clone(),
+                scripts: bodies,
+                reply,
+            })
             .await
+        {
+            Ok(js) => {
+                if let Some(obj) = summary.as_object_mut() {
+                    obj.insert("js".into(), js);
+                }
+            }
+            // A page stays usable even when its scripts cannot run; the
+            // failure is reported alongside the document, not instead of it.
+            Err(e) => {
+                if let Some(obj) = summary.as_object_mut() {
+                    obj.insert("js".into(), json!({ "error": e.message }));
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Fetch a page's external scripts through the guarded client.
+    ///
+    /// A script that cannot be fetched becomes an empty body rather than
+    /// failing the navigation: one missing analytics bundle must not make an
+    /// otherwise readable page unreadable.
+    async fn fetch_scripts(
+        &self,
+        session: &Session,
+        summary: &Value,
+        scripts: &[ScriptSource],
+        timeout_ms: u64,
+        abort: &Abort,
+    ) -> Vec<String> {
+        let base = summary.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let mut budget = self.cfg.js_max_script_bytes;
+        let mut out = Vec::with_capacity(scripts.len());
+
+        for script in scripts {
+            match script {
+                ScriptSource::Inline(body) => out.push(body.clone()),
+                ScriptSource::External(src) => {
+                    let joined = match url::Url::parse(base).and_then(|b| b.join(src)) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            out.push(String::new());
+                            continue;
+                        }
+                    };
+                    if budget == 0 {
+                        out.push(String::new());
+                        continue;
+                    }
+                    let cookie_header = session.jar.header_for(joined.as_str());
+                    let mut set_cookies: Vec<(String, String)> = Vec::new();
+                    let fut = guarded_fetch(
+                        &self.cfg,
+                        &self.client,
+                        FetchRequest {
+                            url: joined.as_str(),
+                            method: "GET",
+                            headers: Vec::new(),
+                            body: None,
+                            cookie_header,
+                            set_cookies: Some(&mut set_cookies),
+                            timeout_ms,
+                            max_bytes: budget.min(self.cfg.max_response_bytes),
+                        },
+                    );
+                    let res = tokio::select! {
+                        biased;
+                        _ = abort.token().cancelled() => Err(abort.reason()),
+                        r = fut => r,
+                    };
+                    match res {
+                        Ok(f) if f.status < 400 => {
+                            budget = budget.saturating_sub(f.bytes);
+                            session.jar.store_set_cookies(&f.url, &set_cookies);
+                            out.push(f.body);
+                        }
+                        _ => out.push(String::new()),
+                    }
+                }
+            }
+        }
+        out
     }
 
     async fn fetch(
