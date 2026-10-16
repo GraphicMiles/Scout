@@ -450,6 +450,25 @@ async fn navigate(State(state): State<AppState>, req: Request<Body>) -> Result<R
     Ok(Json(out?).into_response())
 }
 
+/// A request that is not a page load: the session signs in once, and then this
+/// addresses an API on that origin with the session cookie attached.
+async fn request(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
+    let owner = owner_of(&req);
+    let body = read_json(req, state.cfg.max_body_bytes).await?;
+    let rr = crate::validate::request(&body, &state.cfg)?;
+    let st = &state;
+    let out = st
+        .scout
+        .tasks
+        .run_inline(None, None, |abort| {
+            let owner = owner.clone();
+            let rr = rr.clone();
+            async move { st.scout.request(&owner, rr, &abort).await }
+        })
+        .await;
+    Ok(Json(out?).into_response())
+}
+
 async fn extract(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
     let owner = owner_of(&req);
     let body = read_json(req, state.cfg.max_body_bytes).await?;
@@ -581,6 +600,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/:id", delete(destroy_session))
         .route("/v1/navigate", post(navigate))
+        .route("/v1/request", post(request))
         .route("/v1/extract", post(extract))
         .route("/v1/interact", post(interact))
         .route("/v1/eval", post(eval))

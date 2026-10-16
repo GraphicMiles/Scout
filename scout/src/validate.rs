@@ -159,6 +159,79 @@ pub fn navigate(v: &Value, _cfg: &Config) -> Result<NavigateReq> {
     })
 }
 
+/// One authenticated request that is *not* a navigation: the session's cookies
+/// go out, the SSRF policy applies, and the body comes back as it was sent
+/// instead of being parsed into a document.
+#[derive(Debug, Clone)]
+pub struct RequestReq {
+    pub url: String,
+    pub session_id: Option<String>,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub content_type: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+const REQUEST_METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+pub fn request(v: &Value, _cfg: &Config) -> Result<RequestReq> {
+    let m = obj(v, "body")?;
+    unknown(
+        m,
+        &["url", "sessionId", "method", "headers", "body", "contentType", "timeoutMs"],
+        "body",
+    )?;
+    let url = opt_str(m, "url")?.ok_or_else(|| ScoutError::invalid("\"url\" is required"))?;
+    if url.trim().is_empty() {
+        return Err(ScoutError::invalid("\"url\" must not be empty"));
+    }
+    let method = opt_str(m, "method")?
+        .unwrap_or_else(|| "GET".into())
+        .to_ascii_uppercase();
+    if !REQUEST_METHODS.contains(&method.as_str()) {
+        return Err(ScoutError::invalid(format!(
+            "\"method\" must be one of {}",
+            REQUEST_METHODS.join(", ")
+        ))
+        .with_details(serde_json::json!({ "field": "method" })));
+    }
+    let headers = match m.get("headers") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(map)) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (k, val) in map {
+                let v = val
+                    .as_str()
+                    .ok_or_else(|| ScoutError::invalid(format!("header \"{k}\" must be a string")))?;
+                if k.trim().is_empty() {
+                    return Err(ScoutError::invalid("a header name must not be empty"));
+                }
+                out.push((k.clone(), v.to_string()));
+            }
+            out
+        }
+        Some(_) => return Err(ScoutError::invalid("\"headers\" must be an object")),
+    };
+    // A body is only meaningful on a method that carries one; refusing the
+    // combination is cheaper than silently dropping what the caller sent.
+    let body = opt_str(m, "body")?;
+    if body.is_some() && matches!(method.as_str(), "GET" | "HEAD") {
+        return Err(ScoutError::invalid(format!(
+            "{method} does not take a body; use POST, PUT or PATCH"
+        )));
+    }
+    Ok(RequestReq {
+        url,
+        session_id: session_id(m, false)?,
+        method,
+        headers,
+        body,
+        content_type: opt_str(m, "contentType")?,
+        timeout_ms: opt_u64(m, "timeoutMs")?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractReq {
     pub url: Option<String>,

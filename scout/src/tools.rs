@@ -50,6 +50,33 @@ pub fn manifest() -> Value {
     let tools = vec![
         tool("session.create", "Create an isolated browsing session with its own cookie jar. Sessions never share cookies or credentials.", json!({}), &[]),
         tool("session.destroy", "Destroy a session and release its DOM, jar and worker slot.", json!({ "sessionId": sid() }), &["sessionId"]),
+        tool("session.export", "Export the session's cookies and current document, so a signed-in session can be saved and resumed later.", json!({ "sessionId": sid() }), &["sessionId"]),
+        tool("session.import", "Restore cookies exported by session.export into a session, so an existing signed-in session can be resumed without replaying a login.", json!({
+            "sessionId": sid(),
+            "url": { "type": "string", "description": "An origin URL the cookies are scoped to, e.g. https://example.com/" },
+            "cookies": { "type": "array", "description": "Cookie objects as produced by session.export" }
+        }), &["sessionId", "url", "cookies"]),
+        tool("auth.login", "Sign in to a site with credentials the operator supplies: loads the login page, fills the form, submits it and reports whether a session was actually issued. Does not solve CAPTCHAs or second factors.", json!({
+            "sessionId": sid(),
+            "url": { "type": "string", "description": "The sign-in page" },
+            "username": { "type": "string" },
+            "password": { "type": "string" },
+            "usernameSelector": { "type": "string", "description": "Override the discovered username field" },
+            "passwordSelector": { "type": "string", "description": "Override the discovered password field" },
+            "submitSelector": { "type": "string", "description": "Element whose form is submitted; defaults to the password field's form" },
+            "usernameIndex": { "type": "integer", "minimum": 0 },
+            "passwordIndex": { "type": "integer", "minimum": 0 },
+            "fields": { "type": "object", "description": "Extra fields as selector -> value" }
+        }), &["sessionId", "url", "username", "password"]),
+        tool("request", "Make an HTTP request with the session's cookies and the SSRF policy applied, and return the response instead of parsing it into a page. This is the primitive for authenticated reads and writes on an API.", json!({
+            "sessionId": sid(),
+            "url": { "type": "string", "format": "uri" },
+            "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+            "headers": { "type": "object", "description": "Extra request headers" },
+            "body": { "type": "string" },
+            "contentType": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 }
+        }), &["url"]),
         tool("navigate", "Navigate a session to a URL. Page scripts run and the DOM is rebuilt before this returns.", json!({
             "sessionId": sid(),
             "url": { "type": "string", "format": "uri" },
@@ -176,6 +203,66 @@ pub async fn call(
                     async move { scout.extract(&owner, er, &a).await }
                 })
                 .await?
+        }
+
+        "request" => {
+            let mut body = json!({ "url": str_arg("url")? });
+            for key in ["sessionId", "method", "headers", "body", "contentType", "timeoutMs"] {
+                if let Some(v) = obj.get(key) {
+                    body[key] = v.clone();
+                }
+            }
+            let rr = validate::request(&body, &scout.cfg)?;
+            scout
+                .tasks
+                .run_inline(None, None, |a| {
+                    let rr = rr.clone();
+                    let owner = owner.to_string();
+                    async move { scout.request(&owner, rr, &a).await }
+                })
+                .await?
+        }
+
+        "auth.login" => crate::auth::login(scout, owner, &args, abort).await?,
+
+        "session.export" => {
+            let session = scout.sessions.get(owner, &str_arg("sessionId")?)?;
+            json!({
+                "sessionId": session.id,
+                "referrer": session.referrer(),
+                "cookies": session.jar.cookies()
+            })
+        }
+        "session.import" => {
+            let session = scout.sessions.get(owner, &str_arg("sessionId")?)?;
+            let url = str_arg("url")?;
+            let cookies = obj
+                .get("cookies")
+                .and_then(|c| c.as_array())
+                .ok_or_else(|| invalid("\"cookies\" must be an array as produced by session.export"))?;
+            let mut imported = 0usize;
+            for entry in cookies {
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let value = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                let mut raw = format!("{name}={value}; Path={path}");
+                if let Some(d) = entry.get("domain").and_then(|v| v.as_str()).filter(|d| !d.is_empty()) {
+                    raw.push_str(&format!("; Domain={d}"));
+                }
+                if entry.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    raw.push_str("; Secure");
+                }
+                if entry.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    raw.push_str("; HttpOnly");
+                }
+                if session.jar.set_cookie(&url, &raw) {
+                    imported += 1;
+                }
+            }
+            json!({ "ok": true, "imported": imported, "cookies": session.jar.len() })
         }
 
         "interact" => {

@@ -64,6 +64,33 @@ export class ScoutClient {
   getTask(id) { return this.#request('GET', `/v1/tasks/${id}`); }
   cancelTask(id) { return this.#request('POST', `/v1/tasks/${id}/cancel`, {}); }
 
+  /**
+   * A request that is not a page load: the session's cookies go out, the SSRF
+   * policy applies, and the response comes back unparsed. This is the primitive
+   * for reading and writing an API as an authenticated user.
+   */
+  request(params, opts) { return this.#request('POST', '/v1/request', params, opts?.signal); }
+
+  /** Discover the agent-facing tool layer. */
+  tools() { return this.#request('GET', '/v1/tools').then((r) => r.tools); }
+
+  /** Call one tool by name. */
+  callTool(name, args = {}, opts) {
+    return this.#request('POST', '/v1/tools/call', { name, arguments: args }, opts?.signal);
+  }
+
+  /**
+   * Sign in with credentials you are authorised to use, and get back the
+   * evidence: which cookies were issued, whether the sign-in form is still on
+   * the page, and what the landing page says. `looksAuthenticated` is a
+   * conclusion drawn from that evidence, not an assumption.
+   */
+  login(params, opts) { return this.callTool('auth.login', params, opts); }
+
+  /** Move a signed-in session somewhere it can be resumed. */
+  exportSession(sessionId) { return this.callTool('session.export', { sessionId }); }
+  importSession(sessionId, url, cookies) { return this.callTool('session.import', { sessionId, url, cookies }); }
+
   /** Create a session, run fn(sessionId), and always destroy the session afterwards. */
   async withSession(fn) {
     const s = await this.createSession();

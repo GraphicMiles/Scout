@@ -34,6 +34,48 @@ export type TaskStep =
 export interface TaskSpec { sessionId?: string; steps: TaskStep[]; timeoutMs?: number; retries?: number }
 export type TaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
 export interface Task { id: string; status: TaskStatus; createdAt: string; startedAt: string | null; finishedAt: string | null; result: { steps: unknown[]; data?: unknown } | null; error: { code: string; message: string; retryable: boolean; details?: unknown } | null }
+export interface RequestParams {
+  sessionId?: string;
+  url: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+  headers?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  timeoutMs?: number;
+}
+export interface RequestResult {
+  url: string;
+  status: number;
+  statusText: string;
+  contentType: string;
+  headers: Record<string, string>;
+  body: string;
+  bytes: number;
+  redirects: unknown[];
+}
+export interface LoginParams {
+  sessionId: string;
+  url: string;
+  username: string;
+  password: string;
+  usernameSelector?: string;
+  passwordSelector?: string;
+  submitSelector?: string;
+  usernameIndex?: number;
+  passwordIndex?: number;
+  fields?: Record<string, string>;
+}
+export interface LoginResult {
+  looksAuthenticated: boolean;
+  reason: string;
+  url: string | null;
+  title: string | null;
+  cookies: { before: number; after: number; added: string[] };
+  passwordFieldStillPresent: boolean;
+  landing: { url: string; title: string; passwordFields: number; inputs: number; text: string } | { error: string };
+  steps: unknown[];
+}
+export interface ToolDef { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface Strategy { name: string; description: string; status: 'verified-fixtures' | 'fixture-verified-only' | 'not_implemented'; reason?: string }
 export class ScoutApiError extends Error { status: number; code: string; retryable: boolean; details?: unknown; retryAfterSec?: number }
 export class ScoutClient {
@@ -48,6 +90,16 @@ export class ScoutClient {
 
   /** Execute JavaScript against the session's loaded page (read-only DOM snapshot). */
   eval(p: { sessionId: string; script: string }, o?: { signal?: AbortSignal }): Promise<EvalResult>;
+
+  /** A request with the session's cookies, returned unparsed, under the SSRF policy. */
+  request(p: RequestParams, o?: { signal?: AbortSignal }): Promise<RequestResult>;
+  /** Discover the agent-facing tool layer. */
+  tools(): Promise<ToolDef[]>;
+  callTool(name: string, args?: Record<string, unknown>, o?: { signal?: AbortSignal }): Promise<unknown>;
+  /** Sign in with credentials you are authorised to use; resolves with the evidence. */
+  login(p: LoginParams, o?: { signal?: AbortSignal }): Promise<LoginResult>;
+  exportSession(sessionId: string): Promise<{ sessionId: string; referrer: string | null; cookies: unknown[] }>;
+  importSession(sessionId: string, url: string, cookies: unknown[]): Promise<{ ok: true; imported: number; cookies: number }>;
   submitTask(spec: TaskSpec): Promise<Task>;
   getTask(id: string): Promise<Task>;
   cancelTask(id: string): Promise<Task>;

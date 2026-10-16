@@ -4,7 +4,7 @@
 //! so these tests also exercise `SCOUT_PRIVATE_ALLOWLIST` — the explicit operator
 //! opt-in for internal hosts.
 
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
@@ -86,7 +86,54 @@ async fn harness() -> Harness {
             } else {
                 Html("<html><body><h1>denied</h1></body></html>")
             }
-        }));
+        }))
+        // A sign-in flow: a form, a POST that only accepts one password, a
+        // cookie, and a page behind it.
+        .route("/login", get(|| async { Html(LOGIN_HTML) }))
+        .route("/session", post(|body: String| async move {
+            let good = body.contains("email=tester%40example.com") && body.contains("password=hunter2");
+            if !good {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    LOGIN_FAILED.to_string(),
+                )
+                    .into_response();
+            }
+            (
+                axum::http::StatusCode::SEE_OTHER,
+                [
+                    (axum::http::header::LOCATION, "/account".to_string()),
+                    (
+                        axum::http::header::SET_COOKIE,
+                        "sid=session-xyz; Path=/; HttpOnly".to_string(),
+                    ),
+                ],
+            )
+                .into_response()
+        }))
+        .route("/account", get(|headers: axum::http::HeaderMap| async move {
+            let c = headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if c.contains("sid=session-xyz") {
+                Html("<html><head><title>Account</title></head><body><h1>authorised</h1><p>Welcome back</p></body></html>")
+            } else {
+                Html(LOGIN_HTML)
+            }
+        }))
+        // A page whose content only exists after a fetch() resolves.
+        .route("/spa", get(|| async { Html(SPA_HTML) }))
+        // An authenticated JSON API, for the request tool to read and write.
+        .route("/api/items", get(|| async { axum::Json(json!({ "items": [1, 2, 3] })) })
+            .post(|body: String| async move {
+                (axum::http::StatusCode::CREATED, axum::Json(json!({ "created": body })))
+            }))
+        // Echoes the headers it received, so a test can assert on what Scout
+        // actually put on the wire.
+        .route(
+            "/headers",
+            get(|headers: axum::http::HeaderMap| async move { echo_headers(headers) })
+                .post(|headers: axum::http::HeaderMap| async move { echo_headers(headers) }),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fixture_addr: SocketAddr = listener.local_addr().unwrap();
@@ -143,6 +190,60 @@ const FIXTURE_HTML: &str = r#"<!doctype html>
   </form>
 </body>
 </html>"#;
+
+/// The headers a request arrived with, as JSON.
+fn echo_headers(headers: axum::http::HeaderMap) -> axum::Json<Value> {
+    let mut map = serde_json::Map::new();
+    for (k, v) in headers.iter() {
+        map.insert(k.as_str().to_ascii_lowercase(), json!(v.to_str().unwrap_or("")));
+    }
+    axum::Json(Value::Object(map))
+}
+
+/// A sign-in form with a CSRF token, which is what makes the flow a real one.
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html><head><title>Sign in</title></head>
+<body>
+  <h1>Sign in</h1>
+  <form id="login" method="post" action="/session">
+    <input type="hidden" name="csrf" value="t0ken">
+    <input type="email" name="email" id="email">
+    <input type="password" name="password" id="password">
+    <button type="submit">Sign in</button>
+  </form>
+</body></html>"#;
+
+/// The same form back again, which is what a real site does on a bad password.
+const LOGIN_FAILED: &str = r#"<!doctype html>
+<html><head><title>Sign in</title></head>
+<body>
+  <h1>Sign in</h1>
+  <p class="error">Wrong email or password.</p>
+  <form id="login" method="post" action="/session">
+    <input type="hidden" name="csrf" value="t0ken">
+    <input type="email" name="email" id="email">
+    <input type="password" name="password" id="password">
+    <button type="submit">Sign in</button>
+  </form>
+</body></html>"#;
+
+/// Nothing in the markup: the items only exist once the script's fetch returns.
+const SPA_HTML: &str = r#"<!doctype html>
+<html><head><title>SPA</title></head>
+<body>
+  <ul id="out"></ul>
+  <script>
+    fetch('/api/items').then(function (r) { return r.json(); }).then(function (d) {
+      var ul = document.getElementById('out');
+      d.items.forEach(function (n) {
+        var li = document.createElement('li');
+        li.className = 'item';
+        li.textContent = 'item-' + n;
+        ul.appendChild(li);
+      });
+    });
+  </script>
+</body></html>"#;
 
 // The fixture server must outlive each test, so it is started per-test above and
 // the keepalive task holds the runtime slot.
@@ -758,4 +859,339 @@ async fn javascript_executes_against_the_loaded_page() {
         .await;
     assert_eq!(status, 422, "{out}");
     assert_eq!(out["error"]["code"], "compatibility_error");
+}
+
+/// Signing in with credentials the operator owns, and then acting as that user:
+/// the session cookie, the pages behind the wall, and the API calls that go
+/// with them.
+mod auth_api {
+    use super::*;
+
+    async fn new_session(h: &Harness) -> String {
+        let (_, body) = h.post("/v1/sessions", json!({})).await;
+        body["id"].as_str().expect("session id").to_string()
+    }
+
+    async fn call(h: &Harness, name: &str, args: Value) -> (u16, Value) {
+        h.post("/v1/tools/call", json!({ "name": name, "arguments": args }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn login_with_valid_credentials_establishes_a_session() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (status, body) = call(
+            &h,
+            "auth.login",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/login", h.fixture),
+                "username": "tester@example.com",
+                "password": "hunter2"
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["looksAuthenticated"], json!(true), "{body}");
+        assert_eq!(body["cookies"]["added"], json!(["sid"]), "{body}");
+        assert_eq!(body["passwordFieldStillPresent"], json!(false));
+
+        // And the session is real: the page behind the wall is now readable.
+        let (_, nav) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/account", h.fixture) }),
+        )
+        .await;
+        assert_eq!(nav["status"], json!(200), "{nav}");
+        let (_, text) = call(&h, "page.text", json!({ "sessionId": sid })).await;
+        let text = text.to_string();
+        assert!(text.contains("authorised"), "expected the account page, got {text}");
+    }
+
+    #[tokio::test]
+    async fn login_with_wrong_credentials_is_refused_and_says_so() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (status, body) = call(
+            &h,
+            "auth.login",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/login", h.fixture),
+                "username": "tester@example.com",
+                "password": "not-the-password"
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "a refused login is a result, not an error: {body}");
+        assert_eq!(body["looksAuthenticated"], json!(false), "{body}");
+        assert_eq!(body["cookies"]["added"], json!([]), "{body}");
+        let reason = body["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("401"), "the refusal should name the status: {reason}");
+
+        // Nothing was signed in, so the wall is still there.
+        let (_, nav) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/account", h.fixture) }),
+        )
+        .await;
+        assert_eq!(nav["status"], json!(200));
+        let (_, forms) = call(&h, "page.forms", json!({ "sessionId": sid })).await;
+        assert!(
+            forms.to_string().contains("password"),
+            "an unsigned session must still see the sign-in form: {forms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exported_session_can_be_resumed_in_another_one() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, body) = call(
+            &h,
+            "auth.login",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/login", h.fixture),
+                "username": "tester@example.com",
+                "password": "hunter2"
+            }),
+        )
+        .await;
+        assert_eq!(body["looksAuthenticated"], json!(true), "{body}");
+
+        let (_, exported) = call(&h, "session.export", json!({ "sessionId": sid })).await;
+        let cookies = exported["cookies"].clone();
+        assert!(cookies.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+
+        let fresh = new_session(&h).await;
+        let (_, imported) = call(
+            &h,
+            "session.import",
+            json!({ "sessionId": fresh, "url": format!("{}/", h.fixture), "cookies": cookies }),
+        )
+        .await;
+        assert_eq!(imported["imported"], json!(1), "{imported}");
+
+        // No login in the new session: the imported cookie is enough.
+        let (_, nav) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": fresh, "url": format!("{}/account", h.fixture) }),
+        )
+        .await;
+        assert_eq!(nav["status"], json!(200));
+        let (_, text) = call(&h, "page.text", json!({ "sessionId": fresh })).await;
+        assert!(text.to_string().contains("authorised"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_request_tool_reads_and_writes_with_the_session_cookie() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+
+        // Sign in first: the API is behind the same session.
+        let (_, body) = call(
+            &h,
+            "auth.login",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/login", h.fixture),
+                "username": "tester@example.com",
+                "password": "hunter2"
+            }),
+        )
+        .await;
+        assert_eq!(body["looksAuthenticated"], json!(true), "{body}");
+
+        let (_, get) = call(
+            &h,
+            "request",
+            json!({ "sessionId": sid, "url": format!("{}/api/items", h.fixture) }),
+        )
+        .await;
+        assert_eq!(get["status"], json!(200), "{get}");
+        assert!(get["body"].as_str().unwrap_or("").contains("items"), "{get}");
+
+        let (_, created) = call(
+            &h,
+            "request",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/api/items", h.fixture),
+                "method": "POST",
+                "contentType": "application/json",
+                "body": "{\"name\":\"new\"}"
+            }),
+        )
+        .await;
+        assert_eq!(created["status"], json!(201), "{created}");
+        assert!(created["body"].as_str().unwrap_or("").contains("new"), "{created}");
+    }
+
+    #[tokio::test]
+    async fn a_request_carries_cookies_picked_up_earlier_in_the_session() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, _) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/setcookie", h.fixture) }),
+        )
+        .await;
+        let (_, out) = call(
+            &h,
+            "request",
+            json!({ "sessionId": sid, "url": format!("{}/needs-cookie", h.fixture) }),
+        )
+        .await;
+        assert_eq!(out["status"], json!(200), "{out}");
+        assert!(out["body"].as_str().unwrap_or("").contains("authorised"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_request_to_a_blocked_address_is_refused() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (status, body) = call(
+            &h,
+            "request",
+            json!({ "sessionId": sid, "url": "http://169.254.169.254/latest/meta-data/" }),
+        )
+        .await;
+        assert_ne!(status, 200);
+        assert_eq!(body["error"]["code"], json!("blocked_destination"), "{body}");
+    }
+}
+
+/// Page scripts that talk to the network, and the policy that still applies to
+/// them.
+mod page_network_api {
+    use super::*;
+
+    async fn new_session(h: &Harness) -> String {
+        let (_, body) = h.post("/v1/sessions", json!({})).await;
+        body["id"].as_str().expect("session id").to_string()
+    }
+
+    async fn call(h: &Harness, name: &str, args: Value) -> (u16, Value) {
+        h.post("/v1/tools/call", json!({ "name": name, "arguments": args }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_page_that_renders_itself_with_fetch_is_readable() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, nav) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/spa", h.fixture) }),
+        )
+        .await;
+        assert_eq!(nav["status"], json!(200), "{nav}");
+        assert_eq!(nav["js"]["scriptsRun"], json!(1), "{nav}");
+        assert_eq!(nav["js"]["network"]["requests"], json!(1), "{nav}");
+        assert!(nav["js"]["jobsRun"].as_u64().unwrap_or(0) >= 1, "{nav}");
+
+        // The fetched data is in the DOM, not just in the response.
+        let (_, text) = call(&h, "page.text", json!({ "sessionId": sid })).await;
+        let text = text.to_string();
+        assert!(text.contains("item-1") && text.contains("item-3"), "got {text}");
+    }
+
+    #[tokio::test]
+    async fn a_script_can_call_the_api_from_evaluate() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, _) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/", h.fixture) }),
+        )
+        .await;
+        let (_, out) = call(
+            &h,
+            "evaluate",
+            json!({
+                "sessionId": sid,
+                "script": "return fetch('/api/items').then(function (r) { return r.json(); }).then(function (d) { return d.items.length; });"
+            }),
+        )
+        .await;
+        assert_eq!(out["value"], json!(3), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_scripted_request_is_blocked_by_the_ssrf_policy() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, _) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/", h.fixture) }),
+        )
+        .await;
+        let (_, out) = call(
+            &h,
+            "evaluate",
+            json!({
+                "sessionId": sid,
+                "script": "return fetch('http://169.254.169.254/').then(function () { return 'reached'; }).catch(function (e) { return 'refused: ' + e.message; });"
+            }),
+        )
+        .await;
+        let value = out["value"].as_str().unwrap_or("").to_string();
+        assert!(value.starts_with("refused"), "the SSRF policy must apply to page scripts too: {value}");
+    }
+
+    #[tokio::test]
+    async fn requests_look_like_the_browser_the_runtime_stands_in_for() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        let (_, out) = call(
+            &h,
+            "request",
+            json!({ "sessionId": sid, "url": format!("{}/headers", h.fixture) }),
+        )
+        .await;
+        let body: Value = serde_json::from_str(out["body"].as_str().unwrap_or("{}")).unwrap_or(Value::Null);
+        let ua = body["user-agent"].as_str().unwrap_or("");
+        assert!(ua.contains("Chrome/"), "expected a browser UA, got {ua}");
+        assert!(body["sec-ch-ua"].as_str().unwrap_or("").contains("Chromium"), "{body}");
+        assert_eq!(body["sec-fetch-mode"], json!("cors"), "{body}");
+        assert_eq!(body["accept-language"], json!("en-US,en;q=0.8"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_form_post_carries_the_origin_and_referer_a_server_expects() {
+        let h = harness().await;
+        let sid = new_session(&h).await;
+        // Land on the page first, so the POST has somewhere to come from.
+        let (_, _) = call(
+            &h,
+            "navigate",
+            json!({ "sessionId": sid, "url": format!("{}/", h.fixture) }),
+        )
+        .await;
+        let (_, out) = call(
+            &h,
+            "request",
+            json!({
+                "sessionId": sid,
+                "url": format!("{}/headers", h.fixture),
+                "method": "POST",
+                "contentType": "application/x-www-form-urlencoded",
+                "body": "a=1"
+            }),
+        )
+        .await;
+        let body: Value = serde_json::from_str(out["body"].as_str().unwrap_or("{}")).unwrap_or(Value::Null);
+        assert_eq!(body["origin"], json!(h.fixture), "{body}");
+        assert_eq!(body["referer"], json!(format!("{}/", h.fixture)), "{body}");
+        assert_eq!(body["sec-fetch-site"], json!("same-origin"), "{body}");
+    }
 }

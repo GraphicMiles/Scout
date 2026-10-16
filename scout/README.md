@@ -115,17 +115,34 @@ page scripts now run **during navigation**:
 - `setTimeout`/`setInterval` run on a virtual clock: callbacks are queued and
   drained synchronously after the scripts, so deferred writes are captured
   without sleeping in real time.
-- Bounded by a wall-clock budget, a memory cap, a stack cap, a script-count cap
-  and a byte budget for fetched scripts. A runaway script is interrupted.
+- `fetch`, `XMLHttpRequest`, `Headers`, `Response` and `URLSearchParams` are
+  implemented over a host bridge that applies the *same* guarded client, cookie
+  jar, SSRF policy and byte caps as navigation. Requests are synchronous — there
+  is no event loop to suspend on — so the promise returned is already settled;
+  `await` and `.then` chains run because the host drains pending jobs after each
+  script, exactly as a browser drains its microtask queue. A scripted request to
+  a blocked address is refused (`fetch` rejects with a `TypeError`).
+- Bounded by a wall-clock budget, a memory cap, a stack cap, a script-count cap,
+  a byte budget for fetched scripts, a request budget (`SCOUT_JS_MAX_FETCHES`,
+  default 8) and a promise-job budget (`SCOUT_JS_JOB_BUDGET`, default 5 000).
+  A runaway script is interrupted.
 
-Still missing, and reported rather than papered over: no event loop driven by
-real I/O, no in-page `fetch`/`XMLHttpRequest`, no layout, no CSS cascade, no
-`IndexedDB`. A page whose content depends on those still reports
-`js_required_likely` rather than returning fabricated data.
+Still missing, and reported rather than papered over: no layout, no CSS cascade,
+no `IndexedDB`, no Web Workers, no ES module semantics. A page whose content
+depends on those still reports `js_required_likely` (or `js_shell_not_rendered`,
+when the document arrives as a shell with no links) rather than returning
+fabricated data.
 
-Measured cost of the JS engine: idle RSS **4.8 MB**, peak **6.3 MB** across 15
-JavaScript-rendered navigations, binary **5.2 MB** (`SCOUT_JS_ENABLED=0`
-restores the old read-only behaviour).
+Two differences from a browser worth knowing: CORS is **not** enforced — the
+request has already been through the SSRF policy and the session's own jar, so
+rejecting a cross-origin response would cost compatibility without adding
+safety, though `credentials` is still honoured; and response bodies are text, so
+an octet stream is decoded as UTF-8 and is lossy rather than faithful.
+
+Measured cost of the JS engine: idle RSS **5.0 MB**, peak **6.5 MB** across 15
+navigations that each ran a page script and an authenticated in-page `fetch`,
+binary **5.5 MB** (`SCOUT_JS_ENABLED=0` restores the old read-only behaviour;
+`SCOUT_JS_NETWORK=0` keeps the engine and refuses only the network).
 
 `POST /v1/eval` runs the script as a **function body**, so a value is returned only
 by an explicit `return`; a trailing expression's value is discarded.
@@ -143,6 +160,32 @@ anywhere in the source, no warning is raised, because a spurious warning would b
 worse than a missed one. A runaway script is an explicit `compatibility_error`
 ("JavaScript exceeded its time limit"), never a `null`.
 
+**Signed-in sessions.** A session can be authenticated with credentials the
+operator already owns, and then behaves like that user:
+
+- `auth.login` (tool) loads a sign-in page, discovers the password field and the
+  field above it, fills them, submits, and reports the *evidence* — which cookies
+  appeared, whether the sign-in form is still on the page, and what the landing
+  page says — rather than guessing that it worked.
+- Cookies are read before and written after every hop of a request, so a cookie
+  issued by a login `POST` is presented on the redirect that follows it. That is
+  what makes signing in possible at all.
+- `POST /v1/request` (and the `request` tool) makes a request with the session
+  jar and the SSRF policy applied and returns the response unparsed, which is the
+  primitive for authenticated reads and writes on a JSON API.
+- `session.export` / `session.import` move a signed-in session between sessions,
+  so it can be resumed without replaying the login.
+- Navigation carries the header set a browser sends — `Sec-Fetch-*`, client hints
+  derived from the configured UA, and `Referer`/`Origin` under
+  `strict-origin-when-cross-origin`. `SCOUT_BROWSER_HEADERS=0` turns that off and
+  `SCOUT_USER_AGENT` declares something else, because transparency about what is
+  on the wire matters more than getting in.
+
+None of this defeats a CAPTCHA, a second factor, a rate limit or an access
+control. A login a human could not complete with these credentials fails here
+too, and the failure is reported with the status and the evidence instead of
+being retried in the hope it works the second time.
+
 **Other honest limits.** The YouTube adapter reads the first page of results only
 (continuation requests are not made); price parsing handles US-style separators
 only; the cookie jar screens a curated public-suffix list rather than the full PSL;
@@ -158,11 +201,12 @@ src/scout.rs       orchestration: sessions, strategies, tasks, retries
 src/worker.rs      DOM thread affinity (scraper::Html is !Send) and the command loop
 src/interaction.rs click/fill/select/check/uncheck/press/submit + form submission
 src/extract.rs     typed field extraction (string, url, number, price, date)
-src/js.rs          embedded QuickJS: DOM snapshot shim, limits, console capture
+src/js.rs          embedded QuickJS: DOM shim, fetch/XHR bridge, limits, console
+src/auth.rs        signing in with supplied credentials, and the evidence it returns
 src/adapters/       strategy registry (generic-page, selectors, youtube, ...)
 src/tasks.rs       bounded queue, concurrency permits, admission, watchdog
 src/resources.rs   RSS sampling, soft/hard memory budgets
-src/security.rs    URL policy, DNS re-checks, guarded fetch
+src/security.rs    URL policy, DNS re-checks, guarded fetch, browser headers
 conformance/       port of the Node test suite (fixture.mjs + conformance.test.mjs)
 sdk/               JavaScript SDK and its integration test
 bench/             benchmark client, fixtures and recorded results
