@@ -8,6 +8,12 @@
 FROM rust:1.88-slim-bookworm AS build
 WORKDIR /src
 
+# rquickjs-sys patches the QuickJS sources at build time, so `patch` must be
+# present; slim images do not ship it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patch \
+ && rm -rf /var/lib/apt/lists/*
+
 # Dependency layer: compile the tree once with a stub main so that a source-only
 # change does not re-download and re-compile every crate.
 COPY Cargo.toml Cargo.lock ./
