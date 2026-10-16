@@ -41,10 +41,33 @@ pub enum StrategySpec {
     YoutubeChannelVideos,
 }
 
+/// A script the page asked for, in document order.
+pub enum ScriptSource {
+    /// Body is already in the document.
+    Inline(String),
+    /// Needs fetching against the page URL before it can run.
+    External(String),
+}
+
+pub struct LoadOutcome {
+    /// The navigate response, unchanged.
+    pub summary: Value,
+    /// The page's scripts, in document order, capped by `js_max_scripts`.
+    pub scripts: Vec<ScriptSource>,
+}
+
 pub enum Cmd {
     Load {
         session: String,
         fetched: Box<Fetched>,
+        reply: oneshot::Sender<Result<LoadOutcome>>,
+    },
+    /// Run the page's scripts and rebuild the DOM from what they produced.
+    RunScripts {
+        session: String,
+        /// Bodies in document order; an empty string means it could not be
+        /// fetched, which is recorded rather than fatal.
+        scripts: Vec<String>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Extract {
@@ -89,6 +112,9 @@ impl WorkerState {
             Cmd::Load { session, fetched, reply } => {
                 let _ = reply.send(self.load(&session, *fetched));
             }
+            Cmd::RunScripts { session, scripts, reply } => {
+                let _ = reply.send(self.run_scripts(&session, scripts));
+            }
             Cmd::Extract { session, spec, limit, reply } => {
                 let _ = reply.send(self.extract(&session, &spec, limit));
             }
@@ -112,7 +138,7 @@ impl WorkerState {
         }
     }
 
-    fn load(&mut self, session: &str, fetched: Fetched) -> Result<Value> {
+    fn load(&mut self, session: &str, fetched: Fetched) -> Result<LoadOutcome> {
         if fetched.status >= 400 {
             let restricted = matches!(fetched.status, 401 | 403 | 429);
             let msg = if restricted {
@@ -158,6 +184,12 @@ impl WorkerState {
             )
         };
 
+        let scripts = if self.cfg.js_enabled {
+            collect_scripts(page.doc.as_ref(), self.cfg.js_max_scripts)
+        } else {
+            Vec::new()
+        };
+
         let summary = json!({
             "url": page.url,
             "status": page.status,
@@ -168,7 +200,7 @@ impl WorkerState {
             "warnings": page.warnings,
         });
         self.pages.insert(session.to_string(), page);
-        Ok(summary)
+        Ok(LoadOutcome { summary, scripts })
     }
 
     fn page(&self, session: &str) -> Result<&Page> {
@@ -206,6 +238,59 @@ impl WorkerState {
         interaction::apply(page, &action, &cfg)
     }
 
+    /// Execute the page's scripts and rebuild the DOM from the result.
+    ///
+    /// The document is re-parsed from the serialised, mutated tree, which is
+    /// what makes script-built content visible to extraction. A page whose
+    /// scripts all fail keeps its original DOM rather than being blanked.
+    fn run_scripts(&mut self, session: &str, scripts: Vec<String>) -> Result<Value> {
+        let page = self
+            .pages
+            .get_mut(session)
+            .ok_or_else(|| ScoutError::new(ErrorCode::NotFound, "Unknown session"))?;
+        let Some(doc) = page.doc.as_ref() else {
+            return Err(ScoutError::new(
+                ErrorCode::CompatibilityError,
+                "JavaScript execution needs an HTML page",
+            ));
+        };
+
+        let snapshot = js::dom_snapshot(doc);
+        let out = js::run_page(
+            &scripts,
+            &snapshot,
+            &page.url,
+            &self.cfg.user_agent,
+            Duration::from_millis(self.cfg.js_timeout_ms),
+            self.cfg.js_max_memory_bytes as usize,
+            self.cfg.js_timer_budget,
+        )?;
+
+        if let Some(html) = out.html {
+            if let Ok(new_doc) = html::parse_html(&html, self.cfg.max_dom_nodes) {
+                let warnings = js_warnings(&new_doc);
+                page.doc = Some(new_doc);
+                page.warnings = warnings;
+            }
+        }
+
+        let mut summary = json!({
+            "scriptsRun": out.scripts_run,
+            "scriptsFailed": out.scripts_failed,
+            "timersRun": out.timers_run,
+            "timersPending": out.timers_pending,
+            "durationMs": out.duration_ms,
+            "timedOut": out.timed_out,
+        });
+        if !out.errors.is_empty() {
+            summary["errors"] = json!(out.errors);
+        }
+        if !out.logs.is_empty() {
+            summary["logs"] = json!(out.logs);
+        }
+        Ok(summary)
+    }
+
     fn eval(&self, session: &str, script: &str) -> Result<Value> {
         let page = self.page(session)?;
         let Some(doc) = page.doc.as_ref() else {
@@ -232,6 +317,38 @@ impl WorkerState {
             "warnings": out.warnings,
         }))
     }
+}
+
+/// Collect a page's scripts in document order.
+///
+/// Non-JavaScript `<script>` blocks (templates, JSON payloads, import maps)
+/// are skipped: executing them would either throw or, worse, parse successfully
+/// and do nothing useful.
+fn collect_scripts(doc: Option<&scraper::Html>, limit: usize) -> Vec<ScriptSource> {
+    let mut out = Vec::new();
+    let Some(doc) = doc else { return out };
+    let Ok(sel) = selector::compile("script") else { return out };
+
+    for el in doc.select(&sel) {
+        if out.len() >= limit {
+            break;
+        }
+        let node = el.value();
+        let kind = node.attr("type").unwrap_or("").trim().to_ascii_lowercase();
+        if !kind.is_empty()
+            && kind != "module"
+            && !kind.contains("javascript")
+            && !kind.contains("ecmascript")
+            && !kind.contains("text/jsx")
+        {
+            continue;
+        }
+        match node.attr("src").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(src) => out.push(ScriptSource::External(src.to_string())),
+            None => out.push(ScriptSource::Inline(el.text().collect::<String>())),
+        }
+    }
+    out
 }
 
 /// Heuristic: does this page look like it renders its content with JavaScript?
@@ -264,7 +381,7 @@ fn js_warnings(doc: &scraper::Html) -> Vec<Value> {
     if (scripts > 0 && visible < 200) || noscript_needs_js {
         vec![json!({
             "code": "js_required_likely",
-            "message": "Page appears to render its content with JavaScript; extraction may be empty or incomplete. Scout's JavaScript support is limited to script execution against a read-only DOM snapshot.",
+            "message": "Page appears to render its content with JavaScript. Scout runs page scripts against the parsed document and rebuilds it, but there is no event loop, no in-page fetch and no layout, so some content may still be missing.",
         })]
     } else {
         Vec::new()

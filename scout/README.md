@@ -101,12 +101,31 @@ Facebook or TikTok compatibility is claimed.
 5. `interact` responses carry the Node fields (`ok`, `type`, `navigated`, `page`)
    plus `effect`/`warnings` for callers that want the port's own detail.
 
-**JavaScript.** An embedded QuickJS engine (`rquickjs`) is part of the runtime: the
-`eval` path runs real scripts against a read-only snapshot of the parsed document
-with a memory cap, stack cap and interrupt-based timeout, and captures `console`
-output. Page scripts are **not** executed during navigation yet — no event loop, no
-in-page `fetch`/`XMLHttpRequest`, no document mutation. A page whose content depends
-on those still reports `js_required_likely` rather than returning fabricated data.
+**JavaScript.** An embedded QuickJS engine (`rquickjs`) is part of the runtime, and
+page scripts now run **during navigation**:
+
+- Inline and external `<script>` elements execute in document order inside one
+  context, so scripts share a global scope the way classic scripts do.
+- External scripts are fetched through the same guarded client as the document,
+  so the SSRF policy applies to them too.
+- The DOM is mutable — `createElement`, `appendChild`, `innerHTML`,
+  `setAttribute`, `classList` and friends all work. After the scripts finish,
+  the mutated tree is serialised and re-parsed, so extraction sees content the
+  scripts built.
+- `setTimeout`/`setInterval` run on a virtual clock: callbacks are queued and
+  drained synchronously after the scripts, so deferred writes are captured
+  without sleeping in real time.
+- Bounded by a wall-clock budget, a memory cap, a stack cap, a script-count cap
+  and a byte budget for fetched scripts. A runaway script is interrupted.
+
+Still missing, and reported rather than papered over: no event loop driven by
+real I/O, no in-page `fetch`/`XMLHttpRequest`, no layout, no CSS cascade, no
+`IndexedDB`. A page whose content depends on those still reports
+`js_required_likely` rather than returning fabricated data.
+
+Measured cost of the JS engine: idle RSS **4.8 MB**, peak **6.3 MB** across 15
+JavaScript-rendered navigations, binary **5.2 MB** (`SCOUT_JS_ENABLED=0`
+restores the old read-only behaviour).
 
 `POST /v1/eval` runs the script as a **function body**, so a value is returned only
 by an explicit `return`; a trailing expression's value is discarded.

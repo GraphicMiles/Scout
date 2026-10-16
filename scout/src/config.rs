@@ -52,6 +52,15 @@ pub struct Config {
     pub youtube_hosts: Vec<String>,
     pub js_timeout_ms: u64,
     pub js_max_memory_bytes: u64,
+    /// Run page scripts during navigation. Off means the old read-only
+    /// behaviour: no globals, no mutation, no timer drain.
+    pub js_enabled: bool,
+    /// Cap on how many scripts a page may execute, external and inline combined.
+    pub js_max_scripts: usize,
+    /// Cap on the bytes fetched for external scripts, across the whole page.
+    pub js_max_script_bytes: usize,
+    /// How many queued timer callbacks to run after the scripts finish.
+    pub js_timer_budget: u32,
 }
 
 fn num(env: &std::collections::HashMap<String, String>, key: &str, default: u64) -> Result<u64, String> {
@@ -78,16 +87,21 @@ fn list(env: &std::collections::HashMap<String, String>, key: &str) -> Vec<Strin
 impl Config {
     /// A development-mode configuration built without consulting the environment.
     /// Used by tests and by embedders that construct the runtime programmatically.
+    /// Builds from a caller-supplied environment map rather than mutating the
+    /// process environment. `set_var`/`remove_var` here raced with any other
+    /// test reading the environment concurrently, which made `interaction`
+    /// tests fail intermittently as the suite grew.
     pub fn dev() -> Self {
-        std::env::set_var("SCOUT_DEV_MODE", "1");
-        let cfg = Self::from_env().expect("dev config is always valid");
-        std::env::remove_var("SCOUT_DEV_MODE");
-        cfg
+        let mut env: std::collections::HashMap<String, String> = env::vars().collect();
+        env.insert("SCOUT_DEV_MODE".into(), "1".into());
+        Self::from_map(env).expect("dev config is always valid")
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let env: std::collections::HashMap<String, String> =
-            env::vars().collect();
+        Self::from_map(env::vars().collect())
+    }
+
+    pub fn from_map(env: std::collections::HashMap<String, String>) -> Result<Self, String> {
 
         let api_keys: Vec<String> = env
             .get("SCOUT_API_KEYS")
@@ -160,6 +174,13 @@ impl Config {
                 }),
             js_timeout_ms: num(&env, "SCOUT_JS_TIMEOUT_MS", 5_000)?,
             js_max_memory_bytes: num(&env, "SCOUT_JS_MAX_MEMORY_MB", 64)? * MB,
+            js_enabled: env
+                .get("SCOUT_JS_ENABLED")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            js_max_scripts: num(&env, "SCOUT_JS_MAX_SCRIPTS", 32)? as usize,
+            js_max_script_bytes: num(&env, "SCOUT_JS_MAX_SCRIPT_BYTES", 2 * MB)? as usize,
+            js_timer_budget: num(&env, "SCOUT_JS_TIMER_BUDGET", 64)? as u32,
         };
 
         if !cfg.dev_mode {

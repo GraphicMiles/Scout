@@ -43,7 +43,7 @@ the builder stage.
 
 ---
 
-## P1 — Declare one runtime; demote the Node base
+## P1 — Declare one runtime; demote the Node base ✅ DONE (Option A)
 
 **Why:** the repo ships two complete runtimes. Measured, the Rust port is strictly
 better on every axis — it has a real JS engine and a working live YouTube adapter;
@@ -61,10 +61,17 @@ functionality…"*
 | **A. Ship Rust only** (recommended) | Move `scout/` → `reference/node-base/`, keep it as the conformance oracle. Rust becomes `scout-rs/` → `scout/`. No new code. | G2 evaporates. One runtime to secure, benchmark and document. |
 | **B. Keep both, fix Node** | Port the `lockupViewModel` walker from `scout-rs/src/adapters/youtube.rs` into `scout/src/adapters/youtube.js`, plus a live test. | Two runtimes to maintain; Node still has no JS engine, so it can never reach parity. |
 
-**Recommendation: A.** B only makes sense if something external depends on the
-Node build. Say the word and I'll do B instead — the raw fix is ~40 lines in
-`parseYoutubeChannel`, and I can verify it live against `@NASA/videos` the same
-way I verified the Rust one.
+**Decision: A — shipped.** `scout-rs/` → `scout/` (the product); `scout/` →
+`reference/node-base/` (the contract oracle, explicitly *not* a supported
+runtime). The move was low-risk because nothing imports across the boundary at
+runtime — only `README.md` referenced paths, and Docker/compose use relative
+paths. Verified after the move: 109 unit, 22 API, 47 conformance, 17 SDK and 46
+Node reference tests all still pass.
+
+The root `SCOUT_README.md` was a byte-identical copy of the Node base's README, so
+it was replaced with a short orientation file rather than left documenting a
+runtime that is no longer shipped. `scout.zip` (a stale pre-Rust-port archive)
+was deleted.
 
 ---
 
@@ -137,7 +144,7 @@ explicit compatibility errors, and that is an acceptable, honest result.
 
 ---
 
-## P4 — Minor defects (cheap, fold into any of the above)
+## P4 — Minor defects ✅ DONE
 
 - **`/v1/eval` silently returns `value: null`** unless the script uses an explicit
   `return` — `1+1` → `null`, `return 1+1;` → `2`. Document the contract *and*
@@ -153,17 +160,30 @@ explicit compatibility errors, and that is an acceptable, honest result.
 
 ---
 
-## Suggested sequencing
+## Status
 
-| # | Item | Effort | Unblocks |
-|---|---|---|---|
-| P0 | Docker pin | **done** | Definition of Done (needs your `docker build` to confirm) |
-| P1 | One runtime (needs your A/B call) | ~30 min | Removes duplication + the broken adapter |
-| P4 | Minor defects | ~1 hr | Closes the small correctness gaps |
-| P2 | Benchmark harness | ~half a day | The last explicit §7 requirement |
-| P3 | In-navigation JS → FB/TikTok | multi-day, incremental | The two remaining target sites |
+| # | Item | State |
+|---|---|---|
+| P0 | Docker toolchain pin | ✅ done, pushed (`d19b6e2`) — image still unbuilt |
+| P1 | Ship Rust only, demote Node | ✅ done, pushed |
+| P4 | Minor defects | ✅ done, pushed |
+| P2 | Playwright/Lightpanda benchmark | ⬜ not started — **last explicit §7 requirement unmet** |
+| P3 | In-navigation JS → FB/TikTok | ⬜ not started — the long pole |
 
-**My recommendation:** confirm P1 (A or B), then let me execute P1 + P4 together —
-that clears every *correctness* gap except the Docker confirmation only you can
-run. After that, P2 is the last explicit brief requirement that is currently
-unmet, and P3 is the long pole.
+Everything *correctness*-related that this environment can verify is now closed.
+241 tests pass (109 Rust unit, 22 Rust API, 47 conformance, 17 SDK, 46 Node
+reference).
+
+**What remains and who can do it:**
+
+- **You, on a machine with Docker:** `cd scout && docker build -t scout .` — this is
+  the last thing standing between the project and the Definition of Done. The
+  compile step is verified on 1.88; the image is not.
+- **P2 (me, ~half a day):** the benchmark harness. Chromium and Lightpanda get
+  installed outside `/home/user`, so there is no snapshot-budget cost.
+- **P3 (me, multi-day):** in-navigation JS. Do this last — it is the largest piece
+  of work and the only thing that can move Facebook and TikTok off
+  `not_implemented`.
+
+**Suggested order:** P2 next (it is the only explicitly-required item still
+unmet and it is self-contained), then P3.
