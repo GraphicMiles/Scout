@@ -61,8 +61,9 @@ async function main() {
   // Allow a pinned version: SCOUT_VERSION=v0.1.0
   const tag = process.env.SCOUT_VERSION ?? 'latest';
   const url =
-    `https://github.com/${REPO}/releases/download/${tag}/${asset}` +
-    (tag === 'latest' ? '' : '');
+    tag === 'latest'
+      ? `https://github.com/${REPO}/releases/latest/download/${asset}`
+      : `https://github.com/${REPO}/releases/download/${tag}/${asset}`;
 
   mkdirSync(binDir, { recursive: true });
   log(`Downloading ${url} ...`);
