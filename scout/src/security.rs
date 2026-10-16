@@ -259,6 +259,9 @@ pub struct Fetched {
     pub headers: Vec<(String, String)>,
     pub content_type: String,
     pub body: String,
+    /// Present when the response was not textual: the exact bytes,
+    /// base64-encoded, so callers are not forced through a lossy UTF-8 decode.
+    pub body_b64: Option<String>,
     pub bytes: usize,
     pub redirects: Vec<serde_json::Value>,
 }
@@ -295,6 +298,24 @@ pub fn status_text(status: u16) -> &'static str {
 
 fn is_textual(ct: &str) -> bool {
     ct.is_empty() || ct.starts_with("text/") || ct.contains("json") || ct.contains("xml")
+}
+
+/// Standard base64 with padding, hand-rolled to avoid a dependency for
+/// thirty lines of alphabet work.
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 fn map_net_error(e: reqwest::Error) -> ScoutError {
@@ -462,16 +483,29 @@ fn client_hints(ua: &str) -> Option<(String, &'static str)> {
 }
 
 fn registrable(host: &str) -> String {
-    let mut parts: Vec<&str> = host.trim_end_matches('.').split('.').collect();
-    if parts.len() > 2 {
-        parts = parts.split_off(parts.len() - 2);
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = h.split('.').collect();
+    if labels.len() <= 2 {
+        return h;
     }
-    parts.join(".")
+    // Walk from the longest candidate down: the registrable domain is the
+    // public suffix plus one label ("www.example.co.uk" -> "example.co.uk").
+    for take in (2..labels.len()).rev() {
+        let candidate: String = labels[labels.len() - take..].join(".");
+        if crate::session::is_public_suffix(&candidate) {
+            let n = take + 1;
+            if labels.len() >= n {
+                return labels[labels.len() - n..].join(".");
+            }
+            break;
+        }
+    }
+    labels[labels.len() - 2..].join(".")
 }
 
-/// Approximation of "same site": equal registrable domains, without a public
-/// suffix list. Used only for a Sec-Fetch-Site value, never for a decision
-/// about whether a request may proceed.
+/// "Same site" as a browser computes it: equal registrable domains. Used only
+/// for a Sec-Fetch-Site value, never for a decision about whether a request
+/// may proceed.
 fn same_site(a: &url::Url, b: &url::Url) -> bool {
     match (a.host_str(), b.host_str()) {
         (Some(h1), Some(h2)) => registrable(h1) == registrable(h2),
@@ -621,7 +655,11 @@ pub async fn guarded_fetch(
             .trim()
             .to_ascii_lowercase();
 
-        if !is_textual(&content_type) {
+        // Documents and scripts must be textual; an XHR/fetch from a page
+        // script (or the /v1/request tool) may fetch binary data, which comes
+        // back as base64 instead of a corrupted string.
+        let binary = !is_textual(&content_type);
+        if binary && req.kind != FetchKind::Xhr {
             return Err(ScoutError::new(
                 ErrorCode::UnsupportedContent,
                 format!("\"{content_type}\" is not downloaded (documents and data only)"),
@@ -648,6 +686,7 @@ pub async fn guarded_fetch(
 
         let charset = extract_charset(&exposed);
         let body = decode_body(&buf, charset.as_deref());
+        let body_b64 = if binary { Some(encode_base64(&buf)) } else { None };
         let bytes = buf.len();
 
         return Ok(Fetched {
@@ -656,6 +695,7 @@ pub async fn guarded_fetch(
             headers: exposed,
             content_type,
             body,
+            body_b64,
             bytes,
             redirects,
         });
@@ -714,6 +754,18 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn registrable_domain_respects_public_suffixes() {
+        // Two-label hosts pass through unchanged.
+        assert_eq!(registrable("example.com"), "example.com");
+        // The suffix plus one label, not the last two labels.
+        assert_eq!(registrable("www.example.co.uk"), "example.co.uk");
+        assert_eq!(registrable("deep.shop.example.com.ng"), "example.com.ng");
+        assert_eq!(registrable("a.b.me.github.io"), "me.github.io");
+        // A suffix list miss falls back to the last two labels.
+        assert_eq!(registrable("a.b.example.de"), "example.de");
     }
 
     #[test]

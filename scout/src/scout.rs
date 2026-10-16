@@ -425,6 +425,7 @@ impl Scout {
                         url: f.url,
                         headers: f.headers,
                         body: f.body,
+                        body_b64: f.body_b64,
                     })
                 }
                 Err(e) => {
@@ -491,6 +492,7 @@ impl Scout {
                 "contentType": fetched.content_type,
                 "headers": Value::Object(head),
                 "body": fetched.body,
+                "bodyBase64": fetched.body_b64,
                 "bytes": fetched.bytes,
                 "redirects": fetched.redirects,
             }))
