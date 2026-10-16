@@ -710,6 +710,65 @@ impl Scout {
         let worker = self.worker_of(&req.session_id)?;
         let _guard = session.lock().await?;
 
+        // Scroll and non-Enter key presses are delivered to the page's scripts:
+        // they re-run first (so their listeners exist in the fresh context),
+        // then the event is dispatched and the DOM is rebuilt from the result.
+        let is_enter = req
+            .action
+            .key
+            .as_deref()
+            .map(|k| k.eq_ignore_ascii_case("enter"))
+            .unwrap_or(false);
+        let needs_event_pass =
+            req.action.kind == "scroll" || (req.action.kind == "press" && !is_enter);
+        if needs_event_pass {
+            let kind = req.action.kind.clone();
+            let key = req.action.key.clone();
+            let selector = req.action.selector.clone();
+            let scroll_px: u64 = req
+                .action
+                .values
+                .first()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(800);
+            let url = session.referrer().unwrap_or_default();
+            let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
+            let net = if self.cfg.js_network {
+                Some(self.page_net(&session, &url, net_stats.clone()))
+            } else {
+                None
+            };
+            let detail = self
+                .workers
+                .call(worker, |reply| Cmd::FireEvent {
+                    session: session.id.clone(),
+                    kind,
+                    key,
+                    selector,
+                    scroll_px,
+                    net,
+                    reply,
+                })
+                .await?;
+            let mut out = json!({
+                "ok": true,
+                "type": req.action.kind,
+                "navigated": false,
+                "effect": "events",
+                "detail": detail,
+            });
+            let stats = *net_stats.lock().unwrap();
+            if stats.requests > 0 || stats.blocked > 0 {
+                out["network"] = json!({
+                    "requests": stats.requests,
+                    "failed": stats.failed,
+                    "blocked": stats.blocked,
+                    "bytes": stats.bytes,
+                });
+            }
+            return Ok(out);
+        }
+
         let effect: Effect = self
             .workers
             .call(worker, |reply| Cmd::Interact {

@@ -122,6 +122,12 @@ async fn harness() -> Harness {
         }))
         // A page whose content only exists after a fetch() resolves.
         .route("/spa", get(|| async { Html(SPA_HTML) }))
+        // A lazy-loading page for the scroll action.
+        .route("/lazy", get(|| async { Html(LAZY_HTML) }))
+        // A key-reactive page for the press action.
+        .route("/keys", get(|| async { Html(KEYS_HTML) }))
+        // More items for the lazy page's scroll handler.
+        .route("/api/more", get(|| async { axum::Json(json!({ "names": ["lazy-1", "lazy-2", "lazy-3"] })) }))
         // An authenticated JSON API, for the request tool to read and write.
         .route("/api/items", get(|| async { axum::Json(json!({ "items": [1, 2, 3] })) })
             .post(|body: String| async move {
@@ -241,6 +247,51 @@ const SPA_HTML: &str = r#"<!doctype html>
         li.textContent = 'item-' + n;
         ul.appendChild(li);
       });
+    });
+  </script>
+</body></html>"#;
+
+/// A lazy-loading page: initial items render on load (guarded so a re-run does
+/// not duplicate them), and a scroll listener fetches more. This is the shape
+/// of page the scroll action exists for.
+const LAZY_HTML: &str = r#"<!doctype html>
+<html><head><title>Lazy</title></head>
+<body>
+  <ul id="list"></ul>
+  <script>
+    function add(names) {
+      var ul = document.getElementById('list');
+      for (var i = 0; i < names.length; i++) {
+        var li = document.createElement('li');
+        li.className = 'item';
+        var s = document.createElement('span');
+        s.className = 'name';
+        s.textContent = names[i];
+        li.appendChild(s);
+        ul.appendChild(li);
+      }
+    }
+    if (!document.getElementById('list').children.length) add(['initial-1', 'initial-2']);
+    window.addEventListener('scroll', function () {
+      fetch('/api/more').then(function (r) { return r.json(); }).then(function (d) {
+        add(d.names);
+      });
+    });
+  </script>
+</body></html>"#;
+
+/// A page that reacts to key events: the pattern search-as-you-type uses.
+const KEYS_HTML: &str = r#"<!doctype html>
+<html><head><title>Keys</title></head>
+<body>
+  <input id="q" type="text">
+  <div id="out"></div>
+  <script>
+    document.getElementById('q').addEventListener('keydown', function (e) {
+      if (e.type === 'keydown' && e.key.length === 1) {
+        var out = document.getElementById('out');
+        out.textContent = (out.textContent || '') + e.key;
+      }
     });
   </script>
 </body></html>"#;
@@ -564,6 +615,90 @@ async fn unsupported_content_types_are_refused() {
     let (status, body) = h.post("/v1/extract", json!({ "url": format!("{}/image", h.fixture) })).await;
     assert_eq!(status, 415, "{body}");
     assert_eq!(body["error"]["code"], "unsupported_content");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scroll_action_triggers_lazy_loading() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+    let (status, body) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/lazy", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let count_items = |body: &Value| body["data"].as_array().map(|a| a.len()).unwrap_or(0);
+    let (_, before) = h
+        .post(
+            "/v1/extract",
+            json!({ "sessionId": sid, "strategy": "selectors", "schema": {
+                "item": "li.item", "fields": { "name": ".name" }
+            }}),
+        )
+        .await;
+    assert_eq!(count_items(&before), 2, "initial render: {before}");
+
+    let (status, scrolled) = h
+        .post(
+            "/v1/interact",
+            json!({ "sessionId": sid, "action": { "type": "scroll", "value": 1600 } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{scrolled}");
+    assert_eq!(scrolled["ok"], json!(true), "{scrolled}");
+    assert_eq!(scrolled["effect"], json!("events"), "{scrolled}");
+
+    let (_, after) = h
+        .post(
+            "/v1/extract",
+            json!({ "sessionId": sid, "strategy": "selectors", "schema": {
+                "item": "li.item", "fields": { "name": ".name" }
+            }}),
+        )
+        .await;
+    let names: Vec<&str> = after["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|i| i["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        names,
+        ["initial-1", "initial-2", "lazy-1", "lazy-2", "lazy-3"],
+        "after scroll: {after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn press_dispatches_key_events_to_page_scripts() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+    let (status, body) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/keys", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, pressed) = h
+        .post(
+            "/v1/interact",
+            json!({ "sessionId": sid, "action": { "type": "press", "selector": "#q", "key": "a" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{pressed}");
+    assert_eq!(pressed["effect"], json!("events"), "{pressed}");
+
+    let (_, text) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "page.text", "arguments": { "sessionId": sid, "selector": "#out" } }),
+        )
+        .await;
+    assert_eq!(text["text"], json!("a"), "the keydown handler must see the key exactly once: {text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

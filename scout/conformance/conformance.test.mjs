@@ -777,8 +777,6 @@ describe('engine: interaction', () => {
         [{ type: 'click', selector: '#nope' }, 'element_not_found', 422],
         [{ type: 'click', selector: '#js-link' }, 'unsupported_capability', 501],
         [{ type: 'click', selector: '#js' }, 'unsupported_capability', 501],
-        [{ type: 'scroll' }, 'unsupported_capability', 501],
-        [{ type: 'press', selector: 'input[name=q]', key: 'Tab' }, 'unsupported_capability', 501],
         [{ type: 'fill', selector: 'input[type=file]', value: 'x' }, 'unsupported_capability', 501],
         [{ type: 'select', selector: 'select', value: 'green' }, 'element_not_found', 422],
         [{ type: 'submit', selector: 'form[enctype] input' }, 'unsupported_capability', 501],
@@ -791,6 +789,31 @@ describe('engine: interaction', () => {
         assert.equal(r.status, status, `${JSON.stringify(action)} → ${r.status} ${r.text.slice(0, 140)}`);
         assert.equal(r.json.error.code, code, `${JSON.stringify(action)} code was ${r.json.error.code}`);
       }
+    } finally {
+      await client.destroySession(id);
+    }
+  });
+
+  // Node refused scroll and non-Enter keys outright. The Rust runtime delivers
+  // them to the page's scripts: the page's own scripts re-run (so listeners
+  // exist again in the fresh context), the event is dispatched, and the DOM is
+  // rebuilt from the result.
+  it('scroll and non-Enter key presses are delivered as events', async () => {
+    const client = scout.client();
+    const act = (sessionId, action) => post(scout.baseUrl, '/v1/interact', { sessionId, action });
+    const { id } = await client.createSession();
+    try {
+      await client.navigate({ sessionId: id, url: `${fx}/form` });
+      const scroll = await act(id, { type: 'scroll', value: 600 });
+      assert.equal(scroll.status, 200, scroll.text.slice(0, 140));
+      assert.equal(scroll.json.effect, 'events');
+      assert.equal(scroll.json.detail.event.kind, 'scroll');
+      assert.equal(scroll.json.detail.event.scrollPx, 600);
+
+      const press = await act(id, { type: 'press', selector: 'input[name=q]', key: 'Tab' });
+      assert.equal(press.status, 200, press.text.slice(0, 140));
+      assert.equal(press.json.effect, 'events');
+      assert.equal(press.json.detail.event.key, 'Tab');
     } finally {
       await client.destroySession(id);
     }

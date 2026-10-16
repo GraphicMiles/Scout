@@ -120,6 +120,24 @@ impl Action {
                 }
                 list
             }
+            // Pixels to scroll by; optional, defaulting to 800 in the caller.
+            "scroll" => match o.get("value") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::String(v))
+                    if v.chars().count() <= 9 && v.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    vec![v.clone()]
+                }
+                Some(Value::Number(n)) if n.as_u64().map(|u| u < 1_000_000_000).unwrap_or(false) => {
+                    vec![n.to_string()]
+                }
+                _ => {
+                    return Err(bad(
+                        "\"value\" for scroll must be a non-negative number of pixels".into(),
+                        "value",
+                    ))
+                }
+            },
             _ => Vec::new(),
         };
         let index = match o.get("index") {
@@ -218,10 +236,9 @@ impl Effect {
 
 /// Actions that a document-only runtime cannot perform. Reported by name so the
 /// caller learns precisely what is missing instead of receiving a generic error.
-const UNSUPPORTED_ACTIONS: &[(&str, &str)] = &[(
-    "scroll",
-    "Scrolling is not supported: Scout core has no layout engine and cannot trigger lazy loading",
-)];
+/// (Scroll left this list: it is now delivered to the page's scripts as a
+/// scroll event, which is what lazy loading listens for.)
+const UNSUPPORTED_ACTIONS: &[(&str, &str)] = &[];
 pub fn apply(page: &mut Page, action: &Action, cfg: &Config) -> Result<Effect> {
     if let Some((_, why)) = UNSUPPORTED_ACTIONS.iter().find(|(k, _)| *k == action.kind) {
         return Err(ScoutError::unsupported(*why).with_details(json!({ "action": action.kind })));
@@ -299,7 +316,18 @@ fn reject_unfillable(el: &ElementRef, sel: &str) -> Result<()> {
 /// The caller's selector and the key used at submission time must agree, or a
 /// filled field silently submits empty. Both sides go through `element_selector`.
 fn record(page: &mut Page, sel: &str, value: String) {
-    page.form_state.insert(sel.to_string(), value);
+    page.form_state.insert(sel.to_string(), vec![value]);
+}
+
+/// Record several values under one key: what a `<select multiple>` produces.
+fn record_many(page: &mut Page, sel: &str, values: Vec<String>) {
+    page.form_state.insert(sel.to_string(), values);
+}
+
+/// The recorded state of a checkbox-style key: touched and non-empty means
+/// checked, touched and empty means explicitly unchecked.
+fn recorded_checked(v: &[String]) -> bool {
+    matches!(v.first(), Some(s) if !s.is_empty())
 }
 
 fn fill(page: &mut Page, action: &Action, sel: &str) -> Result<Effect> {
@@ -365,17 +393,19 @@ fn select(page: &mut Page, action: &Action, sel: &str) -> Result<Effect> {
         )
         .with_details(json!({ "selector": sel })));
     }
-    // A <select multiple> can hold several values, but the page's form state maps
-    // one key to one value; say so rather than silently keeping only the first.
-    if el.value().attr("multiple").is_some() && want.len() > 1 {
+    // A <select multiple> can hold several values at once; every requested
+    // value was verified to exist above, so recording them all is safe. A
+    // single-value select still refuses a second value: it would be a choice
+    // the page cannot represent.
+    if el.value().attr("multiple").is_none() && want.len() > 1 {
         return Err(ScoutError::unsupported(
-            "Selecting several values of a <select multiple> at once is not supported; select one value per action",
+            "This <select> is not multiple; choose one value per action",
         )
         .with_details(json!({ "selector": sel })));
     }
-    record(page, &element_selector(&el), want[0].clone());
+    record_many(page, &element_selector(&el), want.clone());
     Ok(Effect::None {
-        detail: json!({ "selected": sel }),
+        detail: json!({ "selected": sel, "values": want }),
     })
 }
 
@@ -455,7 +485,7 @@ fn click(page: &mut Page, action: &Action, sel: &str, cfg: &Config) -> Result<Ef
         let was_checked = page
             .form_state
             .get(&element_selector(&el))
-            .map(|v| !v.is_empty())
+            .map(|v| recorded_checked(v))
             .unwrap_or_else(|| el.value().attr("checked").is_some());
         return set_checked(page, action, sel, is_radio || !was_checked);
     }
@@ -582,7 +612,7 @@ fn build_submission(
         }
         if tag == "input" && matches!(ty.as_str(), "checkbox" | "radio") {
             let checked = match page.form_state.get(&canonical) {
-                Some(v) => !v.is_empty(),
+                Some(v) => recorded_checked(v),
                 None => el.value().attr("checked").is_some(),
             };
             if checked {
@@ -596,14 +626,14 @@ fn build_submission(
                 let v = page
                     .form_state
                     .get(&canonical)
-                    .cloned()
+                    .and_then(|v| v.first().cloned())
                     .or_else(|| el.value().attr("value").map(|v| v.to_string()))
                     .unwrap_or_default();
                 pairs.push((name, v));
             }
             "textarea" => {
                 let v = match page.form_state.get(&canonical) {
-                    Some(v) => v.clone(),
+                    Some(v) => v.first().cloned().unwrap_or_default(),
                     None => {
                         // A newline immediately after <textarea> is dropped by
                         // the HTML parser, so it is not part of the value.
@@ -632,7 +662,7 @@ fn build_submission(
                 let chosen: Vec<String> = match page.form_state.get(&canonical) {
                     Some(want) => opts
                         .iter()
-                        .filter(|o| option_value(o) == *want)
+                        .filter(|o| want.contains(&option_value(o)))
                         .map(option_value)
                         .collect(),
                     None => {
@@ -783,7 +813,60 @@ mod tests {
         let a = Action::from_json(&json!({ "type": "fill", "selector": "input[name=q]", "value": "hello" })).unwrap();
         let e = apply(&mut p, &a, &cfg()).unwrap();
         assert!(matches!(e, Effect::None { .. }));
-        assert_eq!(p.form_state.get("[name=\"q\"]").map(|s| s.as_str()), Some("hello"));
+        assert_eq!(
+            p.form_state.get("[name=\"q\"]").and_then(|v| v.first()).map(|s| s.as_str()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn multi_select_records_and_submits_every_value() {
+        let mut p = page_with(
+            "<form action='/pick' method='get'>\
+             <select name='toppings' multiple>\
+             <option value='cheese'>cheese</option>\
+             <option value='mushrooms'>mushrooms</option>\
+             <option value='olives'>olives</option>\
+             </select>\
+             <button type='submit'>go</button>\
+             </form>",
+        );
+        let a = Action::from_json(&json!({
+            "type": "select",
+            "selector": "select[name=toppings]",
+            "value": ["cheese", "olives"]
+        }))
+        .unwrap();
+        let e = apply(&mut p, &a, &cfg()).unwrap();
+        assert!(matches!(e, Effect::None { .. }));
+        let stored = p.form_state.get("[name=\"toppings\"]").unwrap();
+        assert_eq!(stored, &vec!["cheese".to_string(), "olives".to_string()]);
+
+        // Submitting must carry both values, in the recorded order.
+        let submit = Action::from_json(&json!({
+            "type": "submit", "selector": "form"
+        }))
+        .unwrap();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { url, .. } => {
+                assert!(url.contains("toppings=cheese"), "url was {url}");
+                assert!(url.contains("toppings=olives"), "url was {url}");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_select_still_refuses_multiple_values() {
+        let mut p = page_with(
+            "<form><select name='one'><option value='a'>a</option><option value='b'>b</option></select></form>",
+        );
+        let a = Action::from_json(&json!({
+            "type": "select", "selector": "select[name=one]", "value": ["a", "b"]
+        }))
+        .unwrap();
+        let err = apply(&mut p, &a, &cfg()).unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::UnsupportedCapability);
     }
 
     #[test]

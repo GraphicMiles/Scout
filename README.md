@@ -27,13 +27,14 @@ docker run --memory=512m --cpus=0.5 -e SCOUT_API_KEYS=your-key -p 8080:8080 scou
 - Runs page JavaScript during navigation, including fetch and XMLHttpRequest
 - Extracts typed fields: text, URLs, numbers, prices, dates
 - Clicks, fills, selects, and submits forms
+- Scrolls pages and delivers key presses to their scripts, so lazy-loading and search-as-you-type pages work
 - Signs in with credentials you supply and reports the evidence
 - Extracts videos from YouTube channels, verified against live pages
 - Queues background tasks with retries, timeouts, and a memory watchdog
 
 ## What it does not do
 
-There is no layout, no CSS cascade, no Web Workers, no IndexedDB. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
+There is no layout, no CSS cascade, no Web Workers, no IndexedDB. Page event listeners live only inside one script pass, so a scroll or key press re-runs the page's own scripts before dispatching; scripts that append unconditionally on load may duplicate content. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
 
 ## API
 
@@ -51,7 +52,7 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | POST | `/v1/navigate` | Load a page into a session |
 | POST | `/v1/request` | Raw HTTP request with session cookies |
 | POST | `/v1/extract` | Extract fields from a page |
-| POST | `/v1/interact` | Click, fill, or submit |
+| POST | `/v1/interact` | Click, fill, select, submit, scroll, or press a key |
 | POST | `/v1/eval` | Run JavaScript against a page |
 | POST | `/v1/tasks` | Submit a task |
 | GET | `/v1/tasks/:id` | Task status and result |
