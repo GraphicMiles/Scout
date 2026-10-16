@@ -9,7 +9,24 @@ export interface ExtractResult<T = unknown> { data: T; warnings: Warning[]; meta
 export interface NavigateResult { url: string; status: number; contentType: string; bytes: number; title: string | null; redirects: { from: string; to: string; status: number }[]; warnings: Warning[]; durationMs: number }
 export type ActionType = 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'press' | 'submit' | 'scroll';
 export interface Action { type: ActionType; selector?: string; index?: number; value?: string | string[]; key?: string; timeoutMs?: number }
-export interface InteractResult { ok: true; type: ActionType; navigated: boolean; navigation?: NavigateResult; page?: { url: string; status: number; title: string | null } }
+export interface InteractResult {
+  /** "none" when the action only changed local state; "navigate" when it caused a request. */
+  effect: 'none' | 'navigate';
+  /** Present when effect is "none". */
+  detail?: Record<string, unknown>;
+  /** Present when effect is "navigate": the page the interaction loaded. */
+  navigation?: NavigateResult;
+  warnings?: Warning[];
+}
+
+export interface EvalResult {
+  /** The script's return value, as JSON. Null when the script returned nothing. */
+  value: unknown;
+  logs: string[];
+  durationMs: number;
+  /** True when the script hit the wall-clock limit and was interrupted. */
+  timedOut: boolean;
+}
 export type TaskStep =
   | { op: 'navigate'; url: string; timeoutMs?: number }
   | ({ op: 'extract' } & Omit<ExtractParams, 'sessionId'>)
@@ -28,6 +45,9 @@ export class ScoutClient {
   navigate(p: { sessionId: string; url: string; timeoutMs?: number }, o?: { signal?: AbortSignal }): Promise<NavigateResult>;
   extract<T = unknown>(p: ExtractParams, o?: { signal?: AbortSignal }): Promise<ExtractResult<T>>;
   interact(p: { sessionId: string; action: Action }, o?: { signal?: AbortSignal }): Promise<InteractResult>;
+
+  /** Execute JavaScript against the session's loaded page (read-only DOM snapshot). */
+  eval(p: { sessionId: string; script: string }, o?: { signal?: AbortSignal }): Promise<EvalResult>;
   submitTask(spec: TaskSpec): Promise<Task>;
   getTask(id: string): Promise<Task>;
   cancelTask(id: string): Promise<Task>;
