@@ -137,26 +137,108 @@ fn domain_attribute(set_cookie: &str) -> Option<String> {
     None
 }
 
-/// Common multi-label public suffixes that must never be used as a cookie domain.
+/// Multi-label public suffixes that must never be used as a cookie domain.
 ///
-/// This is a curated list, not the full Public Suffix List. It covers the cases
-/// that matter most in practice; a complete PSL is the correct long-term fix and
-/// is noted as a known gap rather than pretended away.
-const PUBLIC_SUFFIXES: &[&str] = &[
+/// A broad curated list rather than the full Public Suffix List: it covers the
+/// second-level suffixes a real crawler meets (country registrations, hosting
+/// platforms, academic and government zones). The full PSL is ~9k entries and
+/// mostly wildcard private domains; this list is the useful core of it. Bare
+/// TLDs (`com`, `io`) are handled separately by `is_public_suffix`.
+pub(crate) const PUBLIC_SUFFIXES: &[&str] = &[
+    // United Kingdom
     "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "sch.uk",
-    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
-    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "com.br", "net.br", "org.br",
-    "co.nz", "net.nz", "org.nz", "govt.nz", "co.za", "org.za", "net.za",
-    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
-    "co.in", "net.in", "org.in", "gov.in", "com.mx", "com.ar", "com.tr",
-    "co.kr", "or.kr", "com.sg", "com.hk", "com.tw", "co.id", "com.ng",
-    "co.ke", "com.gh", "co.ug", "com.pk", "com.bd", "com.my", "com.ph",
-    "github.io", "pages.dev", "netlify.app", "vercel.app", "herokuapp.com",
-    "s3.amazonaws.com", "cloudfront.net", "workers.dev",
+    "ltd.uk", "plc.uk", "police.uk", "nhs.uk",
+    // Australia / New Zealand
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz", "geek.nz", "maori.nz",
+    // Japan
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "ad.jp", "ed.jp", "gr.jp", "lg.jp",
+    // Korea / Taiwan / Hong Kong / China
+    "co.kr", "or.kr", "ne.kr", "re.kr", "pe.kr", "go.kr", "mil.kr", "ac.kr",
+    "com.tw", "org.tw", "net.tw", "edu.tw", "gov.tw", "idv.tw",
+    "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk", "idv.hk",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn", "mil.cn",
+    // Southeast Asia
+    "com.sg", "org.sg", "net.sg", "edu.sg", "gov.sg", "per.sg",
+    "com.my", "org.my", "net.my", "edu.my", "gov.my",
+    "co.id", "or.id", "web.id", "ac.id", "go.id", "net.id",
+    "com.ph", "org.ph", "net.ph",
+    "co.th", "or.th", "ac.th", "go.th", "net.th", "in.th",
+    "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn",
+    // South Asia
+    "co.in", "net.in", "org.in", "gov.in", "ac.in", "edu.in", "res.in", "firm.in",
+    "com.pk", "org.pk", "net.pk", "edu.pk", "gov.pk",
+    "com.bd", "org.bd", "net.bd", "edu.bd", "gov.bd",
+    "com.lk", "org.lk", "net.lk", "edu.lk", "gov.lk",
+    // Americas
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "com.mx", "org.mx", "net.mx", "edu.mx", "gob.mx",
+    "com.ar", "org.ar", "net.ar", "gob.ar", "edu.ar",
+    "com.cl", "org.cl", "net.cl", "gob.cl",
+    "com.pe", "org.pe", "net.pe", "gob.pe",
+    "com.ve", "org.ve", "net.ve", "gob.ve",
+    "com.ec", "org.ec", "net.ec", "gob.ec",
+    "com.co", "org.co", "net.co", "edu.co", "gov.co",
+    "com.do", "org.do", "net.do", "gob.do", "edu.do",
+    "com.gt", "org.gt", "net.gt", "gob.gt",
+    "com.py", "org.py", "net.py", "gob.py",
+    "com.uy", "org.uy", "net.uy", "gub.uy", "edu.uy",
+    "com.bo", "org.bo", "net.bo", "gob.bo", "edu.bo",
+    "com.pa", "org.pa", "net.pa", "gob.pa",
+    "com.cr", "or.cr", "net.cr", "go.cr", "ac.cr",
+    "com.sv", "org.sv", "edu.sv", "gob.sv",
+    // Europe
+    "co.at", "or.at", "ac.at", "gv.at", "priv.at",
+    "co.hu", "org.hu", "info.hu", "2000.hu",
+    "com.pl", "net.pl", "org.pl", "edu.pl", "gov.pl", "waw.pl",
+    "com.pt", "org.pt", "edu.pt", "gov.pt", "net.pt",
+    "com.es", "org.es", "nom.es", "gob.es", "edu.es",
+    "com.gr", "net.gr", "org.gr", "edu.gr", "gov.gr",
+    "com.tr", "org.tr", "net.tr", "edu.tr", "gov.tr", "av.tr",
+    "com.ru", "org.ru", "net.ru", "pp.ru",
+    "com.ua", "org.ua", "net.ua", "edu.ua", "gov.ua", "in.ua",
+    "co.il", "org.il", "net.il", "ac.il", "gov.il", "muni.il", "idf.il",
+    // Middle East
+    "com.ae", "net.ae", "org.ae", "ac.ae", "gov.ae",
+    "com.sa", "net.sa", "org.sa", "edu.sa", "gov.sa",
+    "com.eg", "net.eg", "org.eg", "edu.eg", "gov.eg",
+    "com.qa", "net.qa", "org.qa", "edu.qa", "gov.qa",
+    "com.kw", "net.kw", "org.kw", "edu.kw", "gov.kw",
+    "com.om", "net.om", "org.om", "edu.om", "gov.om",
+    "com.bh", "net.bh", "org.bh", "edu.bh", "gov.bh",
+    "com.jo", "net.jo", "org.jo", "edu.jo", "gov.jo",
+    "com.lb", "net.lb", "org.lb", "edu.lb", "gov.lb",
+    "co.ma", "net.ma", "org.ma", "ac.ma", "gov.ma",
+    "com.tn", "net.tn", "org.tn", "edu.tn", "gov.tn",
+    "com.dz", "net.dz", "org.dz", "edu.dz", "gov.dz",
+    // Africa
+    "co.za", "org.za", "net.za", "web.za", "gov.za", "ac.za", "edu.za",
+    "com.ng", "org.ng", "net.ng", "edu.ng", "gov.ng", "name.ng", "sch.ng",
+    "com.gh", "org.gh", "edu.gh", "gov.gh",
+    "co.ke", "or.ke", "ne.ke", "go.ke", "ac.ke", "sc.ke",
+    "co.ug", "or.ug", "ac.ug", "go.ug", "ne.ug",
+    "co.tz", "or.tz", "ac.tz", "go.tz", "ne.tz",
+    "co.zw", "or.zw", "ac.zw", "gov.zw",
+    "co.zm", "org.zm", "net.zm", "edu.zm", "gov.zm",
+    "co.rw", "org.rw", "net.rw", "edu.rw", "gov.rw",
+    "or.sc", "com.sc", "edu.sc", "gov.sc",
+    "com.mg", "org.mg", "edu.mg", "gov.mg",
+    // Hosting and app platforms (private suffixes a cookie must not span).
+    // Note: flat-namespace countries (de, fr, it, nl, be, se, no, cz, ch, at
+    // under .at only, etc.) are deliberately absent: their second-level
+    // "com.xx" names are ordinary registrable domains, not suffixes.
+    "github.io", "githubusercontent.com", "pages.dev", "web.app",
+    "firebaseapp.com", "appspot.com", "netlify.app", "vercel.app",
+    "herokuapp.com", "readthedocs.io", "gitbook.io",
+    "s3.amazonaws.com", "s3-ap-northeast-1.amazonaws.com",
+    "s3-eu-west-1.amazonaws.com", "s3-us-east-1.amazonaws.com",
+    "s3-us-west-2.amazonaws.com", "cloudfront.net", "azurewebsites.net",
+    "cloudapp.net", "trafficmanager.net", "blob.core.windows.net",
+    "workers.dev", "pantheonsite.io", "platform.sh", "r2.dev", "trycloudflare.com",
 ];
 
 /// True when `domain` is a bare TLD or a known public suffix.
-fn is_public_suffix(domain: &str) -> bool {
+pub(crate) fn is_public_suffix(domain: &str) -> bool {
     // A single label (`com`, `org`) is always a TLD.
     if !domain.contains('.') {
         return true;
@@ -437,6 +519,10 @@ mod tests {
             ("https://shop.example.co.uk/", "co.uk"),
             ("https://app.example.com.au/", "com.au"),
             ("https://me.github.io/", "github.io"),
+            ("https://shop.example.com.ng/", "com.ng"),
+            ("https://site.or.ke/", "or.ke"),
+            ("https://bucket.s3.amazonaws.com/", "s3.amazonaws.com"),
+            ("https://app.azurewebsites.net/", "azurewebsites.net"),
         ] {
             let jar = CookieJar::new();
             jar.store_set_cookies(host, &[(format!("s=1; Domain={domain}"), String::new())]);

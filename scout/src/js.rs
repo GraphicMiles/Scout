@@ -797,8 +797,9 @@ pub enum NetBody {
     Bytes(Vec<u8>),
 }
 
-/// What the host got back. Body is text: responses that are not textual are
-/// lossy, which is stated rather than hidden.
+/// What the host got back. `body` is text (lossy for non-UTF-8 bytes); when
+/// the response was binary, `body_b64` carries the exact bytes so scripts can
+/// have them without corruption.
 #[derive(Debug, Clone)]
 pub struct NetResponse {
     pub status: u16,
@@ -807,6 +808,9 @@ pub struct NetResponse {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Present only when the response was not textual: the raw bytes,
+    /// base64-encoded.
+    pub body_b64: Option<String>,
 }
 
 /// The host's network, injected into the sandbox.
@@ -1031,6 +1035,7 @@ const NET_SHIM: &str = r##"
 
   function makeResponse(r) {
     var body = (r.body === undefined || r.body === null) ? '' : String(r.body);
+    var b64 = (r.bodyB64 === undefined || r.bodyB64 === null) ? null : String(r.bodyB64);
     var res = {
       ok: r.status >= 200 && r.status < 300,
       status: r.status,
@@ -1039,13 +1044,16 @@ const NET_SHIM: &str = r##"
       redirected: false,
       type: 'basic',
       headers: makeHeaders(r.headers || []),
-      bodyUsed: false
+      bodyUsed: false,
+      base64: b64
     };
     res.text = function () { res.bodyUsed = true; return Promise.resolve(body); };
     res.json = function () { res.bodyUsed = true; return Promise.resolve(JSON.parse(body)); };
     res.arrayBuffer = function () {
       res.bodyUsed = true;
-      var bytes = utf8Bytes(body), ab = new ArrayBuffer(bytes.length), view = new Uint8Array(ab);
+      // Binary responses carry their exact bytes in base64; textual ones are
+      // encoded from the decoded string. Never re-encode lossy text as bytes.
+      var bytes = b64 ? b64ToBytes(b64) : utf8Bytes(body), ab = new ArrayBuffer(bytes.length), view = new Uint8Array(ab);
       for (var i = 0; i < bytes.length; i++) view[i] = bytes[i];
       return Promise.resolve(ab);
     };
@@ -1128,6 +1136,7 @@ const NET_SHIM: &str = r##"
     this.statusText = '';
     this.responseText = '';
     this.response = '';
+    this.responseBase64 = null;
     this.responseType = '';
     this.responseURL = '';
     this.withCredentials = false;
@@ -1222,9 +1231,17 @@ const NET_SHIM: &str = r##"
       this.statusText = r.statusText || '';
       this.responseURL = r.url || this._url;
       this.responseText = (r.body === undefined || r.body === null) ? '' : String(r.body);
-      this.response = this.responseType === 'json'
-        ? JSON.parse(this.responseText)
-        : this.responseText;
+      this.responseBase64 = (r.bodyB64 === undefined || r.bodyB64 === null) ? null : String(r.bodyB64);
+      if (this.responseType === 'json') {
+        this.response = JSON.parse(this.responseText);
+      } else if (this.responseType === 'arraybuffer') {
+        var bytes = this.responseBase64 ? b64ToBytes(this.responseBase64) : utf8Bytes(this.responseText);
+        var ab = new ArrayBuffer(bytes.length), view = new Uint8Array(ab);
+        for (var bi = 0; bi < bytes.length; bi++) view[bi] = bytes[bi];
+        this.response = ab;
+      } else {
+        this.response = this.responseText;
+      }
       queue(function () {
         if (self._aborted) return;
         self._fire('readystatechange');
@@ -1271,7 +1288,8 @@ fn wire_net(ctx: &rquickjs::Ctx<'_>, net: Option<NetFn>) -> Result<()> {
                                 "statusText": r.status_text,
                                 "url": r.url,
                                 "headers": r.headers,
-                                "body": r.body
+                                "body": r.body,
+                                "bodyB64": r.body_b64
                             }
                         }),
                         Err(e) => json!({ "ok": false, "error": e }),
@@ -1390,10 +1408,10 @@ pub struct JsOutcome {
 
 /// Heuristic: does the script contain an explicit `return`?
 ///
-/// A script runs as a function body, so only an explicit `return` yields a value.
-/// Knowing whether one was present lets the caller tell "your script computed
-/// nothing" apart from "your script never returned" — the latter is silent today
-/// and costs callers real debugging time.
+/// Scripts with a `return` run as a function body; scripts without one run as
+/// a program whose completion value is the result. Knowing which kind ran lets
+/// the caller tell "your script computed nothing" apart from "your script
+/// returned undefined on purpose".
 ///
 /// Deliberately permissive: if `return` appears anywhere, including inside a
 /// nested function, this stays quiet. A spurious warning on a script that did
@@ -1477,14 +1495,22 @@ pub fn run(
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         wire_net(&ctx, net)?;
 
-        let script = format!("(function(){{ {} }})()", script);
+        // Scripts with an explicit `return` run as a function body, as before.
+        // Scripts without one run as a program, so the value of the final
+        // expression comes back the way it would at a console: `1 + 1` is 2,
+        // not a silent null.
+        let program = if has_return(script) {
+            format!("(function(){{ {} }})()", script)
+        } else {
+            script.to_string()
+        };
         // A script that awaits a request finishes in pending jobs, not in the
         // call itself: `return await fetch(u).then(r => r.json())` yields a
         // promise, and the value only exists once the job queue has been
         // driven. Resolving it here is the difference between /v1/eval being
         // able to call an API and returning a promise nobody will ever run.
         let v = ctx
-            .eval::<rquickjs::Value, _>(script.as_str())
+            .eval::<rquickjs::Value, _>(program.as_str())
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         let value = match v.as_promise() {
             Some(promise) => match promise.finish::<rquickjs::Value>() {
@@ -1508,15 +1534,15 @@ pub fn run(
     let logs = logs.borrow().clone();
     let timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
 
-    // A `None` value is ambiguous: either the script returned nothing, or it
-    // never returned. Say which, rather than leaving the caller to guess.
+    // A `None` value without a `return` means the program's final statement
+    // produced no value (a declaration, or a call returning undefined). Say so
+    // rather than leaving the caller to debug a silent null.
     let mut warnings: Vec<Value> = Vec::new();
     if result.is_none() && !timed_out && !script.trim().is_empty() && !has_return(script) {
         warnings.push(json!({
             "code": "no_return_value",
-            "message": "The script produced no value. Scripts run as a function body, so a value is \
-                        only returned by an explicit `return` statement; the value of a trailing \
-                        expression is discarded."
+            "message": "The script produced no value. Its final statement has no value; \
+                        end with an expression, or use an explicit `return`."
         }));
     }
 
@@ -1844,6 +1870,21 @@ mod tests {
         )
     }
 
+    /// A host network that answers with binary content as base64.
+    fn fake_net_b64(b64: &'static str, seen: std::sync::Arc<std::sync::Mutex<Vec<NetRequest>>>) -> NetFn {
+        std::sync::Arc::new(move |req: NetRequest| {
+            seen.lock().unwrap().push(req.clone());
+            Ok(NetResponse {
+                status: 200,
+                status_text: "OK".into(),
+                url: "https://example.com/img.png".into(),
+                headers: vec![("content-type".into(), "image/png".into())],
+                body: "\u{fffd}\u{fffd}".into(), // lossy text, as the host produces for binary
+                body_b64: Some(b64.to_string()),
+            })
+        })
+    }
+
     /// A host network that answers every request from a fixed table and records
     /// what it was asked for, so tests can assert on the request as well as the
     /// rendered result.
@@ -1859,6 +1900,7 @@ mod tests {
                 url: "https://example.com/api/items".into(),
                 headers: vec![("content-type".into(), "application/json".into())],
                 body: body.to_string(),
+                body_b64: None,
             })
         })
     }
@@ -2198,6 +2240,29 @@ mod tests {
     }
 
     #[test]
+    fn binary_fetch_responses_carry_exact_bytes() {
+        let seen = empty_seen();
+        // Bytes 0x00 0xFF 0x10 encode to "AP8Q".
+        let net = fake_net_b64("AP8Q", seen.clone());
+        let out = run_net_on(
+            "<p>x</p>",
+            "return fetch('/img.png').then(function (r) { \
+                return r.arrayBuffer().then(function (ab) { \
+                    return [r.base64, new Uint8Array(ab).length, new Uint8Array(ab)[1]]; \
+                }); \
+            });",
+            Some(net),
+        )
+        .unwrap();
+        assert_eq!(
+            out.value,
+            Some(json!(["AP8Q", 3, 255])),
+            "base64 must be exposed and arrayBuffer must carry the exact bytes: {:?}",
+            out.value
+        );
+    }
+
+    #[test]
     fn executes_and_returns_a_value() {
         let out = run_on("<p>x</p>", "return 6 * 7;").unwrap();
         assert_eq!(out.value, Some(json!(42)));
@@ -2212,10 +2277,18 @@ mod tests {
     }
 
     #[test]
-    fn a_trailing_expression_without_return_warns_instead_of_failing_silently() {
-        // The footgun this warning exists for: `1 + 1` is a valid expression,
-        // but as a function body its value is discarded.
+    fn a_trailing_expression_without_return_comes_back_as_the_value() {
+        // Scripts without a `return` run as programs, so the completion value
+        // of the last expression is returned, the way a console would.
         let out = run_on("<p>x</p>", "1 + 1").unwrap();
+        assert_eq!(out.value, Some(json!(2)));
+        assert!(warn_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn a_program_whose_last_statement_has_no_value_warns() {
+        // A declaration leaves no completion value; the caller is told why.
+        let out = run_on("<p>x</p>", "var x = 1;").unwrap();
         assert_eq!(out.value, None);
         assert_eq!(warn_codes(&out), vec!["no_return_value"]);
     }

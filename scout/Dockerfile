@@ -1,11 +1,9 @@
 # Scout (Rust) — multi-stage build.
 #
-# NOTE: the *compile* step is verified, the image itself is not. `cargo build
-# --release --locked` succeeds on rustc 1.88.0 against the committed Cargo.lock;
-# it fails on 1.82, because the lock resolves `cookie_store` 0.22.1, `time` 0.3.55
-# and `icu_*` 2.3.0, which declare `rust-version = "1.88"`. 1.88 is the minimum:
-# 1.85 and 1.86 still fail. There is no Docker daemon in the authoring sandbox, so
-# the image has never been built — treat the first `docker build` as untested.
+# The toolchain pin matters: `cargo build --release --locked` needs rustc 1.88+
+# because the lock resolves `cookie_store` 0.22.1, `time` 0.3.55 and `icu_*`
+# 2.3.0, which declare `rust-version = "1.88"`. The image is built and
+# smoke-tested on every push by CI (.github/workflows/ci.yml).
 
 FROM rust:1.88-slim-bookworm AS build
 WORKDIR /src
@@ -32,9 +30,11 @@ RUN apt-get update \
 COPY --from=build /src/target/release/scout /usr/local/bin/scout
 
 USER scout
+# The binary reads HOST and PORT (not SCOUT_HOST/SCOUT_PORT, which earlier
+# revisions of this file set by mistake; they were silently ignored).
 ENV RUST_LOG=info \
-    SCOUT_HOST=0.0.0.0 \
-    SCOUT_PORT=8080 \
+    HOST=0.0.0.0 \
+    PORT=8080 \
     SCOUT_MEM_SOFT_MB=300 \
     SCOUT_MEM_HARD_MB=400
 

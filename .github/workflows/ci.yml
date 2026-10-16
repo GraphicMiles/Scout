@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scout
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: scout
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Unit and API tests
+        run: cargo test --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Conformance suite
+        run: node --test conformance/conformance.test.mjs
+
+      - name: SDK integration test
+        run: |
+          # The login fixture the signed-in session tests exercise.
+          python3 fixtures/login-app.py 8899 &
+          FIXTURE_PID=$!
+          # The SDK test's default key; the server must be started with it.
+          PORT=8203 \
+          SCOUT_API_KEYS=live_test_key_0123456789abcdef \
+          SCOUT_PRIVATE_ALLOWLIST=127.0.0.1 \
+          SCOUT_ALLOWED_PORTS=80,443,8899 \
+          SCOUT_RATE_LIMIT_PER_MIN=1000 \
+          ./target/release/scout &
+          SCOUT_PID=$!
+          sleep 1
+          SCOUT_URL=http://127.0.0.1:8203 \
+          SCOUT_API_KEY=live_test_key_0123456789abcdef \
+          SCOUT_FIXTURE_URL=http://127.0.0.1:8899 \
+          node sdk/test-sdk.mjs
+          STATUS=$?
+          kill $SCOUT_PID $FIXTURE_PID 2>/dev/null || true
+          exit $STATUS
+
+  docker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scout
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t scout-ci .
+
+      - name: Smoke test the container
+        run: |
+          docker run -d --name scout-ci \
+            --memory=512m --cpus=0.5 \
+            -e SCOUT_API_KEYS=ci_key_0123456789abcdef \
+            -p 8080:8080 scout-ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8080/health | grep -q '"status":"ok"'
+          curl -sf -H "authorization: Bearer ci_key_0123456789abcdef" \
+            http://127.0.0.1:8080/v1/strategies | grep -q youtube-channel-videos
+          # Unauthenticated requests must be refused even in the container.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/v1/strategies)
+          test "$CODE" = "401"
+          docker rm -f scout-ci

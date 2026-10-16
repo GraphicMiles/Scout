@@ -93,6 +93,7 @@ cargo build --release
 node --test conformance/conformance.test.mjs  # conformance suite against the binary
 SCOUT_URL=http://127.0.0.1:8080 SCOUT_API_KEY=key node sdk/test-sdk.mjs
 python3 bench/bench.py                        # benchmark
+node bench/compare-playwright.mjs             # vs Playwright/Chromium (needs: npm i playwright && npx playwright install chromium)
 ```
 
 ## Configuration

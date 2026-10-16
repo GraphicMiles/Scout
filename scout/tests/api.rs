@@ -567,6 +567,26 @@ async fn unsupported_content_types_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary_responses_come_back_as_base64_not_lossy_text() {
+    let h = harness().await;
+    // The request tool is the raw primitive; a binary body must arrive intact.
+    let (status, body) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "request", "arguments": { "url": format!("{}/image", h.fixture) } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["contentType"], "image/png");
+    let b64 = body["bodyBase64"].as_str().expect("bodyBase64 present for binary");
+    // 64 zero bytes encode to 21 groups of "AAAA" plus a final "AA==".
+    let expected = format!("{}AA==", "AAAA".repeat(21));
+    assert_eq!(b64, expected);
+    // And the textual body must not be pretending to be the binary content.
+    assert!(body["body"].as_str().unwrap_or("").trim_matches('\0').is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversized_responses_report_response_too_large() {
     let h = harness().await;
     let (status, body) = h.post("/v1/extract", json!({ "url": format!("{}/big", h.fixture) })).await;

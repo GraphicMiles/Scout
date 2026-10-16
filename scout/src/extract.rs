@@ -20,16 +20,18 @@ const SYMBOLS: &[(&str, &str)] = &[
 
 /// Parse a price.
 ///
-/// Handles US-style separators ("1,234.50") only. European style ("1.234,50")
-/// is documented as unsupported rather than guessed at, since guessing wrong
-/// would silently misreport a price by a factor of 1000.
+/// Handles both separator conventions instead of assuming US format:
+/// "1,234.50" and "1.234,50" and "1 234,50" all parse, because the roles of
+/// the separators are decided from the pattern, not from a locale default.
+/// The remaining ambiguity is resolved conservatively: "1,234" is grouping
+/// (1234), while "2.99" keeps its decimal point, matching the old US reading.
 pub fn parse_price(raw: &str) -> Option<Value> {
     let s = raw.trim();
     if s.is_empty() {
         return None;
     }
 
-    // Find the first numeric run, allowing comma/space thousands separators.
+    // Find the first numeric run, allowing comma/dot/space separators inside it.
     let bytes: Vec<char> = s.chars().collect();
     let mut start = None;
     let mut end = 0usize;
@@ -39,19 +41,20 @@ pub fn parse_price(raw: &str) -> Option<Value> {
                 start = Some(i);
             }
             end = i + 1;
-        } else if start.is_some() && (*c == ',' || *c == ' ' || *c == '.') {
+        } else if start.is_some() && (*c == ',' || *c == ' ' || *c == '.' || *c == '\u{a0}') {
             // continue through separators; a trailing one is trimmed later
         } else if start.is_some() {
             break;
         }
     }
     let start = start?;
-    let numeric: String = bytes[start..end].iter().collect();
-    let numeric = numeric.trim_end_matches([',', ' ', '.']).to_string();
+    let mut numeric: String = bytes[start..end].iter().collect();
+    numeric = numeric.trim_end_matches([',', ' ', '.', '\u{a0}']).to_string();
     if numeric.is_empty() {
         return None;
     }
-    let amount: f64 = numeric.replace([',', ' '], "").parse().ok()?;
+
+    let amount = parse_separators(&numeric)?;
 
     let prefix: String = bytes[..start].iter().collect();
     let suffix: String = bytes[end..].iter().collect();
@@ -61,7 +64,10 @@ pub fn parse_price(raw: &str) -> Option<Value> {
         .find(|(sym, _)| prefix.contains(sym) || suffix.contains(sym))
         .map(|(_, code)| code.to_string())
         .or_else(|| {
-            for code in ["USD", "EUR", "GBP", "NGN", "JPY", "INR"] {
+            for code in [
+                "USD", "EUR", "GBP", "NGN", "JPY", "INR", "CHF", "CAD", "AUD", "ZAR", "GHS",
+                "KES", "BRL", "MXN", "CNY", "RUB", "TRY", "PLN", "SEK", "AED",
+            ] {
                 if prefix.contains(code) || suffix.contains(code) {
                     return Some(code.to_string());
                 }
@@ -74,6 +80,69 @@ pub fn parse_price(raw: &str) -> Option<Value> {
         "currency": currency,
         "raw": raw.trim(),
     }))
+}
+
+/// Decide which separator is the decimal point from the pattern itself.
+///
+/// Rules, in order:
+/// - spaces (regular and non-breaking) are always thousands separators
+/// - if both `.` and `,` appear, the last one to appear is the decimal point
+///   ("1.234,50" is 1234.5; "1,234.50" is 1234.5)
+/// - a single `,` followed by 1 or 2 digits at the end is a decimal comma
+///   ("€2,99" is 2.99); a single `,` followed by exactly 3 digits, or repeated
+///   commas, are thousands separators ("1,234" and "1,234,567")
+/// - a single `.` stays a decimal point ("2.99", "0.125"), preserving the old
+///   US reading; repeated `.`s are thousands separators ("1.234.567")
+fn parse_separators(numeric: &str) -> Option<f64> {
+    let has_comma = numeric.contains(',');
+    let has_dot = numeric.contains('.');
+
+    let decimal: Option<char> = if has_comma && has_dot {
+        let last_comma = numeric.rfind(',').unwrap();
+        let last_dot = numeric.rfind('.').unwrap();
+        Some(if last_comma > last_dot { ',' } else { '.' })
+    } else if has_comma {
+        let last = numeric.rfind(',').unwrap();
+        let digits_after = numeric[last + 1..].chars().filter(|c| c.is_ascii_digit()).count();
+        let commas = numeric.matches(',').count();
+        if commas == 1 && digits_after <= 2 {
+            Some(',') // "1,50": decimal comma
+        } else if commas == 1 && digits_after > 3 {
+            Some(',') // "1,2345": an odd run, but decimal is the safe reading
+        } else {
+            None // "1,234" or "1,234,567": grouping
+        }
+    } else if has_dot {
+        if numeric.matches('.').count() > 1 {
+            None // "1.234.567": grouping
+        } else {
+            Some('.') // "2.99": decimal
+        }
+    } else {
+        None
+    };
+
+    let thousands: [char; 3] = match decimal {
+        Some(',') => ['.', ' ', '\u{a0}'],
+        Some('.') => [',', ' ', '\u{a0}'],
+        _ => [',', '.', ' '],
+    };
+
+    let mut cleaned = String::with_capacity(numeric.len());
+    for c in numeric.chars() {
+        if decimal == Some(c) {
+            cleaned.push('.');
+        } else if thousands.contains(&c) {
+            continue;
+        } else if c.is_ascii_digit() {
+            cleaned.push(c);
+        }
+        // Anything else cannot appear here: the run was digits and separators.
+    }
+    if !cleaned.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
 }
 
 pub fn parse_number(raw: &str) -> Option<f64> {
@@ -642,6 +711,44 @@ pub fn generic_page(page: &Page, limit: usize) -> (Value, Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_international_price_formats() {
+        // European decimal comma, dot as thousands separator.
+        let p = parse_price("1.234,50").unwrap();
+        assert_eq!(p["amount"], json!(1234.5));
+        // Both separators present, comma last: comma is the decimal.
+        let p = parse_price("€ 2,99").unwrap();
+        assert_eq!(p["amount"], json!(2.99));
+        assert_eq!(p["currency"], json!("EUR"));
+        // Space (or non-breaking space) thousands separators.
+        let p = parse_price("1 234 567,89").unwrap();
+        assert_eq!(p["amount"], json!(1234567.89));
+        let p = parse_price("1\u{a0}234,50").unwrap();
+        assert_eq!(p["amount"], json!(1234.5));
+        // Both separators, dot last: dot is the decimal.
+        let p = parse_price("1.234.567,89").unwrap();
+        assert_eq!(p["amount"], json!(1234567.89));
+        // A lone comma before exactly three digits is still grouping.
+        let p = parse_price("1,234").unwrap();
+        assert_eq!(p["amount"], json!(1234.0));
+        // A lone dot is still a decimal point (the old US reading).
+        let p = parse_price("9.99").unwrap();
+        assert_eq!(p["amount"], json!(9.99));
+        let p = parse_price("0.125").unwrap();
+        assert_eq!(p["amount"], json!(0.125));
+        // Pound and naira with separators.
+        let p = parse_price("£1,299.50").unwrap();
+        assert_eq!(p["amount"], json!(1299.5));
+        assert_eq!(p["currency"], json!("GBP"));
+        let p = parse_price("₦1,500.00").unwrap();
+        assert_eq!(p["amount"], json!(1500.0));
+        assert_eq!(p["currency"], json!("NGN"));
+        // Broader currency codes.
+        let p = parse_price("CHF 2,50").unwrap();
+        assert_eq!(p["amount"], json!(2.5));
+        assert_eq!(p["currency"], json!("CHF"));
+    }
 
     #[test]
     fn parses_prices_with_currency() {
