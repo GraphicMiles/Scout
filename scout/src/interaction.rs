@@ -811,6 +811,20 @@ mod tests {
     }
 
     #[test]
+    fn keys_other_than_enter_are_refused_by_name() {
+        // Keyboard input is Enter-only today. Naming the key in the error keeps
+        // this a declared limit rather than a generic failure.
+        let mut p = page_with("<form action='/s'><input name='q'></form>");
+        let a = Action::from_json(
+            &json!({ "type": "press", "selector": "input[name=q]", "key": "Tab" }),
+        )
+        .unwrap();
+        let err = apply(&mut p, &a, &cfg()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedCapability);
+        assert!(err.message.contains("Tab"), "error should name the key: {}", err.message);
+    }
+
+    #[test]
     fn enter_submits_a_get_form_with_query() {
         let mut p = page_with(
             "<form action='/search' method='GET'><input name='q'></form>",

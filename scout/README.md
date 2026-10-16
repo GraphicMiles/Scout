@@ -1,105 +1,150 @@
 # Scout
 
-Lightweight browser automation runtime with an authenticated HTTP API and a JS/TS SDK. This is a **working base**, not a Chromium replacement: it fetches documents over HTTP, parses and queries the DOM, fills and submits forms, and extracts structured data. It does **not** execute JavaScript yet.
+The Scout runtime: a lightweight browser automation runtime with an authenticated
+HTTP API, implemented in Rust.
 
-## Status at a glance
+This directory is **the product**. It began as a port of the Node reference
+implementation and is now the only supported runtime. It exposes the same HTTP API,
+the same SDK, the same error codes and the same test fixtures — verified against
+the Node base rather than described as equivalent.
 
-| Area | State |
-|---|---|
-| Fetch, redirects, cookies, sessions, SSRF policy | Working, tested |
-| HTML parser, CSS selectors, extraction (text, url, number, price, date) | Working, tested (own implementation, see below) |
-| Interactions: click link, fill, select, check, Enter, submit (urlencoded forms) | Working, tested |
-| Task queue: bounded, cancel, timeout, retries (navigation only), watchdog | Working, tested |
-| HTTP API (all required endpoints), auth, rate limits, body limits, metrics | Working, tested |
-| SDK | Working, tested against the real server |
-| JavaScript execution / browser APIs | **Not implemented**. Pages that need JS return a `js_required_likely` warning or a `compatibility_error` |
-| YouTube `youtube-channel-videos` | Verified against a **synthetic fixture only**; never run against real youtube.com |
-| Facebook, TikTok | **Not implemented.** Strategies exist and return `unsupported_capability` before any request is made |
-| Scroll, keyboard other than Enter, file upload, multipart forms | Return `unsupported_capability` |
-| Playwright / Lightpanda benchmark comparison | **Not run** (see Benchmarks) |
+The Node implementation lives in `../reference/node-base/` and is kept in the tree
+as the **contract reference**, not as a supported runtime: `conformance/` runs the
+ported test suite against this binary, and every contract question in this file was
+settled by running the Node service and reading its source, not by assumption.
+Deliberately, the port is ahead of it — it has an embedded JavaScript engine and a
+YouTube adapter verified against live pages, neither of which the Node base has.
 
-## Run
+## Build and run
 
 ```bash
-SCOUT_API_KEYS=$(openssl rand -hex 24) node src/index.js        # needs Node 22+, zero npm dependencies
-SCOUT_DEV_MODE=1 node src/index.js                              # local only: auth off when no keys are set
-docker build -t scout . && docker run --memory=512m --cpus=0.1 -e SCOUT_API_KEYS=... -p 8080:8080 scout
-npm test            # 45 tests
-npm run bench       # Linux only
+cargo build --release                     # target/release/scout
+cargo test                                # unit + in-process integration tests
+SCOUT_API_KEYS=$(openssl rand -hex 24) ./target/release/scout
+curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 ```
 
-## SDK
+Node 22 is needed only for the JavaScript SDK and the conformance suite
+(`sdk/` is the JS SDK, `conformance/` and `bench/` are JavaScript/Python
+harnesses). The service itself has no runtime dependency on Node, Playwright,
+Puppeteer or Chromium: `Cargo.toml` pulls `reqwest` (rustls), `scraper`/`html5ever`
+and `rquickjs` (QuickJS).
+
+Container: `Dockerfile` and `docker-compose.yml` are in this directory. **They were
+written but not built or run** — the authoring sandbox has no Docker daemon. The
+compose file sizes the cgroup limit above `SCOUT_MEM_HARD_MB` so the runtime's own
+watchdog fires before the kernel OOM killer.
+
+## Verification status
+
+| Suite | Command | Result |
+|---|---|---|
+| Rust unit tests | `cargo test --lib` | **103 passed / 0 failed** |
+| Rust in-process API tests | `cargo test --test api` | **22 passed / 0 failed** |
+| Ported conformance suite (Node's tests, same fixtures) | `node --test conformance/conformance.test.mjs` | **47 passed / 0 failed** |
+| JavaScript SDK against the live service | `SCOUT_URL=... node sdk/test-sdk.mjs` | **17 passed / 0 failed** |
+| Benchmark | `python3 bench/bench.py` | see below |
+
+The conformance suite starts the release binary on a free port, drives it through
+the same fixtures as the Node tests (`conformance/fixture.mjs` is a byte-identical
+port of `reference/node-base/test/helpers.js`) and asserts Node's status codes,
+error codes and payload shapes. It covers auth and config refusal, unknown-field rejection, all ten
+endpoints, redirects/gzip/JSON, malformed markup, sessions and cookie isolation,
+the SSRF and allowed-domain policy, rate limiting, payload caps, task queue
+behaviour (bounds, cancel, timeout, retries, memory admission), extraction
+schemas, form interaction and shutdown.
+
+## Measured benchmark (`bench/results/latest.json`)
+
+100 tasks per scenario, 2 vCPUs, local fixtures, sequential client, with
+`--release` and `lto`. Raw JSON: `bench/results/latest.json`.
+
+| Measure | Rust port | Node base (same fixtures) |
+|---|---|---|
+| Cold start to healthy | **3.4 ms** | ~192 ms |
+| Idle RSS | **4.8 MB** | ~64 MB |
+| Peak RSS | 46.9 MB | ~117 MB |
+| Small page (~1 KB), 100 tasks | 100 % success, 100 % accuracy, p50 0.7 ms, p95 0.8 ms | 100 % / 100 %, p50 4 ms |
+| Large page (8000 items, 0.8 MB), 100 tasks | 100 % success, 100 % accuracy, p50 55.1 ms, p95 62.7 ms | 100 % / 100 %, p50 90 ms |
+
+These numbers measure the runtime against local fixtures: no network latency, no
+JavaScript, no hostile markup, and no real-site compatibility claim is implied.
+Playwright/Chromium and Lightpanda were not benchmarked (no browsers in the
+sandbox), so no comparison against them is claimed.
+
+## Compatibility notes
+
+**Capability status is reported, never assumed.** `GET /v1/strategies` returns each
+strategy with its verification state: `generic-page` and `selectors` are
+`verified-fixtures`, `youtube-channel-videos` is **`verified-live`** (checked
+2026-10-16 against `https://www.youtube.com/@NASA/videos`, which served
+`lockupViewModel` rather than the older `videoRenderer` shape), and
+`facebook-jobs`, `facebook-marketplace` and `tiktok-profile` are `not_implemented`
+and refused with `unsupported_capability` *before* any network or queue use. No
+Facebook or TikTok compatibility is claimed.
+
+**Deliberate differences from the Node base.** Each was measured, not assumed:
+
+1. `POST /v1/navigate` requires `sessionId`, and a malformed id is a 400
+   (`"sessionId" is malformed`) — matching `parseNavigate`. Earlier builds of this
+   port accepted a bare `url` and created a temporary session; that divergence is
+   gone.
+2. A `<select multiple>` given more than one value returns `unsupported_capability`
+   instead of silently recording only the first. The Node base supports it; the
+   port's form state maps one key to one value, and quietly doing less would submit
+   a choice the caller never made.
+3. `scroll` returns `unsupported_capability` with an explanation (Node's own
+   `interaction.js` throws the same code). Unknown *action types* are a 400
+   `invalid_request`, as in Node's `parseAction` — the action list is closed.
+4. `GET /v1/eval`-style scripting: the port exposes `POST /v1/eval` (used by the
+   SDK's `eval()`) and the Node base has no equivalent endpoint. Additive only.
+5. `interact` responses carry the Node fields (`ok`, `type`, `navigated`, `page`)
+   plus `effect`/`warnings` for callers that want the port's own detail.
+
+**JavaScript.** An embedded QuickJS engine (`rquickjs`) is part of the runtime: the
+`eval` path runs real scripts against a read-only snapshot of the parsed document
+with a memory cap, stack cap and interrupt-based timeout, and captures `console`
+output. Page scripts are **not** executed during navigation yet — no event loop, no
+in-page `fetch`/`XMLHttpRequest`, no document mutation. A page whose content depends
+on those still reports `js_required_likely` rather than returning fabricated data.
+
+`POST /v1/eval` runs the script as a **function body**, so a value is returned only
+by an explicit `return`; a trailing expression's value is discarded.
 
 ```js
-import { ScoutClient } from './sdk/index.js';
-const scout = new ScoutClient({ baseUrl: process.env.SCOUT_URL, apiKey: process.env.SCOUT_API_KEY });
-
-const result = await scout.extract({ url: 'https://www.youtube.com/@CHANNEL/videos', strategy: 'youtube-channel-videos', limit: 10 });
-console.log(result.data, result.warnings);
-
-// Generic extraction
-await scout.extract({ url, schema: { item: 'li.item', fields: { name: '.name', price: { selector: '.price', type: 'price' }, link: { selector: 'a', type: 'url' } } } });
-
-// Session + interaction
-await scout.withSession(async (sessionId) => {
-  await scout.navigate({ sessionId, url });
-  await scout.interact({ sessionId, action: { type: 'fill', selector: 'input[name=q]', value: 'term' } });
-  await scout.interact({ sessionId, action: { type: 'press', selector: 'input[name=q]', key: 'Enter' } });
-  return scout.extract({ sessionId, strategy: 'generic-page' });
-});
-
-// Background task (navigation steps retry on 5xx/timeouts; interactions never auto-retry)
-const task = await scout.runTask({ steps: [{ op: 'navigate', url }, { op: 'extract', schema }] });
+{ "script": "1 + 1" }                      // value: null   + warning `no_return_value`
+{ "script": "return 1 + 1;" }              // value: 2
+{ "script": "return document.title;" }     // value: "Hacker News"
 ```
 
-## API
+When a script yields no value and contains no `return`, the response carries
+`warnings: [{ code: "no_return_value", … }]` so the caller is told why, instead of
+debugging a silent `null`. The check is deliberately permissive: if `return` appears
+anywhere in the source, no warning is raised, because a spurious warning would be
+worse than a missed one. A runaway script is an explicit `compatibility_error`
+("JavaScript exceeded its time limit"), never a `null`.
 
-`POST /v1/sessions` · `DELETE /v1/sessions/:id` (204) · `POST /v1/navigate` · `POST /v1/extract` · `POST /v1/interact` · `POST /v1/tasks` (202) · `GET /v1/tasks/:id` · `POST /v1/tasks/:id/cancel` · `GET /v1/strategies` · `GET /health` (public) · `GET /metrics` (Prometheus; `SCOUT_METRICS_TOKEN`, else an API key).
+**Other honest limits.** The YouTube adapter reads the first page of results only
+(continuation requests are not made); price parsing handles US-style separators
+only; the cookie jar screens a curated public-suffix list rather than the full PSL;
+`Dockerfile`/`docker-compose.yml` are unverified; Docker resource limits are
+enforced by the runtime's own budget checks plus the compose cgroup settings, and
+the compose file has not been exercised.
 
-Auth: `Authorization: Bearer <key>` or `x-api-key`. Errors always look like `{"error":{"code","message","retryable","details?"}}`. Unknown request fields are rejected. Every response includes `x-request-id`.
-Codes: 400 `invalid_request`, 401 `unauthorized`, 403 `blocked_destination`, 404 `not_found`, 409 `conflict`/`cancelled`, 413 `payload_too_large`, 415 `unsupported_content`, 422 `compatibility_error`/`element_not_found`, 429 `rate_limited`, 501 `unsupported_capability`, 502 `navigation_failed`/`response_too_large`, 503 `queue_full`/`overloaded`/`too_many_sessions`/`resource_limit`/`shutting_down`, 504 `navigation_timeout`/`task_timeout`.
+## Layout
 
-## Configuration (env)
-
-`SCOUT_API_KEYS` (required, 16+ chars each, comma-separated) · `SCOUT_METRICS_TOKEN` · `SCOUT_CONCURRENCY` (1) · `SCOUT_MAX_QUEUED` (16) · `SCOUT_MAX_SESSIONS` (8) · `SCOUT_NAV_TIMEOUT_MS` (15000) · `SCOUT_TASK_TIMEOUT_MS` (60000) · `SCOUT_MAX_RESPONSE_BYTES` (2 MB) · `SCOUT_MAX_DOM_NODES` (150000) · `SCOUT_RATE_LIMIT_PER_MIN` (120 per key) · `SCOUT_MEM_SOFT_MB` (300, reject new work) · `SCOUT_MEM_HARD_MB` (400, abort running task) · `SCOUT_ALLOWED_DOMAINS` · `SCOUT_PRIVATE_ALLOWLIST` (explicit opt-in for internal hosts) · `SCOUT_LOG_LEVEL`.
-
-## Security model
-
-- Every URL and every redirect hop is validated: http/https only, no embedded credentials, ports 80/443 only, no localhost/internal suffixes/single-label hosts, no private, loopback, link-local, metadata, CGNAT, multicast, mapped or NAT64 ranges, decimal/hex IP forms normalized. Resolved DNS addresses are checked again at connect time (rebinding).
-- Only textual document types are downloaded; images, fonts and media are refused by content type. No subresources are ever fetched.
-- Sessions and tasks are bound to the creating API key; other keys get `not_found`. Cookie jars are per session, scoped by domain/path/Secure, and cleared on destroy. Typed form values live in memory only and are dropped on navigation. Logs redact auth, cookie, password and token fields and never contain request bodies.
-- Keys compared via SHA-256 + `timingSafeEqual`; failed-auth attempts are throttled per address; per-key rate limits; 64 KB body limit.
-- Scout identifies itself honestly (`Scout/0.1`). It does not forge consent, solve CAPTCHAs, rotate identities or evade anti-bot systems; 401/403/429 and consent interstitials surface as errors.
-
-## Known gaps (plain observations, for the implementing agent)
-
-- No JavaScript runtime. `src/navigation.js` only emits a heuristic `js_required_likely` warning.
-- `src/html.js` is a tolerant tokenizer/tree builder, not an HTML5-compliant parser (no foster parenting or adoption agency; `<td>` inside unclosed inline elements nests incorrectly).
-- `src/cookies.js` has no public-suffix list; it only rejects bare-TLD `Domain=` values. Cookies are session-scoped, so impact is limited to one session.
-- Price parsing handles US-style separators only.
-- Sessions on one key share a global session cap (`SCOUT_MAX_SESSIONS`), not a per-key cap.
-- YouTube: first page only (about 30 videos); continuation requests are not made. Unverified against the live site, which may serve consent or bot-check pages to this client.
-- Docker image and compose file were written but not built or run (no Docker in the authoring sandbox).
-- Heap does not shrink after large pages: RSS stayed ~113 MB after the large-page scenario.
-
-## Benchmarks (measured here: Node 22.22, Linux, 1 vCPU, not throttled to 0.1)
-
-Scout child process with `--max-old-space-size=192 --expose-gc`, sequential tasks against local fixtures via the SDK. Raw output: `bench/results/latest.json`.
-
-| Measure | Result | Target |
-|---|---|---|
-| Cold start to healthy | ~190 ms | none |
-| Idle RSS | **~64 MB** | <50 MB: **not met** (bare Node baseline is ~63 MB) |
-| Peak RSS, 3-item page, 100 tasks | ~72 MB | <200 MB: met |
-| Peak RSS, 8000-item ~0.8 MB page, 100 tasks | ~117 MB | <200 MB: met |
-| Small page: success / accuracy / p50 / p95 / CPU per task | 100% / 100% / 4 ms / 12 ms / 2.3 ms | none |
-| Large page: success / accuracy / p50 / p95 / CPU per task | 100% / 100% / 90 ms / 133 ms / 92 ms | none |
-
-At `--cpus=0.1`, CPU-bound work takes roughly 10x its CPU time in wall time (about 1 s for the large page); this is an estimate and has not been measured under a real 0.1 CPU cap. Local fixtures have no network latency, JavaScript, or hostile markup, so these numbers say nothing about real-site compatibility. Playwright/Chromium and Lightpanda were not benchmarked: the authoring sandbox had no network or browsers. Add them as additional runners in `bench/` using the same fixtures.
-
-## Next steps, in order
-
-1. Run the YouTube strategy against real channels from the target deployment; record what breaks.
-2. Rust port of the hot path (idle memory is bounded by the Node runtime). Candidate crates to evaluate: `html5ever`/`scraper` or `lol_html` (parsing), `reqwest`/`hyper` + `cookie_store` (HTTP), `url`, `rquickjs` (QuickJS) vs `boa` (JS), `axum`. Keep the HTTP contract, SDK, tests and fixtures unchanged and use them as the conformance suite.
-3. Add an embedded JS runtime and the minimum DOM/`fetch`/`XMLHttpRequest` surface for pages that need it, driven by measured failures.
-4. Facebook/TikTok adapters only after real-page verification, within access rules; optional separate browser fallback for incompatible sites.
+```
+src/server.rs      HTTP surface: routing, auth, limits, error mapping
+src/scout.rs       orchestration: sessions, strategies, tasks, retries
+src/worker.rs      DOM thread affinity (scraper::Html is !Send) and the command loop
+src/interaction.rs click/fill/select/check/uncheck/press/submit + form submission
+src/extract.rs     typed field extraction (string, url, number, price, date)
+src/js.rs          embedded QuickJS: DOM snapshot shim, limits, console capture
+src/adapters/       strategy registry (generic-page, selectors, youtube, ...)
+src/tasks.rs       bounded queue, concurrency permits, admission, watchdog
+src/resources.rs   RSS sampling, soft/hard memory budgets
+src/security.rs    URL policy, DNS re-checks, guarded fetch
+conformance/       port of the Node test suite (fixture.mjs + conformance.test.mjs)
+sdk/               JavaScript SDK and its integration test
+bench/             benchmark client, fixtures and recorded results
+```

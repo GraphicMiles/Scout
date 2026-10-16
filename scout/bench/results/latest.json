@@ -1,41 +1,42 @@
 {
-  "when": "2026-10-16T07:14:47.038Z",
-  "node": "v22.22.2",
-  "cpus": 1,
-  "note": "Scout process only, measured from /proc. Host CPU is not throttled to 0.1; use cpuMsPerTask (CPU time) to estimate behaviour under --cpus=0.1. Playwright/Chromium and Lightpanda were NOT run.",
-  "coldStartMs": 192,
-  "idleRssMb": 63.8,
-  "finalRssMb": 113.3,
-  "peakRssMb": 116.7,
-  "totalCpuSec": 9.59,
+  "when": "2026-10-16T08:43:04Z",
+  "runtime": "scout (rust, release, lto)",
+  "cpus": 2,
+  "note": "Scout process only, measured from /proc. Persistent HTTP client, so latencies exclude client startup. Local fixtures with no network latency, no JavaScript and no hostile markup: these numbers measure the runtime, not real-site compatibility.",
+  "coldStartMs": 3.4,
+  "idleRssMb": 4.8,
+  "peakRssMb": 46.9,
+  "finalRssMb": 46.9,
+  "totalCpuSec": 5.39,
+  "tasksPerScenario": 100,
   "results": [
     {
       "scenario": "small-page (3 items, ~1 KB)",
       "tasks": 100,
-      "successRate": 1,
-      "extractionAccuracy": 1,
-      "firstResultMs": 27,
-      "p50Ms": 4,
-      "p95Ms": 12,
-      "cpuMsPerTask": 2.3,
-      "rssMbStart": 63.8,
-      "rssMbEnd": 71.4,
-      "rssMbMaxSampled": 71.4,
-      "peakRssMbSoFar": 72
+      "successRate": 1.0,
+      "extractionAccuracy": 1.0,
+      "firstResultMs": 2.2,
+      "p50Ms": 0.7,
+      "p95Ms": 0.8,
+      "cpuMsPerTask": 0.4,
+      "statuses": {
+        "200": 100
+      },
+      "errors": {}
     },
     {
-      "scenario": "large-page (8000 items, ~0.8 MB html)",
+      "scenario": "large-page (8000 items, ~0.8 MB)",
       "tasks": 100,
-      "successRate": 1,
-      "extractionAccuracy": 1,
-      "firstResultMs": 118,
-      "p50Ms": 90,
-      "p95Ms": 133,
-      "cpuMsPerTask": 92.2,
-      "rssMbStart": 71.4,
-      "rssMbEnd": 113.3,
-      "rssMbMaxSampled": 113.6,
-      "peakRssMbSoFar": 116.7
+      "successRate": 1.0,
+      "extractionAccuracy": 1.0,
+      "firstResultMs": 53.3,
+      "p50Ms": 55.1,
+      "p95Ms": 62.7,
+      "cpuMsPerTask": 53.5,
+      "statuses": {
+        "200": 100
+      },
+      "errors": {}
     }
   ]
 }

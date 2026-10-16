@@ -403,6 +403,24 @@ pub struct JsOutcome {
     pub logs: Vec<String>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// Why a `None` value is `None`. Empty unless something is worth reporting.
+    pub warnings: Vec<Value>,
+}
+
+/// Heuristic: does the script contain an explicit `return`?
+///
+/// A script runs as a function body, so only an explicit `return` yields a value.
+/// Knowing whether one was present lets the caller tell "your script computed
+/// nothing" apart from "your script never returned" — the latter is silent today
+/// and costs callers real debugging time.
+///
+/// Deliberately permissive: if `return` appears anywhere, including inside a
+/// nested function, this stays quiet. A spurious warning on a script that did
+/// return would be worse than a missed warning on one that did not.
+fn has_return(script: &str) -> bool {
+    script
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '$')
+        .any(|w| w == "return")
 }
 
 /// Run a script against a DOM snapshot in a fresh QuickJS context.
@@ -482,11 +500,26 @@ pub fn run(script: &str, snapshot: &Value, base_url: &str, user_agent: &str, tim
 
     let duration_ms = started.elapsed().as_millis() as u64;
     let logs = logs.borrow().clone();
+    let timed_out = timed_out.load(std::sync::atomic::Ordering::SeqCst);
+
+    // A `None` value is ambiguous: either the script returned nothing, or it
+    // never returned. Say which, rather than leaving the caller to guess.
+    let mut warnings: Vec<Value> = Vec::new();
+    if result.is_none() && !timed_out && !script.trim().is_empty() && !has_return(script) {
+        warnings.push(json!({
+            "code": "no_return_value",
+            "message": "The script produced no value. Scripts run as a function body, so a value is \
+                        only returned by an explicit `return` statement; the value of a trailing \
+                        expression is discarded."
+        }));
+    }
+
     Ok(JsOutcome {
         value: result,
         logs,
         duration_ms,
-        timed_out: timed_out.load(std::sync::atomic::Ordering::SeqCst),
+        timed_out,
+        warnings,
     })
 }
 
@@ -579,6 +612,55 @@ mod tests {
         let out = run_on("<p>x</p>", "return 6 * 7;").unwrap();
         assert_eq!(out.value, Some(json!(42)));
         assert!(!out.timed_out);
+    }
+
+    fn warn_codes(out: &JsOutcome) -> Vec<&str> {
+        out.warnings
+            .iter()
+            .filter_map(|w| w.get("code").and_then(|c| c.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_trailing_expression_without_return_warns_instead_of_failing_silently() {
+        // The footgun this warning exists for: `1 + 1` is a valid expression,
+        // but as a function body its value is discarded.
+        let out = run_on("<p>x</p>", "1 + 1").unwrap();
+        assert_eq!(out.value, None);
+        assert_eq!(warn_codes(&out), vec!["no_return_value"]);
+    }
+
+    #[test]
+    fn a_script_that_returns_null_is_not_warned_about() {
+        // `null` is a deliberate result, not a missing one.
+        let out = run_on("<p>x</p>", "return null;").unwrap();
+        assert_eq!(out.value, None);
+        assert!(warn_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn a_successful_return_is_never_warned_about() {
+        let out = run_on("<p>x</p>", "return 6 * 7;").unwrap();
+        assert_eq!(out.value, Some(json!(42)));
+        assert!(warn_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn the_warning_is_permissive_about_nested_returns() {
+        // The value is discarded here too, but `return` appears in the source,
+        // so the heuristic stays quiet. A spurious warning is worse than a
+        // missed one — this documents that trade-off.
+        let out = run_on("<p>x</p>", "function f() { return 1; } f();").unwrap();
+        assert!(warn_codes(&out).is_empty());
+    }
+
+    #[test]
+    fn a_timed_out_script_reports_the_timeout_not_a_missing_value() {
+        // A runaway script is an explicit error, not a null value — so there is
+        // no ambiguity for the warning to resolve, and none is emitted.
+        let err = run_on("<p>x</p>", "while (true) {}").unwrap_err();
+        assert_eq!(err.code, ErrorCode::CompatibilityError);
+        assert!(err.message.contains("time limit"), "got: {}", err.message);
     }
 
     #[test]

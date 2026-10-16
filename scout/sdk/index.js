@@ -57,6 +57,9 @@ export class ScoutClient {
   navigate(params, opts) { return this.#request('POST', '/v1/navigate', params, opts?.signal); }
   extract(params, opts) { return this.#request('POST', '/v1/extract', params, opts?.signal); }
   interact(params, opts) { return this.#request('POST', '/v1/interact', params, opts?.signal); }
+
+  /** Execute JavaScript against the session's loaded page (read-only DOM snapshot). */
+  eval(params, opts) { return this.#request('POST', '/v1/eval', params, opts?.signal); }
   submitTask(spec) { return this.#request('POST', '/v1/tasks', spec); }
   getTask(id) { return this.#request('GET', `/v1/tasks/${id}`); }
   cancelTask(id) { return this.#request('POST', `/v1/tasks/${id}/cancel`, {}); }

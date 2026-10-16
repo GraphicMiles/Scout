@@ -223,11 +223,13 @@ impl WorkerState {
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
         )?;
+        // `warnings` is additive: callers that only read `value` are unaffected.
         Ok(json!({
             "value": out.value,
             "logs": out.logs,
             "durationMs": out.duration_ms,
             "timedOut": out.timed_out,
+            "warnings": out.warnings,
         }))
     }
 }
