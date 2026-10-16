@@ -1,0 +1,14 @@
+services:
+  scout:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      SCOUT_API_KEYS: ${SCOUT_API_KEYS:?set one or more comma-separated keys, 16+ chars each}
+      SCOUT_METRICS_TOKEN: ${SCOUT_METRICS_TOKEN:-}
+    mem_limit: 512m
+    cpus: 0.1
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: unless-stopped
