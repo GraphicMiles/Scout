@@ -99,6 +99,12 @@ pub fn manifest() -> Value {
         tool("select", "Choose an option in a <select>. A <select multiple> accepts an array of values.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "value": { "type": ["string", "array"], "items": { "type": "string" } } }), &["sessionId", "selector", "value"]),
         tool("check", "Check or uncheck a checkbox or radio.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "checked": { "type": "boolean" } }), &["sessionId", "selector"]),
         tool("press", "Press a key on an element. Enter submits the element's form; any other key is dispatched to the page's scripts as keydown/keypress/keyup events.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "key": { "type": "string" } }), &["sessionId", "selector", "key"]),
+        tool("upload", "Stage a file on an input[type=file] control. The contents are base64; submitting the form sends it as multipart/form-data. Runs no scripts.", json!({
+            "sessionId": sid(),
+            "selector": { "type": "string" },
+            "filename": { "type": "string", "description": "File name to send" },
+            "contentBase64": { "type": "string", "description": "File contents, base64 encoded" }
+        }), &["sessionId", "selector", "filename", "contentBase64"]),
         tool("scroll", "Scroll the page. Fires scroll events into the page's scripts, so lazy-loading pages fetch and render more content. Runs the page's scripts again first; scripts that append unconditionally on load may duplicate content.", json!({ "sessionId": sid(), "value": { "type": "integer", "minimum": 0, "description": "Pixels to scroll to; default 800" } }), &["sessionId"]),
         tool("submit", "Submit the form containing the matched element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId", "selector"]),
         tool("evaluate", "Run JavaScript in the page and return a value. Scripts run as a function body, so use an explicit `return`.", json!({ "sessionId": sid(), "script": { "type": "string" } }), &["sessionId", "script"]),
@@ -316,6 +322,13 @@ pub async fn call(
             let ir = interact(
                 &str_arg("sessionId")?,
                 json!({ "type": kind, "selector": str_arg("selector")? }),
+            )?;
+            run_interact(scout, owner, ir).await?
+        }
+        "upload" => {
+            let ir = interact(
+                &str_arg("sessionId")?,
+                json!({ "type": "upload", "selector": str_arg("selector")?, "value": str_arg("filename")?, "contentBase64": str_arg("contentBase64")? }),
             )?;
             run_interact(scout, owner, ir).await?
         }

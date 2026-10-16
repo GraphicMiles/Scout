@@ -122,6 +122,115 @@ async fn harness() -> Harness {
         }))
         // A page whose content only exists after a fetch() resolves.
         .route("/spa", get(|| async { Html(SPA_HTML) }))
+        // Web Storage persistence across navigations.
+        .route("/store-write", get(|| async { Html(STORE_WRITE_HTML) }))
+        .route("/store-read", get(|| async { Html(STORE_READ_HTML) }))
+        // The upload flow: stage a file, submit, echo the multipart body.
+        .route("/form-upload", get(|| async { Html(UPLOAD_HTML) }))
+        // ES modules: the import chain resolves against this server.
+        .route("/module-page", get(|| async { Html(MODULE_HTML) }))
+        .route(
+            "/js/render.js",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript")],
+                    "import { label } from './label.js';\nexport function render(el) { el.textContent = label(); }",
+                )
+            }),
+        )
+        .route(
+            "/js/label.js",
+            get(|| async {
+                (
+                    [("content-type", "text/javascript")],
+                    "export function label() { return 'module chain ok'; }",
+                )
+            }),
+        )
+        // YouTube pagination: a channel page with ytcfg + a continuation
+        // token, then two browse responses.
+        .route(
+            "/yt/channel",
+            get(|| async {
+                let initial = serde_json::json!({
+                    "metadata": { "channelMetadataRenderer": { "externalId": "UCyt", "title": "Yt Fixture" } },
+                    "contents": { "richGridRenderer": { "contents": [
+                        { "richItemRenderer": { "content": { "lockupViewModel": {
+                            "contentId": "yt-001",
+                            "metadata": { "lockupMetadataViewModel": { "title": { "content": "Video One" } } }
+                        } } } },
+                        { "richItemRenderer": { "content": { "lockupViewModel": {
+                            "contentId": "yt-002",
+                            "metadata": { "lockupMetadataViewModel": { "title": { "content": "Video Two" } } }
+                        } } } },
+                        { "continuationItemRenderer": { "continuationEndpoint": {
+                            "continuationCommand": { "token": "yt-token-1" }
+                        } } }
+                    ] } }
+                });
+                let ytcfg = serde_json::json!({
+                    "INNERTUBE_API_KEY": "AIza-fixture",
+                    "INNERTUBE_CONTEXT": { "client": { "clientName": "WEB", "clientVersion": "9.9" } },
+                    "INNERTUBE_CONTEXT_CLIENT_NAME": "1",
+                    "INNERTUBE_CLIENT_VERSION": "9.9"
+                });
+                Html(format!(
+                    "<html><body><script>var ytInitialData = {initial};</script>\
+                     <script>ytcfg.set({ytcfg});</script></body></html>"
+                ))
+            }),
+        )
+        .route(
+            "/youtubei/v1/browse",
+            post(|headers: axum::http::HeaderMap, body: String| async move {
+                assert!(
+                    headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").contains("json"),
+                    "browse must be posted as JSON"
+                );
+                let req: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let token = req["continuation"].as_str().unwrap_or("");
+                let page1 = |token: &str| serde_json::json!({
+                    "onResponseReceivedActions": [ { "appendContinuationItemsAction": { "continuationItems": [
+                        { "richItemRenderer": { "content": { "lockupViewModel": {
+                            "contentId": "yt-003",
+                            "metadata": { "lockupMetadataViewModel": { "title": { "content": "Video Three" } } }
+                        } } } },
+                        { "richItemRenderer": { "content": { "videoRenderer": {
+                            "videoId": "yt-004", "title": { "simpleText": "Video Four" }
+                        } } } },
+                        { "continuationItemRenderer": { "continuationEndpoint": {
+                            "continuationCommand": { "token": token }
+                        } } }
+                    ] } } ]
+                });
+                let last = serde_json::json!({
+                    "onResponseReceivedActions": [ { "appendContinuationItemsAction": { "continuationItems": [
+                        { "richItemRenderer": { "content": { "lockupViewModel": {
+                            "contentId": "yt-005",
+                            "metadata": { "lockupMetadataViewModel": { "title": { "content": "Video Five" } } }
+                        } } } }
+                    ] } } ]
+                });
+                axum::Json(match token {
+                    "yt-token-1" => page1("yt-token-2"),
+                    _ => last,
+                })
+            }),
+        )
+        // A multipart echo for the upload action.
+        .route(
+            "/upload",
+            post(|headers: axum::http::HeaderMap, body: String| async move {
+                let ct = headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                Html(format!(
+                    "<!doctype html><html><head><title>U</title></head><body><pre id=\"body\">{body}</pre><span id=\"ct\">{ct}</span></body></html>"
+                ))
+            }),
+        )
         // A lazy-loading page for the scroll action.
         .route("/lazy", get(|| async { Html(LAZY_HTML) }))
         // A key-reactive page for the press action.
@@ -160,6 +269,9 @@ async fn harness() -> Harness {
     cfg.rate_limit_per_min = 1_000;
     cfg.session_ttl_ms = 60_000;
     cfg.js_timeout_ms = 2_000;
+    cfg.max_body_bytes = 64 * 1024;
+    cfg.max_upload_bytes = 1024;
+    cfg.youtube_hosts = vec!["127.0.0.1".into()];
 
     let (scout, _server_task, local) = scout::server::start(cfg).await.unwrap();
     Harness {
@@ -280,7 +392,7 @@ const LAZY_HTML: &str = r#"<!doctype html>
   </script>
 </body></html>"#;
 
-/// A page that reacts to key events: the pattern search-as-you-type uses.
+/// A key-reactive page: the pattern search-as-you-type uses.
 const KEYS_HTML: &str = r#"<!doctype html>
 <html><head><title>Keys</title></head>
 <body>
@@ -294,6 +406,48 @@ const KEYS_HTML: &str = r#"<!doctype html>
       }
     });
   </script>
+</body></html>"#;
+
+/// Writes to localStorage on load.
+const STORE_WRITE_HTML: &str = r#"<!doctype html>
+<html><head><title>Write</title></head>
+<body><div id="out">wrote</div>
+  <script>
+    localStorage.setItem('token', 'ses-ok');
+    sessionStorage.setItem('tab', '1');
+  </script>
+</body></html>"#;
+
+/// Reads localStorage back on a later navigation.
+const STORE_READ_HTML: &str = r#"<!doctype html>
+<html><head><title>Read</title></head>
+<body><div id="out"></div>
+  <script>
+    document.getElementById('out').textContent =
+      'token=' + localStorage.getItem('token') + ';tab=' + sessionStorage.getItem('tab');
+  </script>
+</body></html>"#;
+
+/// An ES module page: an inline module imports a relative module, which
+/// imports another. Content only appears if the whole chain runs.
+const MODULE_HTML: &str = r#"<!doctype html>
+<html><head><title>Mod</title></head>
+<body><div id="out">empty</div>
+  <script type="module">
+    import { render } from '/js/render.js';
+    render(document.getElementById('out'));
+  </script>
+</body></html>"#;
+
+/// A form that only makes sense with a staged file.
+const UPLOAD_HTML: &str = r#"<!doctype html>
+<html><head><title>Upload</title></head>
+<body>
+  <form action="/upload" method="post">
+    <input type="text" name="note" value="">
+    <input type="file" name="cv">
+    <button type="submit" name="go" value="1">Go</button>
+  </form>
 </body></html>"#;
 
 // The fixture server must outlive each test, so it is started per-test above and
@@ -699,6 +853,266 @@ async fn press_dispatches_key_events_to_page_scripts() {
         )
         .await;
     assert_eq!(text["text"], json!("a"), "the keydown handler must see the key exactly once: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_storage_survives_navigation_and_evals() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+
+    let (status, _) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/store-write", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // A separate /v1/eval call runs in a fresh context; storage must persist.
+    let (status, ev) = h
+        .post(
+            "/v1/eval",
+            json!({ "sessionId": sid, "script": "return [localStorage.getItem('token'), sessionStorage.getItem('tab')];" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{ev}");
+    assert_eq!(ev["value"], json!(["ses-ok", "1"]), "storage written on load must be readable later: {ev}");
+
+    // A new navigation keeps it: a browser's storage is per session, not per page.
+    let (status, _) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/store-read", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, text) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "page.text", "arguments": { "sessionId": sid, "selector": "#out" } }),
+        )
+        .await;
+    assert_eq!(
+        text["text"], json!("token=ses-ok;tab=1"),
+        "the next page must see the stored values: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_stages_a_file_and_submits_as_multipart() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+
+    let (status, _) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/form-upload", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // "file contents here" in base64.
+    let content_b64 = "ZmlsZSBjb250ZW50cyBoZXJl";
+
+    let (status, up) = h
+        .post(
+            "/v1/interact",
+            json!({
+                "sessionId": sid,
+                "action": {
+                    "type": "upload",
+                    "selector": "input[name=cv]",
+                    "value": "cv.txt",
+                    "contentBase64": content_b64
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{up}");
+    assert_eq!(up["effect"], json!("none"), "{up}");
+    assert_eq!(up["detail"]["fileName"], json!("cv.txt"), "{up}");
+    assert_eq!(up["detail"]["sizeBytes"], json!(18), "{up}");
+
+    let (status, _) = h
+        .post(
+            "/v1/interact",
+            json!({ "sessionId": sid, "action": { "type": "fill", "selector": "input[name=note]", "value": "see attached" } }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // The form has no enctype; staging a file upgrades it, like a browser.
+    let (status, sub) = h
+        .post(
+            "/v1/interact",
+            json!({ "sessionId": sid, "action": { "type": "submit", "selector": "form" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "{sub}");
+    assert_eq!(sub["effect"], json!("navigate"), "{sub}");
+    assert_eq!(sub["page"]["url"], json!(format!("{}/upload", h.fixture)), "{sub}");
+
+    // The echo page shows what the server received.
+    let (_, ct) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "page.text", "arguments": { "sessionId": sid, "selector": "#ct" } }),
+        )
+        .await;
+    assert!(
+        ct["text"].as_str().unwrap_or("").starts_with("multipart/form-data; boundary="),
+        "content type was {ct}"
+    );
+    let (_, body) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "page.text", "arguments": { "sessionId": sid, "selector": "#body" } }),
+        )
+        .await;
+    let body = body["text"].as_str().unwrap_or("");
+    assert!(body.contains("content-disposition: form-data; name=\"note\"\n\nsee attached\n"), "body was {body:?}");
+    assert!(body.contains("content-disposition: form-data; name=\"cv\"; filename=\"cv.txt\"\n"), "body was {body:?}");
+    assert!(body.contains("content-type: application/octet-stream\n\nfile contents here\n"), "body was {body:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_scripts_run_and_render_content() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+
+    let (status, nav) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/module-page", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200, "{nav}");
+    // The inline module and both imports must have run for this to appear.
+    let (_, text) = h
+        .post(
+            "/v1/tools/call",
+            json!({ "name": "page.text", "arguments": { "sessionId": sid, "selector": "#out" } }),
+        )
+        .await;
+    assert_eq!(
+        text["text"], json!("module chain ok"),
+        "the import chain must render: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn youtube_pagination_follows_continuations_up_to_the_limit() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+
+    // The strategy rewrites the channel root to its videos tab.
+    let (status, _) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/yt/channel", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // limit 2: the first page already satisfies it; no browse request needed.
+    let (status, r) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "sessionId": sid,
+                "strategy": "youtube-channel-videos",
+                "url": format!("{}/yt/channel", h.fixture),
+                "limit": 2
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["data"]["count"], 2, "{r}");
+
+    // limit 10: two pages, two continuation requests, five videos total.
+    let (status, r) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "sessionId": sid,
+                "strategy": "youtube-channel-videos",
+                "url": format!("{}/yt/channel", h.fixture),
+                "limit": 10
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["data"]["count"], 5, "all pages must be read: {r}");
+    let ids: Vec<&str> = r["data"]["videos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["videoId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["yt-001", "yt-002", "yt-003", "yt-004", "yt-005"], "document order: {r}");
+    assert_eq!(r["data"]["videos"][2]["title"], "Video Three");
+    assert_eq!(r["data"]["channel"]["title"], "Yt Fixture");
+
+    // limit 4 stops between pages: first page plus one continuation, truncated.
+    let (status, r) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "sessionId": sid,
+                "strategy": "youtube-channel-videos",
+                "url": format!("{}/yt/channel", h.fixture),
+                "limit": 4
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["data"]["count"], 4, "{r}");
+    assert!(
+        r["warnings"].as_array().unwrap().iter().any(|w| w["code"] == "limit_reached"),
+        "the truncation must be said out loud: {r}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_over_the_configured_cap_are_refused() {
+    let h = harness().await;
+    let (_, sess) = h.post("/v1/sessions", json!({})).await;
+    let sid = sess["id"].as_str().expect("session id").to_string();
+    let (status, _) = h
+        .post(
+            "/v1/navigate",
+            json!({ "sessionId": sid, "url": format!("{}/form-upload", h.fixture) }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // 800 bytes of "A": 0x41 repeated, over the harness's 1024-byte cap? No:
+    // 800 < 1024. Use 2000 bytes instead: "QQ..." base64 of 0x41 padding.
+    let big = "QQ==".repeat(500); // decodes to 1500 bytes
+    let (status, err) = h
+        .post(
+            "/v1/interact",
+            json!({
+                "sessionId": sid,
+                "action": {
+                    "type": "upload",
+                    "selector": "input[name=cv]",
+                    "value": "big.bin",
+                    "contentBase64": big
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
+    assert!(
+        err["error"]["message"].as_str().unwrap_or("").contains("limit is 1024"),
+        "message should name the limit: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

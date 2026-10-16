@@ -44,9 +44,9 @@ pub enum StrategySpec {
 /// A script the page asked for, in document order.
 pub enum ScriptSource {
     /// Body is already in the document.
-    Inline(String),
+    Inline { body: String, module: bool },
     /// Needs fetching against the page URL before it can run.
-    External(String),
+    External { src: String, module: bool },
 }
 
 pub struct LoadOutcome {
@@ -65,9 +65,9 @@ pub enum Cmd {
     /// Run the page's scripts and rebuild the DOM from what they produced.
     RunScripts {
         session: String,
-        /// Bodies in document order; an empty string means it could not be
+        /// Scripts in document order; an empty body means it could not be
         /// fetched, which is recorded rather than fatal.
-        scripts: Vec<String>,
+        scripts: Vec<js::Script>,
         /// The session's network, if in-page requests are allowed. Built on the
         /// async side, where the client, the jar and the SSRF policy live, and
         /// handed to the worker so scripts never touch them directly.
@@ -115,13 +115,21 @@ pub enum Cmd {
 struct WorkerState {
     pages: HashMap<String, Page>,
     cfg: Arc<Config>,
+    /// Shared HTTP client for the one worker-side fetch that exists: YouTube
+    /// continuation requests, which need the page's own JSON data to build.
+    client: reqwest::Client,
+    /// The async runtime, so the sync worker can run that fetch. Dedicated
+    /// threads may block on it; runtime threads never reach this code.
+    rt: Option<tokio::runtime::Handle>,
 }
 
 impl WorkerState {
-    fn new(cfg: Arc<Config>) -> Self {
+    fn new(cfg: Arc<Config>, client: reqwest::Client, rt: Option<tokio::runtime::Handle>) -> Self {
         Self {
             pages: HashMap::new(),
             cfg,
+            client,
+            rt,
         }
     }
 
@@ -175,7 +183,7 @@ impl WorkerState {
                 .with_details(json!({ "status": fetched.status, "url": fetched.url })));
         }
 
-        let page = if fetched.content_type.contains("json") {
+        let mut page = if fetched.content_type.contains("json") {
             let parsed: Value = serde_json::from_str(&fetched.body).map_err(|_| {
                 ScoutError::new(
                     ErrorCode::UnsupportedContent,
@@ -211,6 +219,13 @@ impl WorkerState {
             Vec::new()
         };
 
+        // Web Storage belongs to the session, not the document: a new page
+        // load inherits what the previous page stored.
+        if let Some(carried) = self.pages.get(session).map(|old| old.storage.clone()) {
+            page.storage = carried;
+        }
+
+
         let summary = json!({
             "url": page.url,
             "status": page.status,
@@ -235,9 +250,7 @@ impl WorkerState {
         let (data, warnings) = match spec {
             StrategySpec::GenericPage => extract::generic_page(page, limit),
             StrategySpec::Selectors(schema) => extract::extract_by_schema(page, schema, limit),
-            StrategySpec::YoutubeChannelVideos => {
-                crate::adapters::youtube::extract(page, limit, &self.cfg.youtube_hosts)?
-            }
+            StrategySpec::YoutubeChannelVideos => self.youtube_extract(page, limit)?,
         };
         // Page-level warnings travel with the extraction too. A caller that
         // only ever calls /v1/extract must still be told when the page is a
@@ -259,6 +272,105 @@ impl WorkerState {
         }))
     }
 
+    /// YouTube channel videos: the served page first, then continuation
+    /// requests while the limit still wants more and the page offers a token.
+    /// A failed continuation degrades to what is already read, with a warning.
+    fn youtube_extract(
+        &self,
+        page: &Page,
+        limit: usize,
+    ) -> Result<(Value, Vec<Value>)> {
+        use crate::adapters::youtube;
+
+        let (mut data, mut warnings, mut cont) =
+            youtube::first_page(page, limit, &self.cfg.youtube_hosts)?;
+
+        let Some(rt) = self.rt.as_ref() else {
+            if cont.is_some() {
+                warnings.push(json!({
+                    "code": "continuation_unavailable",
+                    "message": "More videos exist, but this server cannot issue continuation requests.",
+                }));
+            }
+            return Ok((data, warnings));
+        };
+
+        // Bound the work: a page of results per request, a handful of pages.
+        const MAX_CONTINUATION_PAGES: usize = 6;
+        let mut items: Vec<Value> = data["videos"].as_array().cloned().unwrap_or_default();
+        let mut seen: std::collections::HashSet<String> = items
+            .iter()
+            .filter_map(|v| v["videoId"].as_str().map(|s| s.to_string()))
+            .collect();
+        let mut next = cont.take();
+        let mut pages = 0usize;
+        let mut failed: Option<String> = None;
+
+        while items.len() < limit && pages < MAX_CONTINUATION_PAGES {
+            let Some(c) = next.clone() else { break };
+            let body = youtube::browse_body(&c);
+            let fetched = rt.block_on(crate::security::guarded_fetch(
+                &self.cfg,
+                &self.client,
+                crate::security::FetchRequest {
+                    url: &c.url,
+                    method: "POST",
+                    headers: youtube::browse_headers(&c),
+                    body: Some(body),
+                    jar: None,
+                    kind: crate::security::FetchKind::Xhr,
+                    referer: Some(page.url.as_str()),
+                    timeout_ms: self.cfg.nav_timeout_ms,
+                    max_bytes: self.cfg.max_response_bytes,
+                },
+            ));
+            let fetched = match fetched {
+                Ok(f) => f,
+                Err(e) => {
+                    failed = Some(e.message.clone());
+                    break;
+                }
+            };
+            let root: serde_json::Value = match serde_json::from_slice(fetched.body.as_bytes()) {
+                Ok(v) => v,
+                Err(_) => {
+                    failed = Some("continuation response was not JSON".into());
+                    break;
+                }
+            };
+            let (more, token) = youtube::parse_browse(&root);
+            for v in more {
+                if let Some(id) = v["videoId"].as_str() {
+                    if seen.insert(id.to_string()) {
+                        items.push(v);
+                    }
+                }
+            }
+            next = token.map(|t| crate::adapters::youtube::Continuation {
+                token: t,
+                ..c.clone()
+            });
+            pages += 1;
+        }
+
+        if let Some(why) = failed {
+            warnings.push(json!({
+                "code": "continuation_failed",
+                "message": format!("Continuation requests failed after {pages} page(s): {why}"),
+            }));
+        } else if items.len() >= limit && next.is_some() {
+            warnings.push(json!({
+                "code": "limit_reached",
+                "message": format!("Only the first {limit} videos were returned; more exist."),
+            }));
+        }
+
+        items.truncate(limit);
+        data["videos"] = serde_json::Value::Array(items);
+        data["count"] = serde_json::json!(data["videos"].as_array().map(|a| a.len()).unwrap_or(0));
+        Ok((data, warnings))
+    }
+
     fn interact(&mut self, session: &str, action: Action) -> Result<Effect> {
         // Interaction records typed values in the page's own form state, so it
         // needs a mutable borrow; the parsed tree itself is never rewritten.
@@ -278,7 +390,7 @@ impl WorkerState {
     fn run_scripts(
         &mut self,
         session: &str,
-        scripts: Vec<String>,
+        scripts: Vec<js::Script>,
         net: Option<js::NetFn>,
         save: bool,
     ) -> Result<Value> {
@@ -294,11 +406,13 @@ impl WorkerState {
         };
 
         let snapshot = js::dom_snapshot(doc);
+        let storage = page.storage.clone();
         let out = js::run_page(
             &scripts,
             &snapshot,
             &page.url,
             &self.cfg.user_agent,
+            &storage,
             net,
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
@@ -312,6 +426,10 @@ impl WorkerState {
                 page.doc = Some(new_doc);
                 page.warnings = warnings;
             }
+        }
+        // Persist Web Storage mutations from the scripts.
+        if let Some(st) = out.storage {
+            page.storage = st;
         }
         // Keep the page's own scripts for later event passes (scroll, key
         // press): those re-run them so their listeners exist again. Only the
@@ -418,7 +536,7 @@ impl WorkerState {
             }
         };
 
-        scripts.push(extra);
+        scripts.push(js::Script::classic(extra));
         let mut summary = self.run_scripts(session, scripts, net, false)?;
         if let Some(obj) = summary.as_object_mut() {
             obj.insert("event".into(), json!({ "kind": kind, "key": key, "scrollPx": scroll_px }));
@@ -426,24 +544,33 @@ impl WorkerState {
         Ok(summary)
     }
 
-    fn eval(&self, session: &str, script: &str, net: Option<js::NetFn>) -> Result<Value> {
-        let page = self.page(session)?;
-        let Some(doc) = page.doc.as_ref() else {
-            return Err(ScoutError::new(
-                ErrorCode::CompatibilityError,
-                "JavaScript execution needs an HTML page",
-            ));
+    fn eval(&mut self, session: &str, script: &str, net: Option<js::NetFn>) -> Result<Value> {
+        let (snapshot, url, storage_in) = {
+            let page = self.page(session)?;
+            let Some(doc) = page.doc.as_ref() else {
+                return Err(ScoutError::new(
+                    ErrorCode::CompatibilityError,
+                    "JavaScript execution needs an HTML page",
+                ));
+            };
+            (js::dom_snapshot(doc), page.url.clone(), page.storage.clone())
         };
-        let snapshot = js::dom_snapshot(doc);
         let out = js::run(
             script,
             &snapshot,
-            &page.url,
+            &url,
             &self.cfg.user_agent,
+            &storage_in,
             net,
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
         )?;
+        // Persist Web Storage mutations the script made.
+        if let Some(st) = out.storage {
+            if let Some(page) = self.pages.get_mut(session) {
+                page.storage = st;
+            }
+        }
         // `warnings` is additive: callers that only read `value` are unaffected.
         Ok(json!({
             "value": out.value,
@@ -479,9 +606,13 @@ fn collect_scripts(doc: Option<&scraper::Html>, limit: usize) -> Vec<ScriptSourc
         {
             continue;
         }
+        let module = kind == "module";
         match node.attr("src").map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            Some(src) => out.push(ScriptSource::External(src.to_string())),
-            None => out.push(ScriptSource::Inline(el.text().collect::<String>())),
+            Some(src) => out.push(ScriptSource::External { src: src.to_string(), module }),
+            None => out.push(ScriptSource::Inline {
+                body: el.text().collect::<String>(),
+                module,
+            }),
         }
     }
     out
@@ -562,18 +693,20 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    pub fn new(cfg: Arc<Config>) -> Self {
+    pub fn new(cfg: Arc<Config>, client: reqwest::Client, rt: Option<tokio::runtime::Handle>) -> Self {
         let n = cfg.concurrency.max(1);
         let mut senders = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
             let (tx, rx) = mpsc::channel::<Cmd>();
             let cfg = cfg.clone();
+            let client = client.clone();
+            let rt = rt.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("scout-page-{i}"))
                 .stack_size(4 * 1024 * 1024)
                 .spawn(move || {
-                    let mut state = WorkerState::new(cfg);
+                    let mut state = WorkerState::new(cfg, client, rt);
                     // Blocking receive: this thread is dedicated to CPU-bound
                     // DOM and JS work and must not run on the async executor.
                     while let Ok(cmd) = rx.recv() {

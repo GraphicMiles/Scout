@@ -29,11 +29,25 @@ pub struct Page {
     pub warnings: Vec<Value>,
     pub form_state: HashMap<String, Vec<String>>,
     pub redirects: Vec<Value>,
+    /// Web Storage for the page's session: `{local: {...}, session: {...}}`.
+    /// Carried across navigations, because that is what a browser does; both
+    /// die with the session.
+    pub storage: Value,
+    /// Files staged on `input[type=file]` controls, keyed by the control's
+    /// canonical selector, exactly like `form_state`.
+    pub files: HashMap<String, StoredFile>,
     /// The page's own script bodies in document order, kept so a later event
     /// pass (a scroll, a key press) can re-run them: listeners die with the
     /// context that registered them, so the scripts must run again before the
     /// event is dispatched into the page.
-    pub scripts: Vec<String>,
+    pub scripts: Vec<crate::js::Script>,
+}
+
+/// A file staged on an `input[type=file]` control by an `upload` action.
+#[derive(Debug, Clone)]
+pub struct StoredFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 impl Page {
@@ -58,6 +72,8 @@ impl Page {
             form_state: HashMap::new(),
             redirects,
             scripts: Vec::new(),
+            storage: serde_json::json!({ "local": {}, "session": {} }),
+            files: HashMap::new(),
         }
     }
 
@@ -82,6 +98,8 @@ impl Page {
             scripts: Vec::new(),
             form_state: HashMap::new(),
             redirects,
+            storage: serde_json::json!({ "local": {}, "session": {} }),
+            files: HashMap::new(),
         }
     }
 

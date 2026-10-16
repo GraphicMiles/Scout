@@ -7,9 +7,12 @@
 //!   2. The server-rendered DOM (`a[href*="/watch?v="]`), which survives layout
 //!      changes that move the JSON around.
 //!
-//! Only the first page of results is read. YouTube paginates with continuation
-//! requests, which are not made, so a channel with more videos than one page
-//! returns a truncated list and says so in `warnings`.
+//! When the caller's limit wants more videos than the first page holds, the
+//! adapter follows YouTube's own continuation protocol: the `ytcfg` blob in the
+//! page carries an API key and client context, and `youtubei/v1/browse` accepts
+//! the page's continuation token to return the next page. Continuations are
+//! attempted only while the limit is not satisfied, and a failed continuation
+//! degrades to the first page with a warning rather than failing the call.
 
 use crate::error::{ErrorCode, Result, ScoutError};
 use crate::html;
@@ -345,6 +348,257 @@ pub fn is_youtube_host(hosts: &[String], host: &str) -> bool {
     hosts.iter().any(|allowed| allowed == &h)
 }
 
+/// Everything needed to request the next page of a channel's videos: the
+/// `youtubei/v1/browse` endpoint, the client context from `ytcfg`, and the
+/// continuation token from the page just read.
+#[derive(Debug, Clone)]
+pub struct Continuation {
+    pub url: String,
+    pub context: Value,
+    pub token: String,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
+}
+
+impl Continuation {
+    /// The API key, for tests and diagnostics.
+    pub fn api_key(&self) -> &str {
+        self.url
+            .split("key=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .unwrap_or("")
+    }
+}
+
+/// The JSON body for a browse request: the client context plus the token.
+pub fn browse_body(cont: &Continuation) -> Vec<u8> {
+    json!({ "context": cont.context, "continuation": cont.token }).to_string().into_bytes()
+}
+
+/// Extra headers a real browse request carries, when `ytcfg` had them.
+pub fn browse_headers(cont: &Continuation) -> Vec<(String, String)> {
+    let mut h = vec![("content-type".to_string(), "application/json".to_string())];
+    if let Some(name) = &cont.client_name {
+        h.push(("x-youtube-client-name".into(), name.clone()));
+    }
+    if let Some(ver) = &cont.client_version {
+        h.push(("x-youtube-client-version".into(), ver.clone()));
+    }
+    h
+}
+
+/// Find the `ytcfg.set({...})` blob in a page and return its parsed object.
+/// Pages carry several `ytcfg.set` calls; the early ones set one string each
+/// (`ytcfg.set('EMERGENCY_BASE_URL', ...)`) and only a later call passes the
+/// whole config object. Every call site is tried until one yields an object.
+fn parse_ytcfg(page: &Page) -> Option<Value> {
+    for text in script_texts(page) {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find("ytcfg.set(") {
+            let at = from + rel + "ytcfg.set(".len();
+            from = at;
+            let rest = text[at..].trim_start();
+            if !rest.starts_with('{') {
+                // A single-value call like ytcfg.set('KEY', 'v'): skip it.
+                continue;
+            }
+            if let Some(obj) = extract_balanced_object(rest) {
+                if let Ok(v) = serde_json::from_str::<Value>(&obj) {
+                    if v.is_object() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a quoted JSON string value for `key` from raw script text, for pages
+/// where the ytcfg object is not valid JSON as a whole.
+fn cfg_string(page: &Page, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    for text in script_texts(page) {
+        if let Some(at) = text.find(&needle) {
+            let rest = text[at + needle.len()..].trim_start();
+            let value_src = read_json_value(rest)?;
+            if let Ok(Value::String(s)) = serde_json::from_str::<Value>(&value_src) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Read one JSON value (string or object) from the start of `src`.
+fn read_json_value(src: &str) -> Option<String> {
+    let bytes = src.as_bytes();
+    match bytes.first() {
+        Some(b'"') => {
+            let mut escaped = false;
+            for (i, &b) in bytes.iter().enumerate().skip(1) {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    return Some(src[..=i].to_string());
+                }
+            }
+            None
+        }
+        Some(b'{') => extract_balanced_object(src),
+        _ => None,
+    }
+}
+
+/// The video list's own continuation token. A page carries several: the grid's
+/// real one, the sort chips' taps, the sidebar's sync. Only tokens inside the
+/// item list qualify: `richGridRenderer` on a served page,
+/// `appendContinuationItemsAction`/`reloadContinuationItemsAction` in a browse
+/// response. Within the list, the first token wins.
+fn list_continuation_token(root: &Value) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        None,
+        Grid,
+        Items,
+    }
+
+    fn walk(v: &Value, ctx: In, out: &mut Vec<(In, String)>) {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    let ctx = match (k.as_str(), ctx) {
+                        ("richGridRenderer", _) => In::Grid,
+                        ("appendContinuationItemsAction", _) | ("reloadContinuationItemsAction", _) => In::Items,
+                        (_, c) => c,
+                    };
+                    if k == "continuationCommand" {
+                        if let Some(t) = val.get("token").and_then(|t| t.as_str()) {
+                            out.push((ctx, t.to_string()));
+                        }
+                    }
+                    walk(val, ctx, out);
+                }
+            }
+            Value::Array(arr) => {
+                for x in arr {
+                    walk(x, ctx, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut all = Vec::new();
+    walk(root, In::None, &mut all);
+    all.iter()
+        .find(|(c, _)| *c == In::Grid)
+        .or_else(|| all.iter().find(|(c, _)| *c == In::Items))
+        .map(|(_, t)| t.clone())
+}
+
+/// The continuation state for a page, when one exists: a token in
+/// `ytInitialData` plus the API key and client context from `ytcfg`.
+pub fn find_continuation(page: &Page, root: &Value) -> Option<Continuation> {
+    let token = list_continuation_token(root)?;
+
+    let cfg = parse_ytcfg(page);
+    let get_str = |k: &str| -> Option<String> {
+        cfg.as_ref()
+            .and_then(|c| c.get(k))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| cfg_string(page, k))
+    };
+    let api_key = get_str("INNERTUBE_API_KEY")?;
+    let context = cfg
+        .as_ref()
+        .and_then(|c| c.get("INNERTUBE_CONTEXT"))
+        .cloned()
+        .filter(|c| c.is_object())?;
+
+    // Stay on the host the page was served from: m.youtube.com continuations
+    // must not cross to www.
+    let base = url::Url::parse(&page.url).ok()?;
+    let host = base.host_str()?.to_string();
+    let mut url = url::Url::parse("https://www.youtube.com/youtubei/v1/browse").ok()?;
+    url.set_host(Some(&host)).ok()?;
+    url.set_port(base.port()).ok()?;
+    url.set_scheme(base.scheme()).ok()?;
+    url.query_pairs_mut()
+        .append_pair("key", &api_key)
+        .append_pair("prettyPrint", "false");
+
+    Some(Continuation {
+        url: url.to_string(),
+        context,
+        token,
+        client_name: get_str("INNERTUBE_CONTEXT_CLIENT_NAME"),
+        client_version: get_str("INNERTUBE_CLIENT_VERSION"),
+    })
+}
+
+/// Videos and the next continuation token from a browse response. The item
+/// shape is the same `videoId`/`title`/... object the strategy returns.
+pub fn parse_browse(root: &Value) -> (Vec<Value>, Option<String>) {
+    let mut videos: Vec<Video> = Vec::new();
+    collect_videos(root, &mut videos);
+
+    let next = list_continuation_token(root);
+
+    let items = videos
+        .iter()
+        .map(|v| {
+            json!({
+                "videoId": v.id,
+                "title": v.title,
+                "url": format!("https://www.youtube.com/watch?v={}", v.id),
+                "thumbnailUrl": v.thumbnail,
+                "publishedText": v.published,
+                "duration": v.duration,
+                "viewCountText": v.views,
+            })
+        })
+        .collect();
+    (items, next)
+}
+
+/// Pull videos out of a JSON tree, in document order, across the markup
+/// generations YouTube has served: `videoRenderer`, `gridVideoRenderer` and
+/// today's `lockupViewModel`. One walk, not a pass per markup, so mixed
+/// generations keep the order the page showed.
+fn collect_videos(value: &Value, out: &mut Vec<Video>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                match k.as_str() {
+                    "videoRenderer" | "gridVideoRenderer" => {
+                        if let Some(x) = video_from_renderer(v) {
+                            out.push(x);
+                        }
+                    }
+                    "lockupViewModel" => {
+                        if let Some(x) = video_from_lockup(v) {
+                            out.push(x);
+                        }
+                    }
+                    _ => {}
+                }
+                collect_videos(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_videos(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Validate and normalise a channel URL before it is fetched.
 ///
 /// A channel root (`/@name`, `/channel/UC...`, `/c/...`, `/user/...`) is
@@ -374,7 +628,13 @@ pub fn prepare_url(hosts: &[String], raw: &str) -> Result<String> {
     Ok(u.to_string())
 }
 
-pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Vec<Value>)> {
+/// Read the served page: channel identity, first-page videos, warnings, and
+/// the continuation state when the limit wants more than the page holds.
+pub fn first_page(
+    page: &Page,
+    limit: usize,
+    hosts: &[String],
+) -> Result<(Value, Vec<Value>, Option<Continuation>)> {
     // A consent interstitial is not something Scout resolves on the caller's
     // behalf; say so rather than reporting an empty channel.
     if let Ok(u) = url::Url::parse(&page.url) {
@@ -428,25 +688,7 @@ pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Ve
     // Videos: prefer ytInitialData, fall back to the DOM.
     let mut videos: Vec<Video> = Vec::new();
     if let Some(root) = root.as_ref() {
-        let mut renderers = Vec::new();
-        find_all(root, "videoRenderer", &mut renderers);
-        find_all(root, "gridVideoRenderer", &mut renderers);
-        find_all(root, "richItemRenderer", &mut renderers); // ignored: no videoId
-
-        for r in renderers {
-            if let Some(v) = video_from_renderer(r) {
-                videos.push(v);
-            }
-        }
-        // `lockupViewModel` is the current video markup on channel pages; it
-        // replaced `videoRenderer`, which no longer appears in served HTML.
-        let mut lockups = Vec::new();
-        find_all(root, "lockupViewModel", &mut lockups);
-        for l in lockups {
-            if let Some(v) = video_from_lockup(l) {
-                videos.push(v);
-            }
-        }
+        collect_videos(root, &mut videos);
     }
 
     if videos.is_empty() {
@@ -492,6 +734,12 @@ pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Ve
 
     let total = videos.len();
     let truncated = total > limit;
+    // More pages are only worth requesting when the caller wants them.
+    let continuation = if limit > total {
+        root.as_ref().and_then(|r| find_continuation(page, r))
+    } else {
+        None
+    };
     videos.truncate(limit);
 
     // Say plainly when the channel identity could not be read, rather than
@@ -510,8 +758,8 @@ pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Ve
     }
     if truncated {
         warnings.push(json!({
-            "code": "continuation_unsupported",
-            "message": format!("Only the first page of results is read; {total} videos were present and continuation requests are not made."),
+            "code": "limit_reached",
+            "message": format!("{total} videos were present; only the first {limit} were returned."),
         }));
     }
 
@@ -537,7 +785,14 @@ pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Ve
             "count": items.len(),
         }),
         warnings,
+        continuation,
     ))
+}
+
+/// Back-compat single-page read: first page only, no continuation state.
+pub fn extract(page: &Page, limit: usize, hosts: &[String]) -> Result<(Value, Vec<Value>)> {
+    let (data, warnings, _) = first_page(page, limit, hosts)?;
+    Ok((data, warnings))
 }
 
 fn video_id_of(hosts: &[String], url: &str) -> Option<String> {
@@ -741,7 +996,103 @@ mod tests {
         let p = page_with(&html_src);
         let (out, warnings) = extract(&p, 3, &test_hosts()).unwrap();
         assert_eq!(out["count"], 3);
-        assert!(warnings.iter().any(|w| w["code"] == "continuation_unsupported"), "warnings: {warnings:?}");
+        assert!(warnings.iter().any(|w| w["code"] == "limit_reached"), "warnings: {warnings:?}");
+        // A limit under the page count must not ask for continuations at all.
+        let (_, _, cont) = first_page(&p, 30, &test_hosts()).unwrap();
+        assert!(cont.is_none(), "no continuation should be built without a token");
+    }
+
+    /// ytcfg and the continuation token produce a ready browse request.
+    #[test]
+    fn continuation_state_is_built_from_ytcfg_and_initial_data() {
+        let initial = json!({
+            "contents": { "richGridRenderer": { "contents": [
+                { "richItemRenderer": { "content": { "lockupViewModel": {
+                    "contentId": "vid1", "metadata": { "lockupMetadataViewModel": {
+                        "title": { "content": "One" }
+                    } }
+                } } } },
+                { "continuationItemRenderer": { "continuationEndpoint": {
+                    "continuationCommand": { "token": "tok-first" }
+                } } }
+            ] } }
+        });
+        let ytcfg = json!({
+            "INNERTUBE_API_KEY": "AIza-test-key",
+            "INNERTUBE_CONTEXT": { "client": { "clientName": "WEB", "clientVersion": "2.20240101.01.00" } },
+            "INNERTUBE_CONTEXT_CLIENT_NAME": "1",
+            "INNERTUBE_CLIENT_VERSION": "2.20240101.01.00"
+        });
+        let html_src = format!(
+            "<html><body><script>var ytInitialData = {initial};</script>\n<script>ytcfg.set({ytcfg});</script></body></html>"
+        );
+        let p = page_with(&html_src);
+
+        // Under the limit: no continuation wanted.
+        let (_, _, none) = first_page(&p, 1, &test_hosts()).unwrap();
+        assert!(none.is_none());
+
+        let (data, warnings, cont) = first_page(&p, 10, &test_hosts()).unwrap();
+        assert_eq!(data["count"], 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let cont = cont.expect("continuation");
+        assert_eq!(cont.token, "tok-first");
+        assert_eq!(cont.api_key(), "AIza-test-key");
+        assert_eq!(
+            cont.url,
+            "https://www.youtube.com/youtubei/v1/browse?key=AIza-test-key&prettyPrint=false"
+        );
+        assert_eq!(cont.context["client"]["clientName"], "WEB");
+        assert_eq!(cont.client_version.as_deref(), Some("2.20240101.01.00"));
+
+        // The request body carries context plus token.
+        let body = browse_body(&cont);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["continuation"], "tok-first");
+        assert_eq!(parsed["context"]["client"]["clientName"], "WEB");
+
+        // Headers name the client, like a real browse request.
+        let headers = browse_headers(&cont);
+        assert!(headers.contains(&("x-youtube-client-version".into(), "2.20240101.01.00".into())));
+    }
+
+    /// A browse response is read with the same parsers as the first page, and
+    /// its own token chains to the next page.
+    #[test]
+    fn browse_responses_parse_and_chain() {
+        let resp = json!({
+            "onResponseReceivedActions": [
+                { "appendContinuationItemsAction": { "continuationItems": [
+                    { "richItemRenderer": { "content": { "lockupViewModel": {
+                        "contentId": "vid2", "metadata": { "lockupMetadataViewModel": {
+                            "title": { "content": "Two" },
+                            "metadata": { "contentMetadataViewModel": { "metadataRows": [ { "metadataParts": [
+                                { "text": { "content": "99K" }, "leadingIcon": { "name": "PLAY_ARROW_OUTLINED" } },
+                                { "text": { "content": "3d ago" } }
+                            ] } ] } }
+                        } }
+                    } } } },
+                    { "richItemRenderer": { "content": { "videoRenderer": {
+                        "videoId": "vid3", "title": { "simpleText": "Three" }
+                    } } } },
+                    { "continuationItemRenderer": { "continuationEndpoint": {
+                        "continuationCommand": { "token": "tok-second" }
+                    } } }
+                ] } }
+            ]
+        });
+        let (items, next) = parse_browse(&resp);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["videoId"], "vid2");
+        assert_eq!(items[0]["title"], "Two");
+        assert_eq!(items[0]["viewCountText"], "99K");
+        assert_eq!(items[1]["videoId"], "vid3");
+        assert_eq!(next.as_deref(), Some("tok-second"));
+
+        // A terminal page has no token.
+        let (items, next) = parse_browse(&json!({ "onResponseReceivedActions": [] }));
+        assert!(items.is_empty());
+        assert!(next.is_none());
     }
 
     #[test]
@@ -812,4 +1163,5 @@ mod tests {
         let got = extract_balanced_object(src).unwrap();
         assert_eq!(got, r#"{"a":{"b":"}{"},"c":1}"#);
     }
+
 }
