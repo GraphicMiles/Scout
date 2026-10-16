@@ -147,6 +147,119 @@ const FIXTURE_HTML: &str = r#"<!doctype html>
 // The fixture server must outlive each test, so it is started per-test above and
 // the keepalive task holds the runtime slot.
 
+/// The agent-facing tool layer: discoverable, authenticated, and unable to
+/// reach anything the HTTP API would refuse.
+mod tools_api {
+    use super::*;
+
+    #[tokio::test]
+    async fn manifest_lists_every_tool_with_a_schema() {
+        let h = harness().await;
+        let (status, body) = h.get("/v1/tools").await;
+        assert_eq!(status, 200);
+        let tools = body["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty());
+        for t in tools {
+            // An agent cannot call a tool whose inputs it cannot discover.
+            assert!(t["name"].is_string(), "tool needs a name");
+            assert!(t["description"].is_string(), "tool needs a description");
+            assert_eq!(t["inputSchema"]["type"], json!("object"));
+        }
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for expected in ["navigate", "extract", "page.forms", "cookies.get", "fill", "submit"] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_round_trips_through_tools() {
+        let h = harness().await;
+        let (status, created) = h
+            .post("/v1/tools/call", json!({ "name": "session.create", "arguments": {} }))
+            .await;
+        assert_eq!(status, 200);
+        let id = created["id"].as_str().expect("session id").to_string();
+
+        let (status, _) = h
+            .post("/v1/tools/call", json!({ "name": "session.destroy", "arguments": { "sessionId": id } }))
+            .await;
+        assert_eq!(status, 200);
+
+        // Destroyed sessions stay gone; the tool layer must not resurrect them.
+        let (status, _) = h
+            .post("/v1/tools/call", json!({ "name": "session.destroy", "arguments": { "sessionId": id } }))
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn unknown_tools_and_unknown_fields_are_refused() {
+        let h = harness().await;
+        let (status, body) = h
+            .post("/v1/tools/call", json!({ "name": "not.a.tool", "arguments": {} }))
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "invalid_request");
+
+        let (status, body) = h
+            .post("/v1/tools/call", json!({ "name": "strategies", "arguments": {}, "extra": 1 }))
+            .await;
+        assert_eq!(status, 400);
+        assert!(body["error"]["message"].as_str().unwrap().contains("extra"));
+    }
+
+    #[tokio::test]
+    async fn navigate_then_inspect_the_page_through_tools() {
+        let h = harness().await;
+        let (_, created) = h
+            .post("/v1/tools/call", json!({ "name": "session.create", "arguments": {} }))
+            .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let (status, nav) = h
+            .post("/v1/tools/call", json!({
+                "name": "navigate",
+                "arguments": { "sessionId": id, "url": format!("{}/", h.fixture) }
+            }))
+            .await;
+        assert_eq!(status, 200, "navigate failed: {nav}");
+
+        let (status, forms) = h
+            .post("/v1/tools/call", json!({ "name": "page.forms", "arguments": { "sessionId": id } }))
+            .await;
+        assert_eq!(status, 200);
+        assert!(forms["count"].as_u64().unwrap() >= 1, "expected a form: {forms}");
+
+        let (status, links) = h
+            .post("/v1/tools/call", json!({ "name": "page.links", "arguments": { "sessionId": id } }))
+            .await;
+        assert_eq!(status, 200);
+        // Links come back absolute: a relative href is useless to a caller.
+        for link in links["links"].as_array().unwrap() {
+            let href = link["href"].as_str().unwrap_or("");
+            assert!(
+                href.starts_with("http://") || href.starts_with("https://") || href.starts_with('#'),
+                "href was not resolved against the document: {href}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_require_authentication() {
+        let h = harness().await;
+        let r = h.client.get(format!("{}/v1/tools", h.base)).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        let r = h
+            .client
+            .post(format!("{}/v1/tools/call", h.base))
+            .json(&json!({ "name": "strategies", "arguments": {} }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_is_public_and_other_routes_require_a_key() {
     let h = harness().await;

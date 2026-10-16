@@ -431,6 +431,25 @@ const DOM_SHIM: &str = r##"
     return list;
   }
 
+  /* Resolve a URL against the document, as a browser does for href/src.
+     Without this, `a.href` hands back the raw attribute, so every relative
+     link on a page comes out as "/path" instead of an address the caller can
+     actually fetch — which makes link extraction close to useless. */
+  function resolveUrl(href) {
+    if (!href) return href;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(href)) return href;   // already absolute
+    if (href.charAt(0) === '#') return href;
+    var base = globalThis.__scout_url || '';
+    if (!base) return href;
+    if (href.charAt(0) === '/') {
+      var origin = /^[a-z][a-z0-9+.\-]*:\/\/[^/]+/i.exec(base);
+      return origin ? origin[0] + href : href;
+    }
+    var b = base.split('#')[0].split('?')[0];
+    var i = b.lastIndexOf('/');
+    return (i >= 0 ? b.slice(0, i + 1) : b + '/') + href;
+  }
+
   function wrap(node) {
     if (!node) return null;
     if (node.__el) return node.__el;
@@ -454,10 +473,12 @@ const DOM_SHIM: &str = r##"
       set className(v) { attrs.class = String(v); },
       get innerText() { return textOf(node); },
       set innerText(v) { this.textContent = v; },
-      get href() { return attrs.href || ''; },
+      get href() { return resolveUrl(attrs.href || ''); },
       set href(v) { attrs.href = String(v); },
-      get src() { return attrs.src || ''; },
+      get src() { return resolveUrl(attrs.src || ''); },
       set src(v) { attrs.src = String(v); },
+      get action() { return resolveUrl(attrs.action || ''); },
+      set action(v) { attrs.action = String(v); },
       get srcset() { return attrs.srcset || ''; },
       set srcset(v) { attrs.srcset = String(v); },
       get title() { return attrs.title || ''; },

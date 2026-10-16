@@ -800,6 +800,18 @@ impl Scout {
 
     // ------------------------------------------------------------ lifecycle
 
+    /// Invoke an agent-facing tool by name. Thin adapter over `tools::call`
+    /// so the server does not need to know the tool set.
+    pub async fn tools_call(
+        self: &Arc<Self>,
+        owner: &str,
+        name: &str,
+        arguments: Value,
+        abort: &Abort,
+    ) -> Result<Value> {
+        crate::tools::call(self, owner, name, arguments, abort).await
+    }
+
     pub fn stats(&self) -> Value {
         json!({
             "sessions": self.sessions.size(),

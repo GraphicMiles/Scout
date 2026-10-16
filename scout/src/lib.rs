@@ -27,6 +27,7 @@ pub mod security;
 pub mod selector;
 pub mod session;
 pub mod tasks;
+pub mod tools;
 pub mod util;
 pub mod worker;
 pub mod validate;
