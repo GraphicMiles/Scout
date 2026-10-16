@@ -61,6 +61,22 @@ pub struct Config {
     pub js_max_script_bytes: usize,
     /// How many queued timer callbacks to run after the scripts finish.
     pub js_timer_budget: u32,
+    /// Total promise jobs a page may run across the whole navigation. This is
+    /// what stops a `.then` chain that keeps queueing work.
+    pub js_job_budget: u32,
+    /// Allow page scripts to issue requests at all. Off means `fetch` and
+    /// `XMLHttpRequest` refuse by name instead of being quietly absent.
+    pub js_network: bool,
+    /// Requests one page may issue from script, across the whole navigation.
+    pub js_max_fetches: usize,
+    /// Bytes one scripted response may cost.
+    pub js_max_fetch_bytes: usize,
+    /// Per-request budget for a scripted fetch. The page's own JS budget is
+    /// separate and still applies.
+    pub js_fetch_timeout_ms: u64,
+    /// Send the header set a browser sends (Sec-Fetch-*, Sec-CH-UA, Referer).
+    /// Off leaves only User-Agent, Accept and Accept-Language.
+    pub browser_headers: bool,
 }
 
 fn num(env: &std::collections::HashMap<String, String>, key: &str, default: u64) -> Result<u64, String> {
@@ -153,10 +169,17 @@ impl Config {
 
             shutdown_grace_ms: num(&env, "SCOUT_SHUTDOWN_GRACE_MS", 10_000)?,
             log_level: env.get("SCOUT_LOG_LEVEL").cloned().unwrap_or_else(|| "info".into()),
-            user_agent: env
-                .get("SCOUT_USER_AGENT")
-                .cloned()
-                .unwrap_or_else(|| "Scout/0.1 (automation runtime)".into()),
+            // A runtime that executes page scripts and carries a real cookie
+            // jar presents itself the way it behaves: as the browser it is a
+            // stand-in for. Sites are entitled to refuse automation outright,
+            // and this does not get around any of them — nothing here defeats
+            // a CAPTCHA, a rate limit or an access control — but a site that
+            // simply serves a different page to an unnamed client would
+            // otherwise make every result a measurement of that difference.
+            // Override with SCOUT_USER_AGENT to declare what you are.
+            user_agent: env.get("SCOUT_USER_AGENT").cloned().unwrap_or_else(|| {
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into()
+            }),
             youtube_hosts: env
                 .get("SCOUT_YOUTUBE_HOSTS")
                 .map(|v| {
@@ -181,6 +204,18 @@ impl Config {
             js_max_scripts: num(&env, "SCOUT_JS_MAX_SCRIPTS", 32)? as usize,
             js_max_script_bytes: num(&env, "SCOUT_JS_MAX_SCRIPT_BYTES", 2 * MB)? as usize,
             js_timer_budget: num(&env, "SCOUT_JS_TIMER_BUDGET", 64)? as u32,
+            js_job_budget: num(&env, "SCOUT_JS_JOB_BUDGET", 5_000)? as u32,
+            js_network: env
+                .get("SCOUT_JS_NETWORK")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            js_max_fetches: num(&env, "SCOUT_JS_MAX_FETCHES", 8)? as usize,
+            js_max_fetch_bytes: num(&env, "SCOUT_JS_MAX_FETCH_BYTES", MB)? as usize,
+            js_fetch_timeout_ms: num(&env, "SCOUT_JS_FETCH_TIMEOUT_MS", 8_000)?,
+            browser_headers: env
+                .get("SCOUT_BROWSER_HEADERS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
         };
 
         if !cfg.dev_mode {

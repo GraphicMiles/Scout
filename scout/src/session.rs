@@ -171,6 +171,10 @@ pub struct Session {
     pub jar: Arc<CookieJar>,
     pub created_at: i64,
     pub last_used: Mutex<i64>,
+    /// The document requests are issued from, so a form POST or an XHR carries
+    /// the Referer and Origin a browser would send and a server that checks
+    /// them sees a coherent request instead of a bare one.
+    referrer: Mutex<Option<String>>,
     pub ctl: CancellationToken,
     /// Serialises operations: one active operation per session, later callers wait.
     op: Arc<AsyncMutex<()>>,
@@ -197,6 +201,7 @@ impl Session {
             jar: Arc::new(CookieJar::new()),
             created_at: now_ms(),
             last_used: Mutex::new(now_ms()),
+            referrer: Mutex::new(None),
             ctl: CancellationToken::new(),
             op: Arc::new(AsyncMutex::new(())),
             destroyed: std::sync::atomic::AtomicBool::new(false),
@@ -219,6 +224,23 @@ impl Session {
         self.destroyed.store(true, std::sync::atomic::Ordering::SeqCst);
         self.ctl.cancel();
         self.jar.clear();
+        *self.referrer.lock().unwrap() = None;
+    }
+
+    /// Where this session's requests are considered to come from.
+    pub fn referrer(&self) -> Option<String> {
+        self.referrer.lock().unwrap().clone()
+    }
+
+    /// Record the document a session is now on.
+    pub fn set_referrer(&self, url: &str) {
+        *self.referrer.lock().unwrap() = Some(url.to_string());
+    }
+
+    /// Forget the document, as when the jar is emptied and the session is no
+    /// longer signed in as whoever it was.
+    pub fn clear_referrer(&self) {
+        *self.referrer.lock().unwrap() = None;
     }
 
     /// A signal that fires when either the session is destroyed or the caller aborts.

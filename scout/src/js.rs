@@ -778,6 +778,606 @@ const DOM_SHIM: &str = r##"
 })();
 "##;
 
+// --------------------------------------------------------------- network
+
+/// A request issued by page JavaScript (`fetch` or `XMLHttpRequest`).
+#[derive(Debug, Clone)]
+pub struct NetRequest {
+    pub method: String,
+    /// As written by the page: relative URLs are resolved against the document.
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<NetBody>,
+}
+
+/// A request body. Text is the common case; binary arrives as base64.
+#[derive(Debug, Clone)]
+pub enum NetBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// What the host got back. Body is text: responses that are not textual are
+/// lossy, which is stated rather than hidden.
+#[derive(Debug, Clone)]
+pub struct NetResponse {
+    pub status: u16,
+    pub status_text: String,
+    /// Final URL after redirects, which is what `response.url` reports.
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// The host's network, injected into the sandbox.
+///
+/// A synchronous callback rather than a future: the sandbox has no event loop,
+/// so a request completes before the calling statement finishes. The
+/// implementation is responsible for every policy that applies to navigation —
+/// SSRF validation, the session cookie jar, byte caps and timeouts — so page
+/// JavaScript cannot reach anything a navigation could not.
+pub type NetFn = std::sync::Arc<dyn Fn(NetRequest) -> std::result::Result<NetResponse, String> + Send + Sync>;
+
+/// Counters a caller can publish next to the JS summary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NetStats {
+    pub requests: usize,
+    pub failed: usize,
+    pub bytes: usize,
+    pub blocked: usize,
+}
+
+/// `fetch`, `XMLHttpRequest`, `atob`/`btoa` and `URLSearchParams`.
+///
+/// ## How this differs from a browser, and why
+///
+/// * **Requests are synchronous.** There is no event loop to suspend on, so
+///   `fetch` performs the request while the calling statement is still on the
+///   stack and returns an already-settled promise. `await`, `.then` chains and
+///   `Promise.all` therefore work — the host drains pending jobs after each
+///   script, exactly as a browser drains its microtask queue — but nothing is
+///   ever *waiting* on the network when the script ends.
+/// * **CORS is not enforced.** A browser's same-origin policy protects the
+///   user's credentials from other sites' scripts; here the request is already
+///   checked against the SSRF policy and the session's own jar, so rejecting a
+///   cross-origin response would remove compatibility without adding safety.
+///   `credentials` is still honoured: cross-origin requests only carry cookies
+///   when the page asks for `include`.
+/// * **Response bodies are text.** Octet streams are decoded as UTF-8, so a
+///   binary response is lossy rather than faithful.
+const NET_SHIM: &str = r##"
+(function () {
+  var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+  function bytesToB64(bytes) {
+    var out = '', i, b0, b1, b2;
+    for (i = 0; i < bytes.length; i += 3) {
+      b0 = bytes[i]; b1 = bytes[i + 1]; b2 = bytes[i + 2];
+      out += B64.charAt(b0 >> 2);
+      out += B64.charAt(((b0 & 3) << 4) | ((b1 === undefined ? 0 : b1) >> 4));
+      out += (b1 === undefined) ? '=' : B64.charAt(((b1 & 15) << 2) | ((b2 === undefined ? 0 : b2) >> 6));
+      out += (b2 === undefined) ? '=' : B64.charAt(b2 & 63);
+    }
+    return out;
+  }
+
+  function b64ToBytes(str) {
+    var map = {}, i, buf = 0, bits = 0, out = [];
+    for (i = 0; i < 64; i++) map[B64.charAt(i)] = i;
+    var s = String(str).replace(/[^A-Za-z0-9+/]/g, '');
+    for (i = 0; i < s.length; i++) {
+      buf = (buf << 6) | map[s.charAt(i)];
+      bits += 6;
+      if (bits >= 8) { bits -= 8; out.push((buf >> bits) & 0xff); }
+    }
+    return out;
+  }
+
+  function latin1FromBytes(b) {
+    var out = '', i;
+    for (i = 0; i < b.length; i++) out += String.fromCharCode(b[i]);
+    return out;
+  }
+
+  function bytesFromLatin1(s) {
+    var out = [], i;
+    for (i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
+    return out;
+  }
+
+  function utf8Bytes(s) {
+    var out = [], i, c;
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+      else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+    }
+    return out;
+  }
+
+  globalThis.atob = function (s) { return latin1FromBytes(b64ToBytes(s)); };
+  globalThis.btoa = function (s) { return bytesToB64(bytesFromLatin1(String(s))); };
+
+  function URLSearchParams(init) {
+    this._p = [];
+    var i, kv, parts;
+    if (typeof init === 'string') {
+      var s = init.charAt(0) === '?' ? init.slice(1) : init;
+      parts = s.split('&');
+      for (i = 0; i < parts.length; i++) {
+        if (!parts[i]) continue;
+        kv = parts[i].split('=');
+        this._p.push([
+          decodeURIComponent(kv[0].replace(/\+/g, ' ')),
+          decodeURIComponent((kv[1] === undefined ? '' : kv[1]).replace(/\+/g, ' '))
+        ]);
+      }
+    } else if (init && typeof init === 'object') {
+      for (var k in init) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) {
+          this._p.push([String(k), String(init[k])]);
+        }
+      }
+    }
+  }
+  URLSearchParams.prototype.append = function (k, v) { this._p.push([String(k), String(v)]); };
+  URLSearchParams.prototype.set = function (k, v) {
+    for (var i = 0; i < this._p.length; i++) {
+      if (this._p[i][0] === String(k)) { this._p[i][1] = String(v); return; }
+    }
+    this._p.push([String(k), String(v)]);
+  };
+  URLSearchParams.prototype.get = function (k) {
+    for (var i = 0; i < this._p.length; i++) if (this._p[i][0] === String(k)) return this._p[i][1];
+    return null;
+  };
+  URLSearchParams.prototype.getAll = function (k) {
+    var out = [];
+    for (var i = 0; i < this._p.length; i++) if (this._p[i][0] === String(k)) out.push(this._p[i][1]);
+    return out;
+  };
+  URLSearchParams.prototype.has = function (k) { return this.get(k) !== null; };
+  URLSearchParams.prototype['delete'] = function (k) {
+    var keep = [];
+    for (var i = 0; i < this._p.length; i++) if (this._p[i][0] !== String(k)) keep.push(this._p[i]);
+    this._p = keep;
+  };
+  URLSearchParams.prototype.forEach = function (fn) {
+    for (var i = 0; i < this._p.length; i++) fn(this._p[i][1], this._p[i][0]);
+  };
+  URLSearchParams.prototype.entries = function () {
+    var out = [];
+    for (var i = 0; i < this._p.length; i++) out.push([this._p[i][0], this._p[i][1]]);
+    return out;
+  };
+  URLSearchParams.prototype.keys = function () { return this.entries().map(function (e) { return e[0]; }); };
+  URLSearchParams.prototype.values = function () { return this.entries().map(function (e) { return e[1]; }); };
+  URLSearchParams.prototype.toString = function () {
+    var out = [];
+    for (var i = 0; i < this._p.length; i++) {
+      out.push(encodeURIComponent(this._p[i][0]) + '=' + encodeURIComponent(this._p[i][1]));
+    }
+    return out.join('&');
+  };
+  globalThis.URLSearchParams = URLSearchParams;
+
+  function headerList(h) {
+    var out = [], i, k;
+    if (!h) return out;
+    if (Object.prototype.toString.call(h) === '[object Array]') {
+      for (i = 0; i < h.length; i++) out.push([String(h[i][0]), String(h[i][1])]);
+      return out;
+    }
+    if (typeof h.entries === 'function') {
+      var e = h.entries() || [];
+      for (i = 0; i < e.length; i++) out.push([String(e[i][0]), String(e[i][1])]);
+      return out;
+    }
+    for (k in h) if (Object.prototype.hasOwnProperty.call(h, k)) out.push([k, String(h[k])]);
+    return out;
+  }
+
+  function makeHeaders(list) {
+    var entries = [], i;
+    for (i = 0; i < (list || []).length; i++) {
+      entries.push([String(list[i][0]).toLowerCase(), String(list[i][1])]);
+    }
+    function find(k) {
+      k = String(k).toLowerCase();
+      for (var i = 0; i < entries.length; i++) if (entries[i][0] === k) return i;
+      return -1;
+    }
+    return {
+      append: function (k, v) { entries.push([String(k).toLowerCase(), String(v)]); },
+      set: function (k, v) {
+        var i = find(k);
+        if (i >= 0) entries[i][1] = String(v);
+        else entries.push([String(k).toLowerCase(), String(v)]);
+      },
+      get: function (k) { var i = find(k); return i < 0 ? null : entries[i][1]; },
+      getAll: function (k) {
+        k = String(k).toLowerCase();
+        var out = [];
+        for (var i = 0; i < entries.length; i++) if (entries[i][0] === k) out.push(entries[i][1]);
+        return out;
+      },
+      has: function (k) { return find(k) >= 0; },
+      'delete': function (k) { var i = find(k); if (i >= 0) entries.splice(i, 1); },
+      forEach: function (fn) { for (var i = 0; i < entries.length; i++) fn(entries[i][1], entries[i][0]); },
+      entries: function () { return entries.map(function (e) { return [e[0], e[1]]; }); },
+      keys: function () { return entries.map(function (e) { return e[0]; }); },
+      values: function () { return entries.map(function (e) { return e[1]; }); }
+    };
+  }
+  globalThis.Headers = function (init) { return makeHeaders(headerList(init)); };
+
+  function bodyPayload(body) {
+    var i, arr;
+    if (body === undefined || body === null) return null;
+    if (typeof body === 'string') return { kind: 'text', value: body };
+    if (body instanceof URLSearchParams) return { kind: 'text', value: body.toString() };
+    if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+      return { kind: 'base64', value: bytesToB64(Array.prototype.slice.call(new Uint8Array(body))) };
+    }
+    if (body && typeof body.byteLength === 'number' && typeof body.length === 'number') {
+      arr = [];
+      for (i = 0; i < body.length; i++) arr.push(body[i] & 0xff);
+      return { kind: 'base64', value: bytesToB64(arr) };
+    }
+    if (typeof body === 'object') return { kind: 'text', value: JSON.stringify(body) };
+    return { kind: 'text', value: String(body) };
+  }
+
+  function makeResponse(r) {
+    var body = (r.body === undefined || r.body === null) ? '' : String(r.body);
+    var res = {
+      ok: r.status >= 200 && r.status < 300,
+      status: r.status,
+      statusText: r.statusText || '',
+      url: r.url || '',
+      redirected: false,
+      type: 'basic',
+      headers: makeHeaders(r.headers || []),
+      bodyUsed: false
+    };
+    res.text = function () { res.bodyUsed = true; return Promise.resolve(body); };
+    res.json = function () { res.bodyUsed = true; return Promise.resolve(JSON.parse(body)); };
+    res.arrayBuffer = function () {
+      res.bodyUsed = true;
+      var bytes = utf8Bytes(body), ab = new ArrayBuffer(bytes.length), view = new Uint8Array(ab);
+      for (var i = 0; i < bytes.length; i++) view[i] = bytes[i];
+      return Promise.resolve(ab);
+    };
+    res.clone = function () { return makeResponse(r); };
+    return res;
+  }
+  globalThis.Response = function (body, init) {
+    return makeResponse({
+      status: (init && init.status) || 200,
+      statusText: (init && init.statusText) || '',
+      url: '',
+      headers: headerList(init && init.headers),
+      body: body === undefined || body === null ? '' : String(body)
+    });
+  };
+
+  // One call, one request. The host applies the SSRF policy, the session jar,
+  // the byte cap and the timeout; a failure becomes a thrown TypeError, which
+  // is what fetch and XHR reject with.
+  function netCall(req) {
+    var raw = globalThis.__scout_net(JSON.stringify(req));
+    var r = JSON.parse(raw);
+    if (!r || !r.ok) throw new Error((r && r.error) || 'the request was refused');
+    return r.response;
+  }
+
+  globalThis.fetch = function (input, init) {
+    var url, method = 'GET', headers = null, body = undefined, credentials = 'same-origin';
+    if (input && typeof input === 'object' && typeof input.url === 'string') {
+      url = input.url;
+      method = input.method || 'GET';
+      headers = input.headers;
+      body = input._body;
+      if (input.credentials) credentials = input.credentials;
+      if (init && init.body !== undefined) body = init.body;
+    } else {
+      url = String(input);
+    }
+    if (init) {
+      if (init.method) method = init.method;
+      if (init.headers !== undefined) headers = init.headers;
+      if (init.body !== undefined) body = init.body;
+      if (init.credentials) credentials = init.credentials;
+    }
+    // The executor runs synchronously, so the promise is already settled by
+    // the time fetch returns. .then chains and await still work because the
+    // host drains pending jobs after each script.
+    return new Promise(function (resolve, reject) {
+      try {
+        var res = netCall({
+          method: String(method).toUpperCase(),
+          url: url,
+          headers: headerList(headers),
+          body: bodyPayload(body),
+          credentials: credentials
+        });
+        resolve(makeResponse(res));
+      } catch (e) {
+        reject(new TypeError(e && e.message ? e.message : String(e)));
+      }
+    });
+  };
+
+  globalThis.Request = function (input, init) {
+    var url = (input && typeof input === 'object' && typeof input.url === 'string') ? input.url : String(input);
+    this.url = url;
+    this.method = (init && init.method) || (input && input.method) || 'GET';
+    this.headers = makeHeaders(headerList((init && init.headers) || (input && input.headers)));
+    this.credentials = (init && init.credentials) || 'same-origin';
+    this._body = (init && init.body !== undefined) ? init.body : (input && input._body);
+  };
+
+  // Events are dispatched after the current script finishes, so a handler
+  // assigned after send() still fires, as it would in a browser.
+  function queue(fn) { Promise.resolve().then(fn); }
+
+  function XMLHttpRequest() {
+    this.readyState = 0;
+    this.status = 0;
+    this.statusText = '';
+    this.responseText = '';
+    this.response = '';
+    this.responseType = '';
+    this.responseURL = '';
+    this.withCredentials = false;
+    this.timeout = 0;
+    this.onreadystatechange = null;
+    this.onload = null;
+    this.onerror = null;
+    this.onloadend = null;
+    this.onabort = null;
+    this.ontimeout = null;
+    this.upload = { addEventListener: function () {} };
+    this._method = 'GET';
+    this._url = '';
+    this._async = true;
+    this._requestHeaders = [];
+    this._responseHeaders = [];
+    this._listeners = {};
+    this._aborted = false;
+  }
+  XMLHttpRequest.UNSENT = 0;
+  XMLHttpRequest.OPENED = 1;
+  XMLHttpRequest.HEADERS_RECEIVED = 2;
+  XMLHttpRequest.LOADING = 3;
+  XMLHttpRequest.DONE = 4;
+
+  XMLHttpRequest.prototype.open = function (method, url, async) {
+    this._method = String(method || 'GET').toUpperCase();
+    this._url = String(url);
+    this._async = async !== false;
+    this.readyState = 1;
+    var self = this;
+    queue(function () { self._fire('readystatechange'); });
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+    this._requestHeaders.push([String(k), String(v)]);
+  };
+  XMLHttpRequest.prototype.overrideMimeType = function () {};
+  XMLHttpRequest.prototype.addEventListener = function (type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    if (typeof fn === 'function') this._listeners[type].push(fn);
+  };
+  XMLHttpRequest.prototype.removeEventListener = function () {};
+  XMLHttpRequest.prototype.getResponseHeader = function (k) {
+    var lower = String(k).toLowerCase();
+    for (var i = 0; i < this._responseHeaders.length; i++) {
+      if (String(this._responseHeaders[i][0]).toLowerCase() === lower) return String(this._responseHeaders[i][1]);
+    }
+    return null;
+  };
+  XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+    var out = [];
+    for (var i = 0; i < this._responseHeaders.length; i++) {
+      out.push(this._responseHeaders[i][0] + ': ' + this._responseHeaders[i][1]);
+    }
+    return out.join('\r\n');
+  };
+  XMLHttpRequest.prototype.abort = function () {
+    this._aborted = true;
+    this.readyState = 0;
+    var self = this;
+    queue(function () { self._fire('abort'); self._fire('loadend'); });
+  };
+  XMLHttpRequest.prototype._fire = function (type) {
+    var handler = this['on' + type];
+    if (typeof handler === 'function') {
+      try { handler.call(this, { type: type, target: this }); } catch (e) { /* one bad listener must not stop the rest */ }
+    }
+    var list = this._listeners[type] || [];
+    for (var i = 0; i < list.length; i++) {
+      try { list[i].call(this, { type: type, target: this }); } catch (e) {}
+    }
+  };
+  XMLHttpRequest.prototype.send = function (body) {
+    var self = this;
+    var payload;
+    try {
+      payload = bodyPayload(body);
+    } catch (e) {
+      payload = null;
+    }
+    try {
+      var r = netCall({
+        method: this._method,
+        url: this._url,
+        headers: this._requestHeaders,
+        body: payload,
+        credentials: this.withCredentials ? 'include' : 'same-origin'
+      });
+      this._responseHeaders = r.headers || [];
+      this.readyState = 4;
+      this.status = r.status;
+      this.statusText = r.statusText || '';
+      this.responseURL = r.url || this._url;
+      this.responseText = (r.body === undefined || r.body === null) ? '' : String(r.body);
+      this.response = this.responseType === 'json'
+        ? JSON.parse(this.responseText)
+        : this.responseText;
+      queue(function () {
+        if (self._aborted) return;
+        self._fire('readystatechange');
+        if (self.status >= 200 && self.status < 300) self._fire('load');
+        else self._fire('error');
+        self._fire('loadend');
+      });
+    } catch (e) {
+      this.readyState = 4;
+      this.status = 0;
+      this.statusText = '';
+      queue(function () {
+        if (self._aborted) return;
+        self._fire('readystatechange');
+        self._fire('error');
+        self._fire('loadend');
+      });
+    }
+  };
+  globalThis.XMLHttpRequest = XMLHttpRequest;
+})();
+"##;
+
+/// Install `__scout_net`, the only channel between page JavaScript and the
+/// network. Always present, so a script that calls `fetch` on a runtime with
+/// networking switched off gets a stated refusal rather than `fetch is not
+/// defined` swallowed as a script error.
+fn wire_net(ctx: &rquickjs::Ctx<'_>, net: Option<NetFn>) -> Result<()> {
+    let f = rquickjs::Function::new(ctx.clone(), move |input: String| -> String {
+        let out = match &net {
+            None => json!({
+                "ok": false,
+                "error": "network access from page scripts is disabled (SCOUT_JS_NETWORK=0)"
+            }),
+            Some(call) => match serde_json::from_str::<Value>(&input) {
+                Err(e) => json!({ "ok": false, "error": format!("malformed request: {e}") }),
+                Ok(v) => match parse_net_request(&v) {
+                    Err(e) => json!({ "ok": false, "error": e }),
+                    Ok(req) => match call(req) {
+                        Ok(r) => json!({
+                            "ok": true,
+                            "response": {
+                                "status": r.status,
+                                "statusText": r.status_text,
+                                "url": r.url,
+                                "headers": r.headers,
+                                "body": r.body
+                            }
+                        }),
+                        Err(e) => json!({ "ok": false, "error": e }),
+                    },
+                },
+            },
+        };
+        out.to_string()
+    })
+    .map_err(|e| js_err(format!("could not install the network bridge: {e}")))?;
+    ctx.globals()
+        .set("__scout_net", f)
+        .map_err(|e| js_err(format!("{e}")))
+}
+
+fn parse_net_request(v: &Value) -> std::result::Result<NetRequest, String> {
+    let method = v
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    let url = v
+        .get("url")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| "the request had no url".to_string())?
+        .to_string();
+    let headers = v
+        .get("headers")
+        .and_then(|h| h.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    let k = p.get(0).and_then(|x| x.as_str())?;
+                    let val = p.get(1).and_then(|x| x.as_str())?;
+                    Some((k.to_string(), val.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let body = match v.get("body") {
+        None | Some(Value::Null) => None,
+        Some(b) => {
+            let kind = b.get("kind").and_then(|k| k.as_str()).unwrap_or("text");
+            let value = b.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            match kind {
+                "base64" => Some(NetBody::Bytes(decode_base64(value))),
+                _ => Some(NetBody::Text(value.to_string())),
+            }
+        }
+    };
+    Ok(NetRequest {
+        method,
+        url,
+        headers,
+        body,
+    })
+}
+
+fn decode_base64(input: &str) -> Vec<u8> {
+    let table: Vec<i16> = (0u8..=255)
+        .map(|b| {
+            let c = b as char;
+            if c.is_ascii_uppercase() {
+                (b - b'A') as i16
+            } else if c.is_ascii_lowercase() {
+                (b - b'a' + 26) as i16
+            } else if c.is_ascii_digit() {
+                (b - b'0' + 52) as i16
+            } else if c == '+' {
+                62
+            } else if c == '/' {
+                63
+            } else {
+                -1
+            }
+        })
+        .collect();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for b in input.bytes() {
+        let v = table[b as usize];
+        if v < 0 {
+            continue;
+        }
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// Run pending promise jobs, so `await` and `.then` chains issued by a script
+/// that performed a request actually finish. Bounded, and checked against the
+/// wall clock: a chain that keeps queueing work cannot outlive the budget.
+fn drain_jobs(ctx: &rquickjs::Ctx<'_>, cap: u32) -> u32 {
+    let mut ran = 0u32;
+    while ran < cap && ctx.execute_pending_job() {
+        ran += 1;
+    }
+    ran
+}
+
 #[derive(Debug)]
 pub struct JsOutcome {
     pub value: Option<Value>,
@@ -809,7 +1409,15 @@ fn has_return(script: &str) -> bool {
 /// A new runtime per call is deliberate: it guarantees that no state, prototype
 /// pollution or lingering global survives between sessions, and it makes the
 /// memory cap trivially enforceable. The cost is engine startup per execution.
-pub fn run(script: &str, snapshot: &Value, base_url: &str, user_agent: &str, timeout: Duration, max_memory: usize) -> Result<JsOutcome> {
+pub fn run(
+    script: &str,
+    snapshot: &Value,
+    base_url: &str,
+    user_agent: &str,
+    net: Option<NetFn>,
+    timeout: Duration,
+    max_memory: usize,
+) -> Result<JsOutcome> {
     use rquickjs::{Context, Runtime};
 
     let started = Instant::now();
@@ -865,18 +1473,35 @@ pub fn run(script: &str, snapshot: &Value, base_url: &str, user_agent: &str, tim
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         ctx.eval::<(), _>(DOM_SHIM)
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
+        ctx.eval::<(), _>(NET_SHIM)
+            .map_err(|e| js_err(classify(&e, &timed_out)))?;
+        wire_net(&ctx, net)?;
 
         let script = format!("(function(){{ {} }})()", script);
-        match ctx.eval::<rquickjs::Value, _>(script.as_str()) {
-            Ok(v) => {
-                if v.is_undefined() || v.is_null() {
-                    Ok(None)
-                } else {
-                    Ok(Some(render_js_value(&v)))
+        // A script that awaits a request finishes in pending jobs, not in the
+        // call itself: `return await fetch(u).then(r => r.json())` yields a
+        // promise, and the value only exists once the job queue has been
+        // driven. Resolving it here is the difference between /v1/eval being
+        // able to call an API and returning a promise nobody will ever run.
+        let v = ctx
+            .eval::<rquickjs::Value, _>(script.as_str())
+            .map_err(|e| js_err(classify(&e, &timed_out)))?;
+        let value = match v.as_promise() {
+            Some(promise) => match promise.finish::<rquickjs::Value>() {
+                Ok(rv) if rv.is_undefined() || rv.is_null() => None,
+                Ok(rv) => Some(render_js_value(&rv)),
+                // Rejected, or blocked on something that is not a job (a
+                // timer). The pending exception has to be cleared or every
+                // later eval on this context fails.
+                Err(_) => {
+                    let _ = ctx.catch();
+                    None
                 }
-            }
-            Err(e) => Err(js_err(classify(&e, &timed_out))),
-        }
+            },
+            None if v.is_undefined() || v.is_null() => None,
+            None => Some(render_js_value(&v)),
+        };
+        Ok(value)
     })?;
 
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -905,6 +1530,7 @@ pub fn run(script: &str, snapshot: &Value, base_url: &str, user_agent: &str, tim
 }
 
 /// What running a page's scripts produced.
+#[derive(Debug)]
 pub struct PageRunOutcome {
     /// The mutated document, serialised back to HTML. `None` when execution was
     /// disabled or nothing ran.
@@ -914,6 +1540,9 @@ pub struct PageRunOutcome {
     pub scripts_failed: usize,
     pub timers_run: u32,
     pub timers_pending: u32,
+    /// Promise jobs run after the scripts: the continuations of `await` and
+    /// `.then`, which is where a page's fetch callbacks actually execute.
+    pub jobs_run: u32,
     pub duration_ms: u64,
     pub timed_out: bool,
     /// Per-script failures. A broken analytics script must not fail the page,
@@ -937,9 +1566,12 @@ pub fn run_page(
     snapshot: &Value,
     base_url: &str,
     user_agent: &str,
+    net: Option<NetFn>,
     timeout: Duration,
     max_memory: usize,
     timer_budget: u32,
+    // Total promise jobs one page may run, across every script and drain.
+    job_budget: u32,
 ) -> Result<PageRunOutcome> {
     use rquickjs::{Context, Runtime};
 
@@ -970,6 +1602,8 @@ pub fn run_page(
     // because the borrow of `ctx` ends with it.
     let timer_counts: std::rc::Rc<std::cell::Cell<(u32, u32)>> =
         std::rc::Rc::new(std::cell::Cell::new((0, 0)));
+    let jobs: std::rc::Rc<std::cell::Cell<u32>> = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut jobs_left = job_budget;
 
     let outcome = ctx.with(|ctx| -> Result<Option<String>> {
         wire_console(&ctx, &logs)?;
@@ -984,6 +1618,9 @@ pub fn run_page(
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         ctx.eval::<(), _>(DOM_SHIM)
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
+        ctx.eval::<(), _>(NET_SHIM)
+            .map_err(|e| js_err(classify(&e, &timed_out)))?;
+        wire_net(&ctx, net)?;
 
         for script in scripts {
             if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1002,18 +1639,40 @@ pub fn run_page(
                     }
                 }
             }
+            // A script that issued a request leaves its continuation in the job
+            // queue. Drain it before the next script, which is when a browser
+            // would have run those microtasks.
+            let ran = drain_jobs(&ctx, jobs_left);
+            jobs.set(jobs.get() + ran);
+            jobs_left = jobs_left.saturating_sub(ran);
         }
 
-        // Deferred writes are common, so drain the virtual clock after the
-        // synchronous scripts have all run.
-        // Marshalled to JSON rather than poked at as a JS object: the drain
-        // result is small, and this cannot fail silently on an API mismatch.
-        let timers: Option<String> = ctx
-            .eval::<String, _>(
-                format!("JSON.stringify(__scout_drain_timers({}))", timer_budget).as_str(),
-            )
-            .ok();
-        timer_counts.set(parse_timer_result(timers.as_deref()));
+        // Timers can issue requests and requests can schedule timers, so the
+        // two queues are drained together until neither produces work.
+        let mut timers_run = 0u32;
+        let mut timers_pending = 0u32;
+        let mut remaining = timer_budget;
+        for _ in 0..64 {
+            let queued = drain_jobs(&ctx, jobs_left);
+            jobs_left = jobs_left.saturating_sub(queued);
+            jobs.set(jobs.get() + queued);
+            let drained: Option<String> = ctx
+                .eval::<String, _>(
+                    format!("JSON.stringify(__scout_drain_timers({}))", remaining).as_str(),
+                )
+                .ok();
+            let (ran, pending) = parse_timer_result(drained.as_deref());
+            timers_run += ran;
+            timers_pending = pending;
+            remaining = remaining.saturating_sub(ran);
+            if queued == 0 && ran == 0 {
+                break;
+            }
+            if timed_out.load(std::sync::atomic::Ordering::SeqCst) || remaining == 0 {
+                break;
+            }
+        }
+        timer_counts.set((timers_run, timers_pending));
 
         let html = if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
             None
@@ -1038,6 +1697,7 @@ pub fn run_page(
         scripts_failed,
         timers_run,
         timers_pending,
+        jobs_run: jobs.get(),
         duration_ms,
         timed_out: timed_out.load(std::sync::atomic::Ordering::SeqCst),
         errors,
@@ -1155,6 +1815,20 @@ mod tests {
     }
 
     fn run_page_on(html: &str, scripts: &[&str]) -> Result<PageRunOutcome> {
+        run_page_net_on(html, scripts, None)
+    }
+
+    fn run_page_net_on(html: &str, scripts: &[&str], net: Option<NetFn>) -> Result<PageRunOutcome> {
+        run_page_budget_on(html, scripts, net, 64, 500)
+    }
+
+    fn run_page_budget_on(
+        html: &str,
+        scripts: &[&str],
+        net: Option<NetFn>,
+        timer_budget: u32,
+        job_budget: u32,
+    ) -> Result<PageRunOutcome> {
         let d = doc(html);
         let snap = dom_snapshot(&d);
         run_page(
@@ -1162,10 +1836,262 @@ mod tests {
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            net,
             Duration::from_millis(2_000),
             64 * 1024 * 1024,
-            64,
+            timer_budget,
+            job_budget,
         )
+    }
+
+    /// A host network that answers every request from a fixed table and records
+    /// what it was asked for, so tests can assert on the request as well as the
+    /// rendered result.
+    fn fake_net(
+        body: &'static str,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<NetRequest>>>,
+    ) -> NetFn {
+        std::sync::Arc::new(move |req: NetRequest| {
+            seen.lock().unwrap().push(req.clone());
+            Ok(NetResponse {
+                status: 200,
+                status_text: "OK".into(),
+                url: "https://example.com/api/items".into(),
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: body.to_string(),
+            })
+        })
+    }
+
+    fn empty_seen() -> std::sync::Arc<std::sync::Mutex<Vec<NetRequest>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    // ------------------------------------------------------------- network
+
+    #[test]
+    fn fetch_reaches_the_document_through_a_then_chain() {
+        let seen = empty_seen();
+        let net = fake_net("[{\"name\":\"Ada\"},{\"name\":\"Alan\"}]", seen.clone());
+        let out = run_page_net_on(
+            "<html><body><ul id='l'></ul></body></html>",
+            &[concat!(
+                "fetch('/api/items')",
+                "  .then(function (r) { return r.json(); })",
+                "  .then(function (items) {",
+                "    var l = document.getElementById('l');",
+                "    for (var i = 0; i < items.length; i++) {",
+                "      var li = document.createElement('li');",
+                "      li.textContent = items[i].name;",
+                "      l.appendChild(li);",
+                "    }",
+                "  });"
+            )],
+            Some(net),
+        )
+        .unwrap();
+
+        assert_eq!(out.scripts_run, 1, "the page script must still count as run");
+        assert!(out.jobs_run >= 1, "the .then callbacks are jobs: {out:?}");
+        let html = out.html.unwrap_or_default();
+        assert!(html.contains("Ada") && html.contains("Alan"), "got: {html}");
+        let seen_guard = seen.lock().unwrap();
+        let reqs = &*seen_guard;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+    }
+
+    #[test]
+    fn a_fetched_url_is_resolved_against_the_document() {
+        let seen = empty_seen();
+        let net = fake_net("{}", seen.clone());
+        run_page_net_on("<p>x</p>", &["fetch('api/items');"], Some(net)).unwrap();
+        // The host resolves it; what matters is that the page may write a
+        // relative URL and the request still names a full one.
+        let seen_guard = seen.lock().unwrap();
+        let reqs = &*seen_guard;
+        assert_eq!(reqs[0].url, "api/items");
+    }
+
+    #[test]
+    fn awaiting_a_fetch_resolves_before_the_script_ends() {
+        let seen = empty_seen();
+        let net = fake_net("{\"n\":42}", seen.clone());
+        let out = run_net_on(
+            "<p>x</p>",
+            "return fetch('/api').then(function (r) { return r.json(); }).then(function (j) { return j.n; });",
+            Some(net),
+        )
+        .unwrap();
+        assert_eq!(out.value, Some(serde_json::json!(42)), "logs: {:?}", out.logs);
+    }
+
+    #[test]
+    fn an_async_function_can_await_fetch_and_write_the_dom() {
+        let seen = empty_seen();
+        let net = fake_net("{\"title\":\"Hello\"}", seen.clone());
+        let out = run_page_net_on(
+            "<html><body><h1 id='t'></h1></body></html>",
+            &[concat!(
+                "(async function () {",
+                "  var r = await fetch('/api/title');",
+                "  var j = await r.json();",
+                "  document.getElementById('t').textContent = j.title;",
+                "})();"
+            )],
+            Some(net),
+        )
+        .unwrap();
+        assert!(out.html.clone().unwrap_or_default().contains("Hello"), "{:?}", out.html);
+    }
+
+    #[test]
+    fn xhr_loads_and_fires_its_handlers_after_the_script() {
+        let seen = empty_seen();
+        let net = fake_net("{\"rows\":[1,2,3]}", seen.clone());
+        let out = run_page_net_on(
+            "<html><body><div id='d'></div></body></html>",
+            &[concat!(
+                "var x = new XMLHttpRequest();",
+                "x.open('POST', '/api/rows');",
+                "x.setRequestHeader('content-type', 'application/json');",
+                "x.onreadystatechange = function () {",
+                "  if (x.readyState === 4 && x.status === 200) {",
+                "    document.getElementById('d').textContent = x.responseText;",
+                "  }",
+                "};",
+                "x.send(JSON.stringify({ q: 'all' }));"
+            )],
+            Some(net),
+        )
+        .unwrap();
+
+        let html = out.html.unwrap_or_default();
+        assert!(html.contains("&quot;rows&quot;") || html.contains("rows"), "got: {html}");
+        let seen_guard = seen.lock().unwrap();
+        let reqs = &*seen_guard;
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(
+            reqs[0].headers.first().map(|h| h.0.clone()),
+            Some("content-type".into())
+        );
+        assert!(reqs[0].body.is_some(), "the posted body must travel");
+    }
+
+    #[test]
+    fn xhr_handlers_registered_after_send_still_fire() {
+        let seen = empty_seen();
+        let net = fake_net("ok", seen.clone());
+        let out = run_page_net_on(
+            "<html><body><div id='d'></div></body></html>",
+            &[concat!(
+                "var x = new XMLHttpRequest();",
+                "x.open('GET', '/api/ping');",
+                "x.send();",
+                "x.addEventListener('load', function () {",
+                "  document.getElementById('d').textContent = 'loaded:' + x.status;",
+                "});"
+            )],
+            Some(net),
+        )
+        .unwrap();
+        assert!(
+            out.html.unwrap_or_default().contains("loaded:200"),
+            "a handler added after send must still run, as in a browser"
+        );
+    }
+
+    #[test]
+    fn a_failed_request_rejects_instead_of_returning_nothing() {
+        let net: NetFn = std::sync::Arc::new(|_| Err("host refused the request".to_string()));
+        let out = run_net_on(
+            "<p>x</p>",
+            "return fetch('/api').then(function () { return 'resolved'; }).catch(function (e) { return 'rejected:' + e.message; });",
+            Some(net),
+        )
+        .unwrap();
+        assert_eq!(out.value, Some(serde_json::json!("rejected:host refused the request")));
+    }
+
+    #[test]
+    fn fetch_without_a_host_network_is_refused_by_name() {
+        // Networking disabled: the page must learn why, not see an undefined
+        // `fetch` and die with an opaque TypeError.
+        let out = run_net_on(
+            "<p>x</p>",
+            "return fetch('/api').catch(function (e) { return 'err:' + e.message; });",
+            None,
+        )
+        .unwrap();
+        let v = out.value.unwrap_or_default().to_string();
+        assert!(v.contains("SCOUT_JS_NETWORK"), "got: {v}");
+    }
+
+    #[test]
+    fn url_search_params_encodes_a_form_body() {
+        let seen = empty_seen();
+        let net = fake_net("ok", seen.clone());
+        run_net_on(
+            "<p>x</p>",
+            "return fetch('/login', { method: 'POST', body: new URLSearchParams({ user: 'a b', pw: 'p&q' }) });",
+            Some(net),
+        )
+        .unwrap();
+        let seen_guard = seen.lock().unwrap();
+        let reqs = &*seen_guard;
+        match reqs[0].body.as_ref().expect("a body") {
+            NetBody::Text(t) => assert_eq!(t, "user=a%20b&pw=p%26q"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btoa_and_atob_round_trip() {
+        let out = run_on("<p>x</p>", "return atob(btoa('hello world'));").unwrap();
+        assert_eq!(out.value, Some(serde_json::json!("hello world")));
+    }
+
+    #[test]
+    fn a_request_from_a_timer_still_reaches_the_document() {
+        let seen = empty_seen();
+        let net = fake_net("late", seen.clone());
+        let out = run_page_net_on(
+            "<html><body><div id='d'></div></body></html>",
+            &[concat!(
+                "setTimeout(function () {",
+                "  fetch('/api/late').then(function (r) { return r.text(); }).then(function (t) {",
+                "    document.getElementById('d').textContent = t;",
+                "  });",
+                "}, 10);"
+            )],
+            Some(net),
+        )
+        .unwrap();
+        assert!(
+            out.html.clone().unwrap_or_default().contains("late"),
+            "a timer callback that issues a request must still render: {:?}",
+            out.html
+        );
+    }
+
+    #[test]
+    fn the_job_queue_is_bounded() {
+        // A page that keeps chaining promises must not spin forever; the drain
+        // is capped and the wall clock still applies.
+        let net = fake_net("{}", empty_seen());
+        let out = run_page_budget_on(
+            "<p>x</p>",
+            &["(function loop(i) { if (i > 100000) return; Promise.resolve().then(function () { loop(i + 1); }); })(0);"],
+            Some(net),
+            64,
+            500,
+        )
+        .unwrap();
+        assert!(
+            out.jobs_run <= 500,
+            "a page may not exceed its job budget, got {}",
+            out.jobs_run
+        );
     }
 
     #[test]
@@ -1254,6 +2180,10 @@ mod tests {
     }
 
     fn run_on(html: &str, script: &str) -> Result<JsOutcome> {
+        run_net_on(html, script, None)
+    }
+
+    fn run_net_on(html: &str, script: &str, net: Option<NetFn>) -> Result<JsOutcome> {
         let d = doc(html);
         let snap = dom_snapshot(&d);
         run(
@@ -1261,6 +2191,7 @@ mod tests {
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            net,
             Duration::from_millis(2_000),
             64 * 1024 * 1024,
         )
@@ -1378,6 +2309,7 @@ mod tests {
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            None,
             Duration::from_millis(5_000),
             8 * 1024 * 1024,
         );

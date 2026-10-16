@@ -4,9 +4,10 @@ use crate::abort::Abort;
 use crate::config::Config;
 use crate::error::{ErrorCode, Result, ScoutError};
 use crate::interaction::Effect;
+use crate::js;
 use crate::metrics::Metrics;
 use crate::resources::ResourceManager;
-use crate::security::{guarded_fetch, FetchRequest, Fetched};
+use crate::security::{guarded_fetch, Fetched, FetchKind, FetchRequest};
 use crate::session::{Session, SessionManager};
 use crate::tasks::TaskManager;
 use crate::validate::{clamp_timeout, ExtractReq, InteractReq, NavigateReq, TaskReq};
@@ -25,6 +26,9 @@ pub struct Scout {
     pub tasks: Arc<TaskManager>,
     pub workers: Arc<WorkerPool>,
     pub client: reqwest::Client,
+    /// Handle on the async runtime, so a blocking in-page request issued from a
+    /// page worker can drive the same guarded client everything else uses.
+    handle: Option<tokio::runtime::Handle>,
     /// Session id -> worker index, so a session always lands on the worker that
     /// holds its DOM.
     routing: Mutex<HashMap<String, usize>>,
@@ -61,6 +65,7 @@ impl Scout {
             tasks,
             workers,
             client,
+            handle: tokio::runtime::Handle::try_current().ok(),
             routing: Mutex::new(HashMap::new()),
             stopping: std::sync::atomic::AtomicBool::new(false),
         });
@@ -143,6 +148,7 @@ impl Scout {
     ) -> Result<Value> {
         let timeout = clamp_timeout(nav.timeout_ms, self.cfg.nav_timeout_ms, self.cfg.max_nav_timeout_ms);
         let fetched = self.fetch(session, nav, timeout, abort).await?;
+        let page_url = fetched.url.clone();
 
         // Parsing and DOM construction happen on the page worker.
         let loaded = self
@@ -165,17 +171,40 @@ impl Scout {
             .fetch_scripts(session, &loaded.summary, &loaded.scripts, timeout, abort)
             .await;
 
+        let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
+        let net = if self.cfg.js_network {
+            Some(self.page_net(session, &page_url, net_stats.clone()))
+        } else {
+            None
+        };
+
         let mut summary = loaded.summary;
         match self
             .workers
             .call(worker, |reply| Cmd::RunScripts {
                 session: session.id.clone(),
                 scripts: bodies,
+                net,
                 reply,
             })
             .await
         {
             Ok(js) => {
+                let mut js = js;
+                let stats = *net_stats.lock().unwrap();
+                if stats.requests > 0 || stats.blocked > 0 {
+                    if let Some(obj) = js.as_object_mut() {
+                        obj.insert(
+                            "network".into(),
+                            json!({
+                                "requests": stats.requests,
+                                "failed": stats.failed,
+                                "blocked": stats.blocked,
+                                "bytes": stats.bytes,
+                            }),
+                        );
+                    }
+                }
                 if let Some(obj) = summary.as_object_mut() {
                     obj.insert("js".into(), js);
                 }
@@ -223,8 +252,7 @@ impl Scout {
                         out.push(String::new());
                         continue;
                     }
-                    let cookie_header = session.jar.header_for(joined.as_str());
-                    let mut set_cookies: Vec<(String, String)> = Vec::new();
+                    let referer = session.referrer();
                     let fut = guarded_fetch(
                         &self.cfg,
                         &self.client,
@@ -233,8 +261,9 @@ impl Scout {
                             method: "GET",
                             headers: Vec::new(),
                             body: None,
-                            cookie_header,
-                            set_cookies: Some(&mut set_cookies),
+                            jar: Some(&session.jar),
+                            kind: FetchKind::Script,
+                            referer: referer.as_deref(),
                             timeout_ms,
                             max_bytes: budget.min(self.cfg.max_response_bytes),
                         },
@@ -247,7 +276,6 @@ impl Scout {
                     match res {
                         Ok(f) if f.status < 400 => {
                             budget = budget.saturating_sub(f.bytes);
-                            session.jar.store_set_cookies(&f.url, &set_cookies);
                             out.push(f.body);
                         }
                         _ => out.push(String::new()),
@@ -266,14 +294,13 @@ impl Scout {
         abort: &Abort,
     ) -> Result<Fetched> {
         let url = crate::security::validate_url(&nav.url, &self.cfg)?;
-        let cookie_header = session.jar.header_for(url.as_str());
 
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = &nav.content_type {
             headers.push(("content-type".into(), ct.clone()));
         }
 
-        let mut set_cookies: Vec<(String, String)> = Vec::new();
+        let referer = session.referrer();
 
         let fut = guarded_fetch(
             &self.cfg,
@@ -283,8 +310,9 @@ impl Scout {
                 method: &nav.method,
                 headers,
                 body: nav.body.as_ref().map(|b| b.as_bytes().to_vec()),
-                cookie_header,
-                set_cookies: Some(&mut set_cookies),
+                jar: Some(&session.jar),
+                kind: FetchKind::Document,
+                referer: referer.as_deref(),
                 timeout_ms,
                 max_bytes: self.cfg.max_response_bytes,
             },
@@ -296,8 +324,9 @@ impl Scout {
             r = fut => r,
         }?;
 
-        // Persist cookies only for a response we actually accepted.
-        session.jar.store_set_cookies(&result.url, &set_cookies);
+        // Subsequent requests come *from* this document, which is what makes a
+        // form POST carry the Referer and Origin a server expects to see.
+        session.set_referrer(&result.url);
 
         self.metrics.inc(
             "scout_navigations_total",
@@ -305,6 +334,173 @@ impl Scout {
             &[("outcome", "ok")],
         );
         Ok(result)
+    }
+
+    /// The network a page's scripts see.
+    ///
+    /// Built here, on the async side, because everything that constrains a
+    /// scripted request lives here: the guarded client with its SSRF policy,
+    /// the session's cookie jar, and the configured budgets. The worker thread
+    /// only ever holds this callback, so page JavaScript cannot reach the
+    /// client, and a request from a script is the same request a navigation
+    /// would make.
+    fn page_net(
+        &self,
+        session: &Session,
+        base_url: &str,
+        stats: std::sync::Arc<Mutex<js::NetStats>>,
+    ) -> js::NetFn {
+        let client = self.client.clone();
+        let cfg = self.cfg.clone();
+        let jar = session.jar.clone();
+        let base = base_url.to_string();
+        let referer = session.referrer().unwrap_or_else(|| base_url.to_string());
+        let handle = self.handle.clone();
+        let max_requests = self.cfg.js_max_fetches;
+        let max_bytes = self.cfg.js_max_fetch_bytes.min(self.cfg.max_response_bytes);
+        let timeout_ms = self.cfg.js_fetch_timeout_ms;
+
+        std::sync::Arc::new(move |req: js::NetRequest| -> std::result::Result<js::NetResponse, String> {
+            {
+                let mut st = stats.lock().unwrap();
+                if st.requests >= max_requests {
+                    st.blocked += 1;
+                    return Err(format!(
+                        "this page has used its budget of {max_requests} scripted requests"
+                    ));
+                }
+                st.requests += 1;
+            }
+            if !matches!(
+                req.method.as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+            ) {
+                return Err(format!("method \"{}\" is not supported", req.method));
+            }
+            let joined = match url::Url::parse(&base).and_then(|b| b.join(&req.url)) {
+                Ok(u) => u,
+                Err(_) => {
+                    return Err(format!(
+                        "could not resolve \"{}\" against the page URL",
+                        req.url
+                    ))
+                }
+            };
+            let body = match &req.body {
+                None => None,
+                Some(js::NetBody::Text(t)) => Some(t.as_bytes().to_vec()),
+                Some(js::NetBody::Bytes(b)) => Some(b.clone()),
+            };
+            let fut = guarded_fetch(
+                &cfg,
+                &client,
+                FetchRequest {
+                    url: joined.as_str(),
+                    method: &req.method,
+                    headers: req.headers.clone(),
+                    body,
+                    jar: Some(&jar),
+                    kind: FetchKind::Xhr,
+                    referer: Some(referer.as_str()),
+                    timeout_ms,
+                    max_bytes,
+                },
+            );
+            let result = match &handle {
+                // The page worker is a plain thread, never a runtime worker, so
+                // blocking here cannot stall the executor that is running this
+                // very request.
+                Some(h) => h.block_on(fut),
+                None => {
+                    return Err("no async runtime is available for scripted requests".into())
+                }
+            };
+            match result {
+                Ok(f) => {
+                    let mut st = stats.lock().unwrap();
+                    st.bytes += f.bytes;
+                    Ok(js::NetResponse {
+                        status: f.status,
+                        status_text: crate::security::status_text(f.status).to_string(),
+                        url: f.url,
+                        headers: f.headers,
+                        body: f.body,
+                    })
+                }
+                Err(e) => {
+                    let mut st = stats.lock().unwrap();
+                    st.failed += 1;
+                    Err(e.message)
+                }
+            }
+        })
+    }
+
+    /// One request through the session's jar and the SSRF policy, with the
+    /// result returned rather than parsed into a page.
+    ///
+    /// This is the primitive behind authenticated CRUD: the session signs in
+    /// once, and then a JSON API on that origin is addressable with the session
+    /// cookie attached, under exactly the same policy as a navigation.
+    pub async fn request(&self, owner: &str, req: crate::validate::RequestReq, abort: &Abort) -> Result<Value> {
+        let (session, ephemeral) = match &req.session_id {
+            Some(id) => (self.sessions.get(owner, id)?, false),
+            None => (self.sessions.create(owner.to_string(), true)?, true),
+        };
+        let timeout = clamp_timeout(
+            req.timeout_ms,
+            self.cfg.nav_timeout_ms,
+            self.cfg.max_nav_timeout_ms,
+        );
+        let result = async {
+            let _guard = session.lock().await?;
+            let referer = session.referrer();
+            let content_type = req.content_type.clone();
+            let mut headers = req.headers.clone();
+            if let Some(ct) = &content_type {
+                headers.push(("content-type".into(), ct.clone()));
+            }
+            let fut = guarded_fetch(
+                &self.cfg,
+                &self.client,
+                FetchRequest {
+                    url: &req.url,
+                    method: &req.method,
+                    headers,
+                    body: req.body.as_ref().map(|b| b.as_bytes().to_vec()),
+                    jar: Some(&session.jar),
+                    kind: FetchKind::Xhr,
+                    referer: referer.as_deref(),
+                    timeout_ms: timeout,
+                    max_bytes: self.cfg.max_response_bytes.min(512 * 1024),
+                },
+            );
+            let fetched = tokio::select! {
+                biased;
+                _ = abort.token().cancelled() => Err(abort.reason()),
+                r = fut => r,
+            }?;
+            let mut head = serde_json::Map::new();
+            for (k, v) in &fetched.headers {
+                head.insert(k.clone(), Value::String(v.clone()));
+            }
+            Ok(json!({
+                "url": fetched.url,
+                "status": fetched.status,
+                "statusText": crate::security::status_text(fetched.status),
+                "contentType": fetched.content_type,
+                "headers": Value::Object(head),
+                "body": fetched.body,
+                "bytes": fetched.bytes,
+                "redirects": fetched.redirects,
+            }))
+        }
+        .await;
+
+        if ephemeral {
+            self.release_session(&session.id);
+        }
+        result
     }
 
     // ------------------------------------------------------------- extracts
@@ -581,10 +777,18 @@ impl Scout {
         let session = self.sessions.get(owner, session_id)?;
         let worker = self.worker_of(session_id)?;
         let _guard = session.lock().await?;
+        // /v1/eval runs on the page that is loaded, so relative URLs and
+        // cookies resolve against it exactly as they do for a page script.
+        let page_url = session.referrer().unwrap_or_default();
+        let net = if self.cfg.js_network {
+            Some(self.page_net(&session, &page_url, std::sync::Arc::new(Mutex::new(js::NetStats::default()))))
+        } else {
+            None
+        };
         tokio::select! {
             biased;
             _ = abort.token().cancelled() => Err(abort.reason()),
-            r = self.workers.call(worker, |reply| Cmd::Eval { session: session.id.clone(), script, reply }) => r,
+            r = self.workers.call(worker, |reply| Cmd::Eval { session: session.id.clone(), script, net, reply }) => r,
         }
     }
 

@@ -68,6 +68,10 @@ pub enum Cmd {
         /// Bodies in document order; an empty string means it could not be
         /// fetched, which is recorded rather than fatal.
         scripts: Vec<String>,
+        /// The session's network, if in-page requests are allowed. Built on the
+        /// async side, where the client, the jar and the SSRF policy live, and
+        /// handed to the worker so scripts never touch them directly.
+        net: Option<js::NetFn>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Extract {
@@ -84,6 +88,7 @@ pub enum Cmd {
     Eval {
         session: String,
         script: String,
+        net: Option<js::NetFn>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Drop {
@@ -112,8 +117,8 @@ impl WorkerState {
             Cmd::Load { session, fetched, reply } => {
                 let _ = reply.send(self.load(&session, *fetched));
             }
-            Cmd::RunScripts { session, scripts, reply } => {
-                let _ = reply.send(self.run_scripts(&session, scripts));
+            Cmd::RunScripts { session, scripts, net, reply } => {
+                let _ = reply.send(self.run_scripts(&session, scripts, net));
             }
             Cmd::Extract { session, spec, limit, reply } => {
                 let _ = reply.send(self.extract(&session, &spec, limit));
@@ -121,8 +126,8 @@ impl WorkerState {
             Cmd::Interact { session, action, reply } => {
                 let _ = reply.send(self.interact(&session, action));
             }
-            Cmd::Eval { session, script, reply } => {
-                let _ = reply.send(self.eval(&session, &script));
+            Cmd::Eval { session, script, net, reply } => {
+                let _ = reply.send(self.eval(&session, &script, net));
             }
             Cmd::Drop { session } => {
                 // Dropping the Page releases the DOM tree and any typed form values.
@@ -254,7 +259,12 @@ impl WorkerState {
     /// The document is re-parsed from the serialised, mutated tree, which is
     /// what makes script-built content visible to extraction. A page whose
     /// scripts all fail keeps its original DOM rather than being blanked.
-    fn run_scripts(&mut self, session: &str, scripts: Vec<String>) -> Result<Value> {
+    fn run_scripts(
+        &mut self,
+        session: &str,
+        scripts: Vec<String>,
+        net: Option<js::NetFn>,
+    ) -> Result<Value> {
         let page = self
             .pages
             .get_mut(session)
@@ -272,9 +282,11 @@ impl WorkerState {
             &snapshot,
             &page.url,
             &self.cfg.user_agent,
+            net,
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
             self.cfg.js_timer_budget,
+            self.cfg.js_job_budget,
         )?;
 
         if let Some(html) = out.html {
@@ -290,6 +302,7 @@ impl WorkerState {
             "scriptsFailed": out.scripts_failed,
             "timersRun": out.timers_run,
             "timersPending": out.timers_pending,
+            "jobsRun": out.jobs_run,
             "durationMs": out.duration_ms,
             "timedOut": out.timed_out,
         });
@@ -302,7 +315,7 @@ impl WorkerState {
         Ok(summary)
     }
 
-    fn eval(&self, session: &str, script: &str) -> Result<Value> {
+    fn eval(&self, session: &str, script: &str, net: Option<js::NetFn>) -> Result<Value> {
         let page = self.page(session)?;
         let Some(doc) = page.doc.as_ref() else {
             return Err(ScoutError::new(
@@ -316,6 +329,7 @@ impl WorkerState {
             &snapshot,
             &page.url,
             &self.cfg.user_agent,
+            net,
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
         )?;

@@ -263,6 +263,36 @@ pub struct Fetched {
     pub redirects: Vec<serde_json::Value>,
 }
 
+/// Reason phrase for the status codes a page script can observe. `Fetched`
+/// carries the number; `response.statusText` needs the words.
+pub fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        418 => "I'm a teapot",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
 fn is_textual(ct: &str) -> bool {
     ct.is_empty() || ct.starts_with("text/") || ct.contains("json") || ct.contains("xml")
 }
@@ -297,16 +327,156 @@ fn map_net_error(e: reqwest::Error) -> ScoutError {
         .with_details(serde_json::json!({ "cause": e.to_string() }))
 }
 
+/// What the request is *for*. A browser varies Sec-Fetch-* by this, and a
+/// server that reads those headers reads them to tell a navigation from a
+/// subresource from an API call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchKind {
+    /// A top-level document load.
+    Document,
+    /// A `<script src>` the document pulled in.
+    Script,
+    /// `fetch` or `XMLHttpRequest`, from the page or from the request tool.
+    Xhr,
+}
+
 pub struct FetchRequest<'a> {
     pub url: &'a str,
     pub method: &'a str,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
-    pub cookie_header: Option<String>,
-    /// Receives every `Set-Cookie` header seen, together with the URL that sent it.
-    pub set_cookies: Option<&'a mut Vec<(String, String)>>,
+    /// The session's cookie jar. Read before every hop and written after every
+    /// hop, so a cookie issued by a login POST is presented on the redirect
+    /// that follows it. Applying cookies only at the end of the chain is the
+    /// difference between being able to sign in and landing back on the form.
+    pub jar: Option<&'a crate::session::CookieJar>,
+    pub kind: FetchKind,
+    /// The document this request is issued from, when there is one. Drives
+    /// `Referer`, `Origin` and `Sec-Fetch-Site` under the browser's default
+    /// `strict-origin-when-cross-origin` policy.
+    pub referer: Option<&'a str>,
     pub timeout_ms: u64,
     pub max_bytes: usize,
+}
+
+/// The header set a browser sends with a request of this kind.
+///
+/// This is identification, not evasion. Scout runs page scripts, keeps a cookie
+/// jar and follows redirects, so it presents itself as the browser it stands in
+/// for; it is a lie to say "Scout/0.1 (automation runtime)" to a server while
+/// behaving like Chrome in every other respect. Nothing here defeats a
+/// CAPTCHA, a rate limit, a login wall or any other access control — those
+/// still stop a session, and Scout reports that it was stopped rather than
+/// looking for a way around. `SCOUT_BROWSER_HEADERS=0` turns all of it off
+/// except User-Agent and Accept-Language, and `SCOUT_USER_AGENT` declares
+/// whatever you would rather declare.
+fn browser_headers(
+    cfg: &Config,
+    kind: FetchKind,
+    target: &url::Url,
+    referer: Option<&str>,
+    method: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let (accept, dest, mode) = match kind {
+        FetchKind::Document => (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "document",
+            "navigate",
+        ),
+        FetchKind::Script => ("*/*", "script", "no-cors"),
+        FetchKind::Xhr => ("*/*", "empty", "cors"),
+    };
+    out.push(("accept".into(), accept.into()));
+
+    if !cfg.browser_headers {
+        return out;
+    }
+
+    let from = referer.and_then(|r| url::Url::parse(r).ok());
+    let site = match &from {
+        None => "none",
+        Some(r) if r.origin() == target.origin() => "same-origin",
+        Some(r) if same_site(r, target) => "same-site",
+        Some(_) => "cross-site",
+    };
+    out.push(("sec-fetch-dest".into(), dest.into()));
+    out.push(("sec-fetch-mode".into(), mode.into()));
+    out.push(("sec-fetch-site".into(), site.into()));
+    if kind == FetchKind::Document {
+        out.push(("upgrade-insecure-requests".into(), "1".into()));
+        out.push(("sec-fetch-user".into(), "?1".into()));
+    }
+
+    // Client hints are derived from the configured UA rather than hard-coded,
+    // so a custom UA does not keep advertising a browser it is not.
+    if let Some((brands, platform)) = client_hints(&cfg.user_agent) {
+        out.push(("sec-ch-ua".into(), brands));
+        out.push(("sec-ch-ua-mobile".into(), "?0".into()));
+        out.push(("sec-ch-ua-platform".into(), format!("\"{platform}\"")));
+    }
+
+    if let Some(r) = &from {
+        // strict-origin-when-cross-origin: full URL within the origin, origin
+        // only across origins, nothing on an https -> http downgrade.
+        let downgrade = r.scheme() == "https" && target.scheme() == "http";
+        if !downgrade {
+            let value = if r.origin() == target.origin() {
+                r.to_string()
+            } else {
+                r.origin().ascii_serialization()
+            };
+            out.push(("referer".into(), value));
+        }
+        // Browsers send Origin on every state-changing request and on XHR.
+        if !matches!(method, "GET" | "HEAD") || kind == FetchKind::Xhr {
+            out.push(("origin".into(), r.origin().ascii_serialization()));
+        }
+    }
+    out
+}
+
+/// `("Chromium";v="131", ...)` when the UA looks like Chrome, else nothing.
+fn client_hints(ua: &str) -> Option<(String, &'static str)> {
+    let major = ua.split("Chrome/").nth(1)?.split(&['.', ' ', ';'][..]).next()?;
+    if !major.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let platform = if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Macintosh") || ua.contains("Mac OS X") {
+        "macOS"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("iPhone") || ua.contains("iPad") {
+        "iOS"
+    } else {
+        "Linux"
+    };
+    Some((
+        format!(
+            "\"Chromium\";v=\"{major}\", \"Google Chrome\";v=\"{major}\", \"Not?A_Brand\";v=\"99\""
+        ),
+        platform,
+    ))
+}
+
+fn registrable(host: &str) -> String {
+    let mut parts: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    if parts.len() > 2 {
+        parts = parts.split_off(parts.len() - 2);
+    }
+    parts.join(".")
+}
+
+/// Approximation of "same site": equal registrable domains, without a public
+/// suffix list. Used only for a Sec-Fetch-Site value, never for a decision
+/// about whether a request may proceed.
+fn same_site(a: &url::Url, b: &url::Url) -> bool {
+    match (a.host_str(), b.host_str()) {
+        (Some(h1), Some(h2)) => registrable(h1) == registrable(h2),
+        _ => false,
+    }
 }
 
 /// Fetch one document with every hop validated.
@@ -324,9 +494,11 @@ pub async fn guarded_fetch(
     let mut body = req.body.clone();
     let mut headers = req.headers.clone();
     let mut redirects = Vec::new();
-    let mut set_cookies = req.set_cookies;
 
     for hop in 0..=cfg.max_redirects {
+        // Recomputed per hop: a cookie set by hop N belongs on hop N+1.
+        let cookie_header = req.jar.and_then(|j| j.header_for(current.as_str()));
+
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(ScoutError::new(
@@ -343,11 +515,10 @@ pub async fn guarded_fetch(
         );
         rb = rb
             .header("user-agent", &cfg.user_agent)
-            .header(
-                "accept",
-                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5",
-            )
             .header("accept-language", "en-US,en;q=0.8");
+        for (k, v) in browser_headers(cfg, req.kind, &current, req.referer, &method) {
+            rb = rb.header(k, v);
+        }
 
         for (k, v) in &headers {
             if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("content-length") {
@@ -355,7 +526,7 @@ pub async fn guarded_fetch(
             }
             rb = rb.header(k, v);
         }
-        if let Some(c) = &req.cookie_header {
+        if let Some(c) = &cookie_header {
             if !c.is_empty() {
                 rb = rb.header("cookie", c);
             }
@@ -368,21 +539,24 @@ pub async fn guarded_fetch(
         let res = rb.send().await.map_err(map_net_error)?;
         let status = res.status().as_u16();
 
-        // Collect Set-Cookie for the session jar, then drop it from exposed headers.
+        // Collect Set-Cookie into the session jar, then drop it from the
+        // headers a caller or a page script is allowed to see.
         let mut exposed = Vec::new();
+        let mut set_cookies: Vec<(String, String)> = Vec::new();
         for (k, v) in res.headers().iter() {
             let name = k.as_str().to_ascii_lowercase();
             if name == "set-cookie" {
-                if let Some(jar) = set_cookies.as_deref_mut() {
-                    if let Ok(s) = v.to_str() {
-                        jar.push((s.to_string(), current.to_string()));
-                    }
+                if let Ok(s) = v.to_str() {
+                    set_cookies.push((s.to_string(), current.to_string()));
                 }
                 continue;
             }
             if let Ok(s) = v.to_str() {
                 exposed.push((name, s.to_string()));
             }
+        }
+        if let Some(jar) = req.jar {
+            jar.store_set_cookies(current.as_str(), &set_cookies);
         }
 
         let location = res

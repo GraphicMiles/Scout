@@ -11,6 +11,7 @@
 
 pub mod abort;
 pub mod adapters;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod extract;

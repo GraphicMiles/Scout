@@ -236,5 +236,81 @@ await check('eval stops a runaway script', async () => {
   });
 });
 
+await check('tools() lists what an agent can call', async () => {
+  const tools = await scout.tools();
+  assert(Array.isArray(tools) && tools.length > 0, 'no tools');
+  const names = tools.map((t) => t.name);
+  for (const n of ['navigate', 'extract', 'request', 'auth.login', 'session.export']) {
+    assert(names.includes(n), `missing tool ${n}`);
+  }
+  for (const t of tools) assert(t.inputSchema?.type === 'object', `${t.name} has no input schema`);
+});
+
+await check('request() returns the response unparsed', async () => {
+  await scout.withSession(async (sessionId) => {
+    const r = await scout.request({ sessionId, url: 'https://example.com/' });
+    assert(r.status === 200, `status was ${r.status}`);
+    assert(r.body.includes('Example Domain'), 'body did not come back verbatim');
+    assert(typeof r.headers['content-type'] === 'string', 'headers missing');
+  });
+});
+
+// Signing in is only exercised against a fixture the operator points at: a
+// public site's login form is not ours to test against.
+const fixture = process.env.SCOUT_FIXTURE_URL;
+if (fixture) {
+  await check('login() signs in and returns the evidence', async () => {
+    await scout.withSession(async (sessionId) => {
+      const r = await scout.login({
+        sessionId,
+        url: `${fixture}/login`,
+        username: 'tester@example.com',
+        password: 'hunter2',
+      });
+      assert(r.looksAuthenticated === true, `looksAuthenticated was ${r.looksAuthenticated}: ${r.reason}`);
+      assert(r.cookies.added.includes('sid'), `cookies were ${JSON.stringify(r.cookies)}`);
+      assert(r.passwordFieldStillPresent === false, 'the sign-in form is still there');
+    });
+  });
+
+  await check('login() refuses wrong credentials instead of guessing', async () => {
+    await scout.withSession(async (sessionId) => {
+      const r = await scout.login({
+        sessionId,
+        url: `${fixture}/login`,
+        username: 'tester@example.com',
+        password: 'wrong',
+      });
+      assert(r.looksAuthenticated === false, 'a wrong password must not authenticate');
+      assert(r.cookies.added.length === 0, 'no session should have been issued');
+    });
+  });
+
+  await check('a signed-in session can be exported and resumed', async () => {
+    const s1 = await scout.createSession();
+    const s2 = await scout.createSession();
+    try {
+      const login = await scout.login({
+        sessionId: s1.id,
+        url: `${fixture}/login`,
+        username: 'tester@example.com',
+        password: 'hunter2',
+      });
+      assert(login.looksAuthenticated === true, login.reason);
+      const exported = await scout.exportSession(s1.id);
+      await scout.importSession(s2.id, `${fixture}/`, exported.cookies);
+      const nav = await scout.navigate({ sessionId: s2.id, url: `${fixture}/account` });
+      assert(nav.status === 200, `status was ${nav.status}`);
+      const text = JSON.stringify(await scout.callTool('page.text', { sessionId: s2.id }));
+      assert(text.includes('tester@example.com'), `the resumed session is not signed in: ${text}`);
+    } finally {
+      await scout.destroySession(s1.id).catch(() => {});
+      await scout.destroySession(s2.id).catch(() => {});
+    }
+  });
+} else {
+  console.log('  skip login() — set SCOUT_FIXTURE_URL to exercise the sign-in flow');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
