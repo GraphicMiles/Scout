@@ -4,6 +4,7 @@
 //! below, so the same behaviour is reachable from an embedder that never starts
 //! a socket.
 
+use crate::abort::Abort;
 use crate::config::Config;
 use crate::error::{ErrorCode, Result, ScoutError};
 use crate::scout::Scout;
@@ -365,6 +366,43 @@ async fn strategies() -> Response {
     Json(crate::adapters::list_json()).into_response()
 }
 
+/// Machine-readable tool manifest, so an agent can discover the surface
+/// instead of having it hard-coded.
+async fn tools_manifest(req: Request<Body>) -> Result<Response> {
+    owner_of(&req); // authenticated, like every other /v1 route
+    Ok(Json(crate::tools::manifest()).into_response())
+}
+
+async fn tools_call(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
+    let owner = owner_of(&req);
+    let body = read_json(req, state.cfg.max_body_bytes).await?;
+    let m = body
+        .as_object()
+        .ok_or_else(|| ScoutError::invalid("body must be an object"))?;
+    for k in m.keys() {
+        if !["name", "arguments"].contains(&k.as_str()) {
+            return Err(ScoutError::invalid(format!("Unknown field \"{k}\" in body")));
+        }
+    }
+    let name = m
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ScoutError::invalid("\"name\" is required"))?
+        .to_string();
+    let arguments = m.get("arguments").cloned().unwrap_or(json!({}));
+
+    // Deliberately not wrapped in `run_inline` here. The individual tools
+    // take their own admission slot for the work that needs one; wrapping
+    // again would try to acquire a second concurrency permit from inside the
+    // first and deadlock at concurrency 1.
+    // The token is never cancelled from here: the tools that run real work
+    // mint their own under the task manager, which owns cancellation and
+    // timeouts. This one only exists to satisfy the `evaluate` tool's signature.
+    let abort = Abort::new();
+    let out = state.scout.tools_call(&owner, &name, arguments, &abort).await;
+    Ok(Json(out?).into_response())
+}
+
 async fn create_session(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
     let owner = owner_of(&req);
     let body = read_json(req, state.cfg.max_body_bytes).await?;
@@ -538,6 +576,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/strategies", get(strategies))
+        .route("/v1/tools", get(tools_manifest))
+        .route("/v1/tools/call", post(tools_call))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/:id", delete(destroy_session))
         .route("/v1/navigate", post(navigate))

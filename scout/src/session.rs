@@ -66,6 +66,47 @@ impl CookieJar {
         }
     }
 
+    /// Every cookie in the jar, including HttpOnly ones that page scripts
+    /// cannot read. Inspecting session state is the point: which cookies a
+    /// target set, over what scope, and when they expire.
+    pub fn cookies(&self) -> Vec<serde_json::Value> {
+        let store = self.store.lock().unwrap();
+        store
+            .iter_any()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name(),
+                    "value": c.value(),
+                    "domain": c.domain(),
+                    "path": c.path(),
+                    "secure": c.secure().unwrap_or(false),
+                    "httpOnly": c.http_only().unwrap_or(false),
+                    "expires": c.expires().and_then(|e| e.datetime()).map(|d| {
+                        format!(
+                            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                            d.year(),
+                            u8::from(d.month()),
+                            d.day(),
+                            d.hour(),
+                            d.minute(),
+                            d.second()
+                        )
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// Seed the jar from a raw cookie value, so a session captured elsewhere
+    /// can be resumed without replaying a login.
+    pub fn set_cookie(&self, url: &str, value: &str) -> bool {
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        let mut store = self.store.lock().unwrap();
+        store.parse(value, &parsed).is_ok()
+    }
+
     pub fn clear(&self) {
         let mut store = self.store.lock().unwrap();
         *store = CookieStore::default();
