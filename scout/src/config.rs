@@ -22,6 +22,9 @@ pub struct Config {
     // Limits
     pub max_body_bytes: usize,
     pub max_response_bytes: usize,
+    /// Ceiling on a single uploaded file, decoded. JSON bodies carrying the
+    /// base64 are separately capped by `max_body_bytes`.
+    pub max_upload_bytes: usize,
     pub max_dom_nodes: usize,
     pub max_redirects: usize,
     pub max_extract_items: usize,
@@ -144,7 +147,8 @@ impl Config {
             allowed_domains: list(&env, "SCOUT_ALLOWED_DOMAINS"),
             allowed_ports: if allowed_ports.is_empty() { vec![80, 443] } else { allowed_ports },
 
-            max_body_bytes: num(&env, "SCOUT_MAX_BODY_BYTES", 64 * 1024)? as usize,
+            max_body_bytes: num(&env, "SCOUT_MAX_BODY_BYTES", 6 * 1024 * 1024)? as usize,
+            max_upload_bytes: num(&env, "SCOUT_MAX_UPLOAD_BYTES", 4 * 1024 * 1024)? as usize,
             max_response_bytes: num(&env, "SCOUT_MAX_RESPONSE_BYTES", 2 * MB)? as usize,
             max_dom_nodes: num(&env, "SCOUT_MAX_DOM_NODES", 150_000)? as usize,
             max_redirects: num(&env, "SCOUT_MAX_REDIRECTS", 5)? as usize,

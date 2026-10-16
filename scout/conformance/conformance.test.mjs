@@ -779,7 +779,6 @@ describe('engine: interaction', () => {
         [{ type: 'click', selector: '#js' }, 'unsupported_capability', 501],
         [{ type: 'fill', selector: 'input[type=file]', value: 'x' }, 'unsupported_capability', 501],
         [{ type: 'select', selector: 'select', value: 'green' }, 'element_not_found', 422],
-        [{ type: 'submit', selector: 'form[enctype] input' }, 'unsupported_capability', 501],
         // Beyond the Node list, same contract:
         [{ type: 'uncheck', selector: 'select' }, 'invalid_request', 400],
         [{ type: 'click', selector: 'input[name=q]', index: 9 }, 'element_not_found', 422],
@@ -789,6 +788,11 @@ describe('engine: interaction', () => {
         assert.equal(r.status, status, `${JSON.stringify(action)} → ${r.status} ${r.text.slice(0, 140)}`);
         assert.equal(r.json.error.code, code, `${JSON.stringify(action)} code was ${r.json.error.code}`);
       }
+      // The enctype form used to be refused; multipart submits now. Its file
+      // input has nothing staged, so it sends an empty file part, like a browser.
+      const mp = await act(id, { type: 'submit', selector: 'form[enctype] input' });
+      assert.equal(mp.status, 200, `multipart submit → ${mp.status} ${mp.text.slice(0, 140)}`);
+      assert.equal(mp.json.effect, 'navigate', `multipart submit effect was ${mp.json.effect}`);
     } finally {
       await client.destroySession(id);
     }

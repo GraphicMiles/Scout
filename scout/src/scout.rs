@@ -42,7 +42,6 @@ impl Scout {
         let resources = ResourceManager::new(cfg.clone());
         let sessions = Arc::new(SessionManager::new((*cfg).clone()));
         let tasks = Arc::new(TaskManager::new(cfg.clone(), metrics.clone(), resources.clone()));
-        let workers = Arc::new(WorkerPool::new(cfg.clone()));
 
         // Redirects are followed manually so every hop is validated; the client's
         // own redirect handling is therefore disabled.
@@ -56,6 +55,15 @@ impl Scout {
             .connect_timeout(Duration::from_millis(10_000))
             .build()
             .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("HTTP client: {e}")))?;
+
+        // The worker pool shares the client and the runtime handle: YouTube
+        // continuation fetches run from the worker side, where the page's
+        // JSON data lives.
+        let workers = Arc::new(WorkerPool::new(
+            cfg.clone(),
+            client.clone(),
+            tokio::runtime::Handle::try_current().ok(),
+        ));
 
         let scout = Arc::new(Self {
             cfg: cfg.clone(),
@@ -183,7 +191,7 @@ impl Scout {
             .workers
             .call(worker, |reply| Cmd::RunScripts {
                 session: session.id.clone(),
-                scripts: bodies,
+                scripts: bodies.clone(),
                 net,
                 reply,
             })
@@ -232,24 +240,27 @@ impl Scout {
         scripts: &[ScriptSource],
         timeout_ms: u64,
         abort: &Abort,
-    ) -> Vec<String> {
+    ) -> Vec<crate::js::Script> {
         let base = summary.get("url").and_then(|u| u.as_str()).unwrap_or("");
         let mut budget = self.cfg.js_max_script_bytes;
         let mut out = Vec::with_capacity(scripts.len());
 
         for script in scripts {
             match script {
-                ScriptSource::Inline(body) => out.push(body.clone()),
-                ScriptSource::External(src) => {
+                ScriptSource::Inline { body, module } => out.push(crate::js::Script {
+                    body: body.clone(),
+                    module: *module,
+                }),
+                ScriptSource::External { src, module } => {
                     let joined = match url::Url::parse(base).and_then(|b| b.join(src)) {
                         Ok(u) => u,
                         Err(_) => {
-                            out.push(String::new());
+                            out.push(crate::js::Script::classic(""));
                             continue;
                         }
                     };
                     if budget == 0 {
-                        out.push(String::new());
+                        out.push(crate::js::Script::classic(""));
                         continue;
                     }
                     let referer = session.referrer();
@@ -276,9 +287,12 @@ impl Scout {
                     match res {
                         Ok(f) if f.status < 400 => {
                             budget = budget.saturating_sub(f.bytes);
-                            out.push(f.body);
+                            out.push(crate::js::Script {
+                                body: f.body,
+                                module: *module,
+                            });
                         }
-                        _ => out.push(String::new()),
+                        _ => out.push(crate::js::Script::classic("")),
                     }
                 }
             }
@@ -309,7 +323,7 @@ impl Scout {
                 url: url.as_str(),
                 method: &nav.method,
                 headers,
-                body: nav.body.as_ref().map(|b| b.as_bytes().to_vec()),
+                body: nav.body.clone(),
                 jar: Some(&session.jar),
                 kind: FetchKind::Document,
                 referer: referer.as_deref(),

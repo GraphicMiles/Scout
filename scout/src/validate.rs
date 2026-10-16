@@ -72,7 +72,7 @@ pub struct NavigateReq {
     pub session_id: Option<String>,
     pub timeout_ms: Option<u64>,
     pub method: String,
-    pub body: Option<String>,
+    pub body: Option<Vec<u8>>,
     pub content_type: Option<String>,
 }
 

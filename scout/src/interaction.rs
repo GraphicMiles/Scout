@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 /// an unimplemented feature, so it is refused with `invalid_request`.
 const ACTION_TYPES: &[&str] = &[
     "click", "fill", "select", "check", "uncheck", "press", "submit", "scroll",
+    "upload",
 ];
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,8 @@ pub struct Action {
     /// The action's values: exactly one for `fill`, one or more for `select`.
     pub values: Vec<String>,
     pub key: Option<String>,
+    /// File contents for `upload`, base64 encoded.
+    pub content_base64: Option<String>,
     /// Which match to act on when the selector matches several elements.
     pub index: Option<u64>,
     /// Per-action navigation budget, clamped by the caller.
@@ -50,7 +53,7 @@ impl Action {
             .as_object()
             .ok_or_else(|| bad("action must be an object".into(), "action"))?;
         for k in o.keys() {
-            if !["type", "selector", "index", "value", "key", "timeoutMs"].contains(&k.as_str()) {
+            if !["type", "selector", "index", "value", "key", "contentBase64", "timeoutMs"].contains(&k.as_str()) {
                 return Err(bad(format!("Unknown field \"{k}\" in action"), k));
             }
         }
@@ -138,6 +141,17 @@ impl Action {
                     ))
                 }
             },
+            // The file's name; contents arrive separately as base64.
+            "upload" => match o.get("value") {
+                Some(Value::String(val)) if is_safe_filename(val) => vec![val.clone()],
+                _ => {
+                    return Err(bad(
+                        "\"value\" for upload must be a file name: 1 to 256 characters, no path separators"
+                            .into(),
+                        "value",
+                    ))
+                }
+            },
             _ => Vec::new(),
         };
         let index = match o.get("index") {
@@ -168,6 +182,21 @@ impl Action {
                 ))
             }
         };
+        let content_base64 = match o.get("contentBase64") {
+            None | Some(Value::Null) => None,
+            // A hard ceiling independent of config: the decoded size is
+            // checked again, against the configured cap, when the file is
+            // staged. 16 MB of base64 covers every sane `max_upload_bytes`.
+            Some(Value::String(s)) if !s.is_empty() && s.len() <= 16 * 1024 * 1024 => {
+                Some(s.clone())
+            }
+            Some(_) => {
+                return Err(bad(
+                    "\"contentBase64\" must be a non-empty base64 string up to 16MB".into(),
+                    "contentBase64",
+                ))
+            }
+        };
         let timeout_ms = match o.get("timeoutMs") {
             None | Some(Value::Null) => None,
             Some(Value::Number(n)) => match n.as_u64() {
@@ -191,10 +220,51 @@ impl Action {
             selector,
             values,
             key,
+            content_base64,
             index,
             timeout_ms,
         })
     }
+}
+
+/// A file name a browser would accept: not empty, not absurdly long, and not
+/// smuggling a path. Browsers keep only the final component anyway.
+fn is_safe_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 256
+        && !name.contains(['/', '\\', '\0'])
+        && name != "."
+        && name != ".."
+}
+
+/// Standard base64 decode, no padding required, whitespace ignored. Returns
+/// `None` on any character outside the alphabet instead of failing half way.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cleaned: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+    for chunk in cleaned.chunks(4) {
+        let n = chunk.iter().try_fold(0u32, |acc, &c| val(c).map(|v| (acc << 6) | v))?;
+        match chunk.len() {
+            4 => out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]),
+            3 => out.extend_from_slice(&[(n >> 10) as u8, (n >> 2) as u8]),
+            2 => out.push((n >> 4) as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// What the caller should do next, if anything.
@@ -206,7 +276,9 @@ pub enum Effect {
     Navigate {
         url: String,
         method: String,
-        body: Option<String>,
+        /// The request body as raw bytes: form posts are text, multipart
+        /// posts carry file bytes that are not valid UTF-8.
+        body: Option<Vec<u8>>,
         content_type: Option<String>,
         /// The caller's per-action budget for this navigation, if it gave one.
         timeout_ms: Option<u64>,
@@ -243,7 +315,7 @@ pub fn apply(page: &mut Page, action: &Action, cfg: &Config) -> Result<Effect> {
     if let Some((_, why)) = UNSUPPORTED_ACTIONS.iter().find(|(k, _)| *k == action.kind) {
         return Err(ScoutError::unsupported(*why).with_details(json!({ "action": action.kind })));
     }
-    const KNOWN: &[&str] = &["fill", "select", "check", "uncheck", "press", "submit", "click"];
+    const KNOWN: &[&str] = &["fill", "select", "check", "uncheck", "press", "submit", "click", "upload"];
     if !KNOWN.contains(&action.kind.as_str()) {
         return Err(ScoutError::unsupported(format!(
             "Interaction \"{}\" is not supported",
@@ -270,6 +342,7 @@ pub fn apply(page: &mut Page, action: &Action, cfg: &Config) -> Result<Effect> {
         "press" => press(page, action, selector_str),
         "submit" => submit_form(page, action, selector_str, cfg),
         "click" => click(page, action, selector_str, cfg),
+        "upload" => upload(page, action, selector_str, cfg),
         other => Err(ScoutError::unsupported(format!(
             "Interaction \"{other}\" is not supported"
         ))
@@ -304,7 +377,7 @@ fn reject_unfillable(el: &ElementRef, sel: &str) -> Result<()> {
     let ty = el.value().attr("type").unwrap_or("").to_ascii_lowercase();
     if ty == "file" {
         return Err(ScoutError::unsupported(
-            "File inputs cannot be filled; Scout does not support file upload",
+            "File inputs take the upload action, not fill",
         )
         .with_details(json!({ "selector": sel })));
     }
@@ -328,6 +401,52 @@ fn record_many(page: &mut Page, sel: &str, values: Vec<String>) {
 /// checked, touched and empty means explicitly unchecked.
 fn recorded_checked(v: &[String]) -> bool {
     matches!(v.first(), Some(s) if !s.is_empty())
+}
+
+fn upload(page: &mut Page, action: &Action, sel: &str, cfg: &Config) -> Result<Effect> {
+    let filename = action
+        .values
+        .first()
+        .cloned()
+        .ok_or_else(|| ScoutError::invalid("upload requires \"value\" (the file name)"))?;
+    let el = find(page, sel, action.index.unwrap_or(0))?;
+    let tag = el.value().name().to_string();
+    let ty = el.value().attr("type").unwrap_or("").to_ascii_lowercase();
+    if tag != "input" || ty != "file" {
+        return Err(ScoutError::unsupported(format!(
+            "Upload targets <input type=file>, not a <{tag} type={ty}> element"
+        ))
+        .with_details(json!({ "selector": sel, "tag": tag, "type": ty })));
+    }
+    // `is_safe_filename` ran at parse time; the value is unchanged since.
+    debug_assert!(is_safe_filename(&filename));
+
+    let b64 = action
+        .content_base64
+        .as_deref()
+        .ok_or_else(|| ScoutError::invalid("upload requires \"contentBase64\""))?;
+    // Reject before decoding, so an oversized payload never allocates.
+    let decoded_len = b64.len() / 4 * 3;
+    if decoded_len > cfg.max_upload_bytes {
+        return Err(ScoutError::invalid(format!(
+            "Upload is {} bytes; the limit is {}",
+            decoded_len, cfg.max_upload_bytes
+        ))
+        .with_details(json!({ "selector": sel, "limitBytes": cfg.max_upload_bytes })));
+    }
+    let bytes = base64_decode(b64).ok_or_else(|| {
+        ScoutError::invalid("\"contentBase64\" is not valid base64")
+            .with_details(json!({ "selector": sel }))
+    })?;
+
+    let size = bytes.len();
+    page.files.insert(
+        element_selector(&el),
+        crate::page::StoredFile { filename, bytes },
+    );
+    Ok(Effect::None {
+        detail: json!({ "uploaded": sel, "fileName": action.values[0].as_str(), "sizeBytes": size }),
+    })
 }
 
 fn fill(page: &mut Page, action: &Action, sel: &str) -> Result<Effect> {
@@ -574,15 +693,21 @@ fn build_submission(
         .attr("enctype")
         .unwrap_or("application/x-www-form-urlencoded")
         .to_ascii_lowercase();
-    if enctype.contains("multipart") {
+    if enctype == "text/plain" {
         return Err(
-            ScoutError::unsupported("Multipart form submission is not supported")
+            ScoutError::unsupported("text/plain form submission is not supported")
                 .with_details(json!({ "enctype": enctype })),
         );
     }
+    let method = form
+        .value()
+        .attr("method")
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
 
     let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut file_field: Option<String> = None;
+    // (field name, canonical selector) for every file input in the form.
+    let mut file_fields: Vec<(String, String)> = Vec::new();
 
     let field_sel = selector::compile("input[name], select[name], textarea[name], button[name]")?;
     for el in form.select(&field_sel).take(MAX_FIELDS) {
@@ -607,7 +732,7 @@ fn build_submission(
             continue;
         }
         if tag == "input" && ty == "file" {
-            file_field = Some(name);
+            file_fields.push((name, canonical));
             continue;
         }
         if tag == "input" && matches!(ty.as_str(), "checkbox" | "radio") {
@@ -693,18 +818,15 @@ fn build_submission(
         }
     }
 
-    if let Some(name) = file_field {
-        return Err(
-            ScoutError::unsupported("Form contains a file input; file upload is not supported")
-                .with_details(json!({ "field": name })),
-        );
-    }
+    // Files force multipart, exactly like a browser: setting a file on an
+    // input upgrades the submission even when the form forgot the enctype.
+    let staged: Vec<(&(String, String), Option<&crate::page::StoredFile>)> = file_fields
+        .iter()
+        .map(|ff| (ff, page.files.get(&ff.1)))
+        .collect();
+    let use_multipart =
+        method == "POST" && (enctype.contains("multipart") || staged.iter().any(|(_, f)| f.is_some()));
 
-    let method = form
-        .value()
-        .attr("method")
-        .unwrap_or("GET")
-        .to_ascii_uppercase();
     let action_attr = form.value().attr("action").unwrap_or("");
     let base = crate::extract::base_url_of(page);
     let action_url = if action_attr.trim().is_empty() {
@@ -716,6 +838,56 @@ fn build_submission(
         })?
     };
 
+    if use_multipart {
+        let boundary = multipart_boundary();
+        let mut body: Vec<u8> = Vec::new();
+        for (k, v) in &pairs {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("content-disposition: form-data; name=\"{k}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(v.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        for (field, staged_file) in &staged {
+            let (name, _) = field;
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            match staged_file {
+                Some(file) => {
+                    body.extend_from_slice(
+                        format!(
+                            "content-disposition: form-data; name=\"{name}\"; filename=\"{}\"\r\n",
+                            file.filename
+                        )
+                        .as_bytes(),
+                    );
+                    body.extend_from_slice(
+                        b"content-type: application/octet-stream\r\n\r\n",
+                    );
+                    body.extend_from_slice(&file.bytes);
+                }
+                // An unfilled file input still gets a part, with an empty
+                // name: that is what browsers send.
+                None => body.extend_from_slice(
+                    format!(
+                        "content-disposition: form-data; name=\"{name}\"; filename=\"\"\r\n\r\n"
+                    )
+                    .as_bytes(),
+                ),
+            }
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        return Ok(Effect::Navigate {
+            url: action_url,
+            method: "POST".into(),
+            body: Some(body),
+            content_type: Some(format!("multipart/form-data; boundary={boundary}")),
+            timeout_ms,
+        });
+    }
+
     let encoded = pairs
         .iter()
         .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
@@ -726,7 +898,7 @@ fn build_submission(
         Ok(Effect::Navigate {
             url: action_url,
             method: "POST".into(),
-            body: Some(encoded),
+            body: Some(encoded.into_bytes()),
             content_type: Some("application/x-www-form-urlencoded".into()),
             timeout_ms,
         })
@@ -747,6 +919,20 @@ fn build_submission(
         })
     }
 }
+
+/// A boundary that cannot appear in any part: random, like a browser's.
+fn multipart_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = nanos ^ (SEQ.fetch_add(1, Ordering::Relaxed) << 48);
+    format!("----scout{n:016x}")
+}
+
 
 /// A stable key for an element, used to look up recorded form values.
 /// Prefers `name`, then `id`, then a tag+index path.
@@ -937,7 +1123,7 @@ mod tests {
             Effect::Navigate { url, method, body, content_type, .. } => {
                 assert_eq!(method, "POST");
                 assert_eq!(url, "https://example.com/login");
-                let body = body.unwrap();
+                let body = String::from_utf8(body.unwrap()).unwrap();
                 assert!(body.contains("u=alice"));
                 assert!(body.contains("p=s3cr3t+xy"));
                 assert_eq!(content_type.as_deref(), Some("application/x-www-form-urlencoded"));
@@ -947,11 +1133,106 @@ mod tests {
     }
 
     #[test]
-    fn multipart_forms_are_refused() {
-        let mut p = page_with("<form action='/u' method='POST' enctype='multipart/form-data'><input name='a'></form>");
+    fn multipart_forms_submit_as_multipart_with_empty_file_parts() {
+        let mut p = page_with(
+            "<form action='/u' method='POST' enctype='multipart/form-data'>\
+             <input name='a' value='hello'><input type='file' name='f'></form>",
+        );
+        let fill = Action::from_json(&json!({ "type": "fill", "selector": "input[name=a]", "value": "hello" })).unwrap();
+        apply(&mut p, &fill, &cfg()).unwrap();
         let submit = Action::from_json(&json!({ "type": "submit", "selector": "form" })).unwrap();
-        let err = apply(&mut p, &submit, &cfg()).unwrap_err();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { url, method, body, content_type, .. } => {
+                assert_eq!(method, "POST");
+                assert_eq!(url, "https://example.com/u");
+                let ct = content_type.unwrap();
+                assert!(ct.starts_with("multipart/form-data; boundary="), "ct was {ct}");
+                let boundary = ct.split("boundary=").nth(1).unwrap();
+                let body = String::from_utf8(body.unwrap()).unwrap();
+                // Regular field as a part.
+                assert!(
+                    body.contains(&format!("content-disposition: form-data; name=\"a\"\r\n\r\nhello\r\n")),
+                    "body was {body}"
+                );
+                // An unfilled file input still sends its part, empty, like a browser.
+                assert!(
+                    body.contains("content-disposition: form-data; name=\"f\"; filename=\"\"\r\n\r\n\r\n"),
+                    "body was {body}"
+                );
+                assert!(body.ends_with(&format!("--{boundary}--\r\n")));
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staged_files_submit_as_multipart_even_without_enctype() {
+        let mut p = page_with(
+            "<form action='/u' method='POST'><input name='a'><input type='file' name='f'></form>",
+        );
+        let upload = Action::from_json(&json!({
+            "type": "upload", "selector": "input[name=f]",
+            "value": "report.bin", "contentBase64": "AP8Q"
+        }))
+        .unwrap();
+        match apply(&mut p, &upload, &cfg()).unwrap() {
+            Effect::None { detail } => {
+                assert_eq!(detail["sizeBytes"], 3);
+                assert_eq!(detail["fileName"], "report.bin");
+            }
+            other => panic!("expected none, got {other:?}"),
+        }
+        let submit = Action::from_json(&json!({ "type": "submit", "selector": "form" })).unwrap();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { body, content_type, .. } => {
+                let ct = content_type.unwrap();
+                assert!(ct.starts_with("multipart/form-data; boundary="), "ct was {ct}");
+                let body = body.unwrap();
+                let text = String::from_utf8_lossy(&body);
+                assert!(
+                    text.contains("content-disposition: form-data; name=\"f\"; filename=\"report.bin\"\r\n"),
+                    "body was {text}"
+                );
+                assert!(text.contains("content-type: application/octet-stream\r\n\r\n"));
+                // The exact staged bytes, including non-UTF-8 ones.
+                let needle = b"content-type: application/octet-stream\r\n\r\n";
+                let at = body
+                    .windows(needle.len())
+                    .position(|w| w == needle)
+                    .expect("file part header");
+                assert_eq!(&body[at + needle.len()..at + needle.len() + 3], &[0x00, 0xFF, 0x10]);
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_refuses_non_file_inputs_and_bad_base64() {
+        let mut p = page_with("<form><input name='a'></form>");
+        let wrong = Action::from_json(&json!({
+            "type": "upload", "selector": "input[name=a]",
+            "value": "x.txt", "contentBase64": "aGk="
+        }))
+        .unwrap();
+        let err = apply(&mut p, &wrong, &cfg()).unwrap_err();
         assert_eq!(err.code, ErrorCode::UnsupportedCapability);
+
+        let mut p = page_with("<form><input type='file' name='f'></form>");
+        let bad = Action::from_json(&json!({
+            "type": "upload", "selector": "input[name=f]",
+            "value": "x.txt", "contentBase64": "not base64 !!"
+        }))
+        .unwrap();
+        let err = apply(&mut p, &bad, &cfg()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+
+        let mut p = page_with("<form><input type='file' name='f'></form>");
+        let err = Action::from_json(&json!({
+            "type": "upload", "selector": "input[name=f]",
+            "value": "../etc/passwd", "contentBase64": "aGk="
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -1003,7 +1284,7 @@ mod tests {
         let click = Action::from_json(&json!({ "type": "click", "selector": "button[name=go]" })).unwrap();
         match apply(&mut p, &click, &cfg()).unwrap() {
             Effect::Navigate { body, .. } => {
-                let body = body.unwrap();
+                let body = String::from_utf8(body.unwrap()).unwrap();
                 assert!(body.contains("go=1"), "the clicked button submits: {body}");
                 assert!(!body.contains("other"), "an unactivated button must not: {body}");
             }
@@ -1023,7 +1304,7 @@ mod tests {
         let submit = Action::from_json(&json!({ "type": "click", "selector": "button[name=go]" })).unwrap();
         match apply(&mut p, &submit, &cfg()).unwrap() {
             Effect::Navigate { body, .. } => {
-                let body = body.unwrap();
+                let body = String::from_utf8(body.unwrap()).unwrap();
                 assert!(body.contains("agree=yes"), "checked box submits its value: {body}");
             }
             other => panic!("expected navigate, got {other:?}"),

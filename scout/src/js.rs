@@ -852,6 +852,35 @@ const DOM_SHIM: &str = r##"
   })();
   globalThis.window = globalThis;
   globalThis.self = globalThis;
+  // Web Storage, backed by the host: __scout_storage is {local: {...}, session: {...}}
+  // seeded from the page's persisted state before scripts run, and read back
+  // after, so values survive navigation within the session.
+  function storageFor(map) {
+    return {
+      getItem: function (k) {
+        k = String(k);
+        return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null;
+      },
+      setItem: function (k, v) { map[String(k)] = String(v); },
+      removeItem: function (k) { delete map[String(k)]; },
+      clear: function () { for (var k in map) { if (Object.prototype.hasOwnProperty.call(map, k)) delete map[k]; } },
+      key: function (i) { var ks = Object.keys(map); return (i >= 0 && i < ks.length) ? ks[i] : null; },
+      get length() { return Object.keys(map).length; }
+    };
+  }
+  (function () {
+    var st = globalThis.__scout_storage;
+    if (!st || typeof st !== 'object') st = globalThis.__scout_storage = {};
+    if (!st.local || typeof st.local !== 'object') st.local = {};
+    if (!st.session || typeof st.session !== 'object') st.session = {};
+    try {
+      Object.defineProperty(globalThis, 'localStorage', { get: function () { return storageFor(st.local); }, configurable: true });
+      Object.defineProperty(globalThis, 'sessionStorage', { get: function () { return storageFor(st.session); }, configurable: true });
+    } catch (e) {
+      globalThis.localStorage = storageFor(st.local);
+      globalThis.sessionStorage = storageFor(st.session);
+    }
+  })();
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
   globalThis.KeyboardEvent = KeyboardEvent;
@@ -1541,6 +1570,8 @@ pub struct JsOutcome {
     pub timed_out: bool,
     /// Why a `None` value is `None`. Empty unless something is worth reporting.
     pub warnings: Vec<Value>,
+    /// Web Storage after the script ran: `{local: {...}, session: {...}}`.
+    pub storage: Option<Value>,
 }
 
 /// Heuristic: does the script contain an explicit `return`?
@@ -1569,6 +1600,7 @@ pub fn run(
     snapshot: &Value,
     base_url: &str,
     user_agent: &str,
+    storage: &Value,
     net: Option<NetFn>,
     timeout: Duration,
     max_memory: usize,
@@ -1596,16 +1628,17 @@ pub fn run(
     let ctx = Context::full(&rt).map_err(|e| js_err(format!("could not create JS context: {e}")))?;
 
     let prelude = format!(
-        "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\n",
+        "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_storage = {};\n",
         snapshot,
         serde_json::to_string(base_url).unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(user_agent).unwrap_or_else(|_| "\"\"".into()),
+        storage,
     );
 
     let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let logs_in = logs.clone();
 
-    let result = ctx.with(|ctx| -> Result<Option<Value>> {
+    let result = ctx.with(|ctx| -> Result<(Option<Value>, Option<Value>)> {
         // console capture
         let console = rquickjs::Object::new(ctx.clone()).map_err(|e| js_err(format!("{e}")))?;
         for level in ["log", "info", "warn", "error", "debug"] {
@@ -1664,8 +1697,16 @@ pub fn run(
             None if v.is_undefined() || v.is_null() => None,
             None => Some(render_js_value(&v)),
         };
-        Ok(value)
+
+        // Read Web Storage back: scripts mutate __scout_storage in place, and
+        // the state must outlive this context.
+        let storage = ctx
+            .eval::<String, _>("JSON.stringify(globalThis.__scout_storage || {})")
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        Ok((value, storage))
     })?;
+    let (result, storage) = result;
 
     let duration_ms = started.elapsed().as_millis() as u64;
     let logs = logs.borrow().clone();
@@ -1689,6 +1730,7 @@ pub fn run(
         duration_ms,
         timed_out,
         warnings,
+        storage,
     })
 }
 
@@ -1711,6 +1753,8 @@ pub struct PageRunOutcome {
     /// Per-script failures. A broken analytics script must not fail the page,
     /// so these are reported rather than returned as an error.
     pub errors: Vec<String>,
+    /// Web Storage after the scripts ran: `{local: {...}, session: {...}}`.
+    pub storage: Option<Value>,
 }
 
 /// Run a page's scripts, in document order, inside a single context.
@@ -1724,11 +1768,126 @@ pub struct PageRunOutcome {
 /// tracker threw would make the runtime useless on the open web. Individual
 /// failures are collected in `errors`; only a timeout or an engine failure
 /// returns `Err`.
+/// One page script, with its execution mode. Classic scripts share the global
+/// scope, exactly like a browser; module scripts get their own scope and may
+/// use `import`/`export`.
+#[derive(Debug, Clone)]
+pub struct Script {
+    pub body: String,
+    pub module: bool,
+}
+
+impl Script {
+    pub fn classic(body: impl Into<String>) -> Self {
+        Self { body: body.into(), module: false }
+    }
+
+    pub fn module(body: impl Into<String>) -> Self {
+        Self { body: body.into(), module: true }
+    }
+}
+
+/// Resolve a module specifier the way a browser would, against the page:
+/// absolute http(s) URLs pass through, relative paths resolve against the
+/// importing module (or the page, for inline modules), and bare specifiers
+/// ("react") have no package registry to resolve against, so they fail.
+fn resolve_module_name(page_base: &str, importer: &str, spec: &str) -> Option<String> {
+    if let Ok(u) = url::Url::parse(spec) {
+        if matches!(u.scheme(), "http" | "https") {
+            return Some(spec.to_string());
+        }
+        return None;
+    }
+    if spec.starts_with("./") || spec.starts_with("../") {
+        let against = if importer.starts_with("http://") || importer.starts_with("https://") {
+            importer
+        } else {
+            page_base
+        };
+        return url::Url::parse(against)
+            .ok()?
+            .join(spec)
+            .ok()
+            .map(|u| u.to_string());
+    }
+    // Root-relative: resolved against the page's origin, like a browser.
+    if spec.starts_with('/') && !spec.starts_with("//") {
+        return url::Url::parse(page_base)
+            .ok()?
+            .join(spec)
+            .ok()
+            .map(|u| u.to_string());
+    }
+    None
+}
+
+/// The module resolver QuickJS consults for every `import`.
+struct PageResolver {
+    page_base: String,
+}
+
+impl rquickjs::loader::Resolver for PageResolver {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &rquickjs::Ctx<'js>,
+        base: &str,
+        name: &str,
+    ) -> rquickjs::Result<String> {
+        match resolve_module_name(&self.page_base, base, name) {
+            Some(canonical) => Ok(canonical),
+            None => Err(rquickjs::Error::Unknown),
+        }
+    }
+}
+
+/// The module loader: fetch import targets over the page's network function,
+/// synchronously, the way a browser blocks on `<script type="module">`.
+struct PageLoader {
+    net: Option<NetFn>,
+    page_base: String,
+    /// Bytes already fetched for imports this run. Bounded so a page that
+    /// imports in a loop cannot pull unbounded data.
+    budget: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl rquickjs::loader::Loader for PageLoader {
+    fn load<'js>(
+        &mut self,
+        ctx: &rquickjs::Ctx<'js>,
+        name: &str,
+    ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>> {
+        let Some(net) = self.net.clone() else {
+            return Err(rquickjs::Error::Unknown);
+        };
+        let max = self.budget.get();
+        if max == 0 {
+            return Err(rquickjs::Error::Unknown);
+        }
+        let resp = net(NetRequest {
+            method: "GET".into(),
+            url: name.to_string(),
+            headers: Vec::new(),
+            body: None,
+        })
+        .map_err(|_| rquickjs::Error::Unknown)?;
+        if resp.status >= 400 {
+            return Err(rquickjs::Error::Unknown);
+        }
+        let len = resp.body.len();
+        if len > max {
+            return Err(rquickjs::Error::Unknown);
+        }
+        self.budget.set(max - len);
+        rquickjs::Module::declare(ctx.clone(), name.to_string(), resp.body)
+    }
+}
+
 pub fn run_page(
-    scripts: &[String],
+    scripts: &[Script],
     snapshot: &Value,
     base_url: &str,
     user_agent: &str,
+    storage: &Value,
     net: Option<NetFn>,
     timeout: Duration,
     max_memory: usize,
@@ -1755,6 +1914,21 @@ pub fn run_page(
     })));
 
     let ctx = Context::full(&rt).map_err(|e| js_err(format!("could not create JS context: {e}")))?;
+
+    // Modules need a resolver and loader before any of them runs. The budget
+    // caps total import bytes for one page.
+    let import_budget = std::rc::Rc::new(std::cell::Cell::new(1024 * 1024));
+    if scripts.iter().any(|s| s.module) {
+        rt.set_loader(
+            PageResolver { page_base: base_url.to_string() },
+            PageLoader {
+                net: net.clone(),
+                page_base: base_url.to_string(),
+                budget: import_budget.clone(),
+            },
+        );
+    }
+
     let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
@@ -1768,14 +1942,15 @@ pub fn run_page(
     let jobs: std::rc::Rc<std::cell::Cell<u32>> = std::rc::Rc::new(std::cell::Cell::new(0));
     let mut jobs_left = job_budget;
 
-    let outcome = ctx.with(|ctx| -> Result<Option<String>> {
+    let outcome = ctx.with(|ctx| -> Result<(Option<String>, Option<Value>)> {
         wire_console(&ctx, &logs)?;
 
         let prelude = format!(
-            "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\n",
+            "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_storage = {};\n",
             snapshot,
             serde_json::to_string(base_url).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(user_agent).unwrap_or_else(|_| "\"\"".into()),
+            storage,
         );
         ctx.eval::<(), _>(prelude.as_str())
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
@@ -1785,20 +1960,38 @@ pub fn run_page(
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         wire_net(&ctx, net)?;
 
-        for script in scripts {
+        for (i, script) in scripts.iter().enumerate() {
             if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
-            // Deliberately NOT wrapped in a function. Classic scripts share a
-            // global scope: a `var` declared by one <script> must be visible to
-            // the next. (The /v1/eval endpoint does wrap, so `return` works
-            // there; page scripts have no top-level return to support.)
-            match ctx.eval::<rquickjs::Value, _>(script.as_str()) {
+            // Classic scripts are deliberately NOT wrapped in a function: they
+            // share a global scope, so a `var` declared by one <script> is
+            // visible to the next. (The /v1/eval endpoint does wrap, so
+            // `return` works there; page scripts have no top-level return.)
+            // Module scripts get their own scope and real `import`/`export`.
+            let outcome = if script.module {
+                let name = format!("scout-inline-{i}");
+                rquickjs::Module::declare(ctx.clone(), name, script.body.as_str())
+                    .and_then(|m| {
+                        m.eval().map(|(m, _promise)| {
+                            // A pending promise means top-level await: its
+                            // continuations are already queued as jobs and are
+                            // drained right after, like any other promise.
+                            let _ = &m;
+                            rquickjs::Value::new_undefined(ctx.clone())
+                        })
+                    })
+                    .map_err(|e| classify(&e, &timed_out))
+            } else {
+                ctx.eval::<rquickjs::Value, _>(script.body.as_str())
+                    .map_err(|e| classify(&e, &timed_out))
+            };
+            match outcome {
                 Ok(_) => scripts_run += 1,
                 Err(e) => {
                     scripts_failed += 1;
                     if errors.len() < 20 {
-                        errors.push(classify(&e, &timed_out));
+                        errors.push(e);
                     }
                 }
             }
@@ -1845,10 +2038,16 @@ pub fn run_page(
                 .into()
         };
 
-        Ok(html)
+        // Web Storage survives the context: read the mutated state back.
+        let storage = ctx
+            .eval::<String, _>("JSON.stringify(globalThis.__scout_storage || {})")
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+        Ok((html, storage))
     });
 
-    let html = outcome?;
+    let (html, storage) = outcome?;
     let duration_ms = started.elapsed().as_millis() as u64;
     let logs = logs.borrow().clone();
     let (timers_run, timers_pending) = timer_counts.get();
@@ -1864,6 +2063,7 @@ pub fn run_page(
         duration_ms,
         timed_out: timed_out.load(std::sync::atomic::Ordering::SeqCst),
         errors,
+        storage,
     })
 }
 
@@ -1982,7 +2182,29 @@ mod tests {
     }
 
     fn run_page_net_on(html: &str, scripts: &[&str], net: Option<NetFn>) -> Result<PageRunOutcome> {
-        run_page_budget_on(html, scripts, net, 64, 500)
+        run_page_storage_on(html, scripts, &json!({ "local": {}, "session": {} }), net)
+    }
+
+    fn run_page_storage_on(
+        html: &str,
+        scripts: &[&str],
+        storage: &Value,
+        net: Option<NetFn>,
+    ) -> Result<PageRunOutcome> {
+        let d = doc(html);
+        let snap = dom_snapshot(&d);
+        run_page(
+            &scripts.iter().map(|s| Script::classic(s.to_string())).collect::<Vec<_>>(),
+            &snap,
+            "https://example.com/",
+            "Scout/0.1",
+            storage,
+            net,
+            Duration::from_millis(2_000),
+            64 * 1024 * 1024,
+            64,
+            500,
+        )
     }
 
     fn run_page_budget_on(
@@ -1992,19 +2214,50 @@ mod tests {
         timer_budget: u32,
         job_budget: u32,
     ) -> Result<PageRunOutcome> {
+        run_page_storage_on(html, scripts, &json!({ "local": {}, "session": {} }), net)
+    }
+
+    fn run_page_scripts_on(
+        html: &str,
+        scripts: Vec<Script>,
+        net: Option<NetFn>,
+    ) -> Result<PageRunOutcome> {
         let d = doc(html);
         let snap = dom_snapshot(&d);
         run_page(
-            &scripts.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &scripts,
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            &json!({ "local": {}, "session": {} }),
             net,
             Duration::from_millis(2_000),
             64 * 1024 * 1024,
-            timer_budget,
-            job_budget,
+            64,
+            500,
         )
+    }
+
+    /// A net that serves different bodies per URL path.
+    fn net_by_path(map: Vec<(&'static str, &'static str)>) -> NetFn {
+        std::sync::Arc::new(move |req: NetRequest| {
+            for (suffix, body) in &map {
+                if req.url.ends_with(suffix) {
+                    return Ok(NetResponse {
+                        status: 200,
+                        status_text: "OK".into(),
+                        url: req.url.clone(),
+                        headers: vec![(
+                            "content-type".into(),
+                            "text/javascript".into(),
+                        )],
+                        body: body.to_string(),
+                        body_b64: None,
+                    });
+                }
+            }
+            Err(format!("no fixture for {}", req.url))
+        })
     }
 
     /// A host network that answers with binary content as base64.
@@ -2363,6 +2616,15 @@ mod tests {
     }
 
     fn run_net_on(html: &str, script: &str, net: Option<NetFn>) -> Result<JsOutcome> {
+        run_storage_on(html, script, &json!({ "local": {}, "session": {} }), net)
+    }
+
+    fn run_storage_on(
+        html: &str,
+        script: &str,
+        storage: &Value,
+        net: Option<NetFn>,
+    ) -> Result<JsOutcome> {
         let d = doc(html);
         let snap = dom_snapshot(&d);
         run(
@@ -2370,6 +2632,7 @@ mod tests {
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            storage,
             net,
             Duration::from_millis(2_000),
             64 * 1024 * 1024,
@@ -2485,6 +2748,117 @@ mod tests {
             out.value,
             Some(json!([["keydown", "a", "KeyA", 65], ["keydown", "Enter", "Enter", 13]]))
         );
+    }
+
+    #[test]
+    fn module_scripts_import_relative_urls_over_the_network() {
+        let net = net_by_path(vec![(
+            "/mod.js",
+            "export function greet(n) { return 'hello ' + n; }\nexport const extra = '!';",
+        )]);
+        let out = run_page_scripts_on(
+            "<div id=\"out\">empty</div>",
+            vec![Script::module(
+                "import { greet, extra } from './mod.js';\n                 document.getElementById('out').textContent = greet('Scout') + extra;"
+            )],
+            Some(net),
+        )
+        .unwrap();
+        assert_eq!(out.scripts_run, 1, "errors: {:?}", out.errors);
+        let html = out.html.unwrap_or_default();
+        assert!(
+            html.contains("hello Scout!"),
+            "the imported function must have run: {html}"
+        );
+    }
+
+    #[test]
+    fn chained_module_imports_resolve_against_the_importing_module() {
+        let net = net_by_path(vec![
+            ("/js/main.js", "import { v } from '../lib/dep.js'; window.__dep = v;"),
+            ("/lib/dep.js", "export const v = 'dep-ok';"),
+        ]);
+        let out = run_page_scripts_on(
+            "<p id=\"out\"></p>",
+            vec![Script::module(
+                "import '/js/main.js'; document.getElementById('out').textContent = window.__dep;"
+            )],
+            Some(net),
+        )
+        .unwrap();
+        assert_eq!(out.scripts_run, 1, "errors: {:?}", out.errors);
+        assert!(out.html.unwrap_or_default().contains("dep-ok"));
+    }
+
+    #[test]
+    fn bare_imports_fail_honestly_without_killing_the_page() {
+        let out = run_page_scripts_on(
+            "<div id=\"out\">empty</div>",
+            vec![
+                Script::module("import React from 'react';"), // no registry: must fail
+                Script::classic(
+                    "document.getElementById('out').textContent = 'still running';",
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.scripts_failed, 1, "the module must fail: {:?}", out.errors);
+        assert_eq!(out.scripts_run, 1);
+        assert!(
+            out.html.unwrap_or_default().contains("still running"),
+            "later scripts must survive a failed import"
+        );
+        assert!(
+            !out.errors.is_empty(),
+            "the import failure must be reported, not swallowed"
+        );
+    }
+
+    #[test]
+    fn module_scope_does_not_leak_into_classic_scripts() {
+        let out = run_page_scripts_on(
+            "<div id=\"out\"></div>",
+            vec![
+                Script::module("export const secret = 1; window.__m = 'ran';"),
+                Script::classic(
+                    "document.getElementById('out').textContent =\n                     (typeof secret) + '/' + window.__m;",
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.scripts_failed, 0, "{:?}", out.errors);
+        let html = out.html.unwrap_or_default();
+        // `secret` is module-scoped; the module's side effect on window is shared.
+        assert!(html.contains("undefined/ran"), "leak check: {html}");
+    }
+
+    #[test]
+    fn web_storage_reads_writes_and_round_trips_to_the_host() {
+        let seed = json!({ "local": { "token": "abc" }, "session": {} });
+        let out = run_storage_on(
+            "<p>x</p>",
+            concat!(
+                "var seen = localStorage.getItem('token');",
+                "localStorage.setItem('visits', '2');",
+                "localStorage.removeItem('token');",
+                "sessionStorage.setItem('tab', 'open');",
+                "return [seen, localStorage.getItem('token'), localStorage.length, sessionStorage.getItem('tab')];"
+            ),
+            &seed,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.value,
+            Some(json!(["abc", null, 1, "open"])),
+            "storage API must behave like a browser's: {:?}",
+            out.value
+        );
+        let st = out.storage.expect("storage round-trips");
+        assert_eq!(st["local"], json!({ "visits": "2" }), "writes and removes persist: {st}");
+        assert_eq!(st["session"], json!({ "tab": "open" }), "session storage is separate: {st}");
     }
 
     #[test]
@@ -2607,6 +2981,7 @@ mod tests {
             &snap,
             "https://example.com/",
             "Scout/0.1",
+            &json!({ "local": {}, "session": {} }),
             None,
             Duration::from_millis(5_000),
             8 * 1024 * 1024,

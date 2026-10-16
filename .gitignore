@@ -1,6 +1,7 @@
-# Build output and dependency caches — never committed.
+# Build output and dependency caches. Never committed.
 target/
 node_modules/
+bin/
 __pycache__/
 .cargo/
 *.log
