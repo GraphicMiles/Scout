@@ -96,9 +96,10 @@ pub fn manifest() -> Value {
         }), &["sessionId", "action"]),
         tool("click", "Click an element matched by selector.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "index": { "type": "integer", "minimum": 0 } }), &["sessionId", "selector"]),
         tool("fill", "Type a value into an input, textarea or select.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "value": { "type": "string" } }), &["sessionId", "selector", "value"]),
-        tool("select", "Choose an option in a <select>.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "value": { "type": "string" } }), &["sessionId", "selector", "value"]),
+        tool("select", "Choose an option in a <select>. A <select multiple> accepts an array of values.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "value": { "type": ["string", "array"], "items": { "type": "string" } } }), &["sessionId", "selector", "value"]),
         tool("check", "Check or uncheck a checkbox or radio.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "checked": { "type": "boolean" } }), &["sessionId", "selector"]),
-        tool("press", "Press a key on an element. Only Enter is implemented; anything else is refused by name.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "key": { "type": "string" } }), &["sessionId", "selector"]),
+        tool("press", "Press a key on an element. Enter submits the element's form; any other key is dispatched to the page's scripts as keydown/keypress/keyup events.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "key": { "type": "string" } }), &["sessionId", "selector", "key"]),
+        tool("scroll", "Scroll the page. Fires scroll events into the page's scripts, so lazy-loading pages fetch and render more content. Runs the page's scripts again first; scripts that append unconditionally on load may duplicate content.", json!({ "sessionId": sid(), "value": { "type": "integer", "minimum": 0, "description": "Pixels to scroll to; default 800" } }), &["sessionId"]),
         tool("submit", "Submit the form containing the matched element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId", "selector"]),
         tool("evaluate", "Run JavaScript in the page and return a value. Scripts run as a function body, so use an explicit `return`.", json!({ "sessionId": sid(), "script": { "type": "string" } }), &["sessionId", "script"]),
         tool("page.text", "Visible text of the page or of one element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId"]),
@@ -288,9 +289,24 @@ pub async fn call(
             run_interact(scout, owner, ir).await?
         }
         "select" => {
+            // A plain string or an array of strings: a <select multiple> takes
+            // several values at once.
+            let value = match obj.get("value") {
+                Some(Value::Array(items)) => {
+                    let list: Vec<String> = items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if list.len() != items.len() {
+                        return Err(ScoutError::invalid("\"value\" array items must be strings"));
+                    }
+                    json!(list)
+                }
+                _ => json!(str_arg("value")?),
+            };
             let ir = interact(
                 &str_arg("sessionId")?,
-                json!({ "type": "select", "selector": str_arg("selector")?, "value": str_arg("value")? }),
+                json!({ "type": "select", "selector": str_arg("selector")?, "value": value }),
             )?;
             run_interact(scout, owner, ir).await?
         }
@@ -312,6 +328,15 @@ pub async fn call(
         }
         "submit" => {
             let ir = interact(&str_arg("sessionId")?, json!({ "type": "submit", "selector": str_arg("selector")? }))?;
+            run_interact(scout, owner, ir).await?
+        }
+
+        "scroll" => {
+            let mut action = json!({ "type": "scroll" });
+            if let Some(v) = obj.get("value") {
+                action["value"] = v.clone();
+            }
+            let ir = interact(&str_arg("sessionId")?, action)?;
             run_interact(scout, owner, ir).await?
         }
 

@@ -74,6 +74,19 @@ pub enum Cmd {
         net: Option<js::NetFn>,
         reply: oneshot::Sender<Result<Value>>,
     },
+    /// Re-run the page's own scripts, then dispatch an event into the page:
+    /// what a scroll action or a key press does. Listeners die with the
+    /// context that registered them, so the scripts run again first.
+    FireEvent {
+        session: String,
+        /// "scroll" or "press".
+        kind: String,
+        key: Option<String>,
+        selector: Option<String>,
+        scroll_px: u64,
+        net: Option<js::NetFn>,
+        reply: oneshot::Sender<Result<Value>>,
+    },
     Extract {
         session: String,
         spec: StrategySpec,
@@ -118,7 +131,10 @@ impl WorkerState {
                 let _ = reply.send(self.load(&session, *fetched));
             }
             Cmd::RunScripts { session, scripts, net, reply } => {
-                let _ = reply.send(self.run_scripts(&session, scripts, net));
+                let _ = reply.send(self.run_scripts(&session, scripts, net, true));
+            }
+            Cmd::FireEvent { session, kind, key, selector, scroll_px, net, reply } => {
+                let _ = reply.send(self.fire_event(&session, &kind, key, selector, scroll_px, net));
             }
             Cmd::Extract { session, spec, limit, reply } => {
                 let _ = reply.send(self.extract(&session, &spec, limit));
@@ -264,6 +280,7 @@ impl WorkerState {
         session: &str,
         scripts: Vec<String>,
         net: Option<js::NetFn>,
+        save: bool,
     ) -> Result<Value> {
         let page = self
             .pages
@@ -296,6 +313,13 @@ impl WorkerState {
                 page.warnings = warnings;
             }
         }
+        // Keep the page's own scripts for later event passes (scroll, key
+        // press): those re-run them so their listeners exist again. Only the
+        // navigation pass saves; an event pass must not append its dispatch
+        // script to what gets re-run next time.
+        if save {
+            page.scripts = scripts;
+        }
 
         let mut summary = json!({
             "scriptsRun": out.scripts_run,
@@ -311,6 +335,93 @@ impl WorkerState {
         }
         if !out.logs.is_empty() {
             summary["logs"] = json!(out.logs);
+        }
+        Ok(summary)
+    }
+
+    /// Re-run the page's scripts, then dispatch an event into the page.
+    ///
+    /// This is what makes `scroll` and `press` real: the page's scripts run
+    /// again (registering their listeners in the fresh context), the event is
+    /// dispatched, and pending jobs and timers drain, so a lazy-loading scroll
+    /// handler actually fetches and appends before the DOM is rebuilt.
+    ///
+    /// Honest limits, reported rather than hidden: re-running a page's initial
+    /// scripts against an already-mutated DOM can duplicate content they append
+    /// unconditionally; scripts that overwrite (innerHTML = ...) are unaffected.
+    fn fire_event(
+        &mut self,
+        session: &str,
+        kind: &str,
+        key: Option<String>,
+        selector: Option<String>,
+        scroll_px: u64,
+        net: Option<js::NetFn>,
+    ) -> Result<Value> {
+        let (mut scripts, has_doc) = {
+            let page = self
+                .pages
+                .get(session)
+                .ok_or_else(|| ScoutError::new(ErrorCode::NotFound, "Unknown session"))?;
+            (page.scripts.clone(), page.doc.is_some())
+        };
+        if !has_doc {
+            return Err(ScoutError::new(
+                ErrorCode::CompatibilityError,
+                "Event dispatch needs an HTML page",
+            ));
+        }
+
+        let extra = match kind {
+            "scroll" => format!(
+                "window.scrollTo(0, {px});\
+                 try {{ document.dispatchEvent(new Event('scroll')); }} catch (e) {{}}",
+                px = scroll_px
+            ),
+            "press" => {
+                let Some(press_key) = key.clone().filter(|k| !k.is_empty()) else {
+                    return Err(ScoutError::invalid("press needs \"key\""));
+                };
+                let sel = selector
+                    .as_deref()
+                    .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+                    .unwrap_or_else(|| "null".into());
+                format!(
+                    "(function () {{
+                       var el = {sel} ? document.querySelector({sel}) : (document.activeElement || document.body);
+                       if (!el) return;
+                       var key = {key};
+                       var named = {{ 'enter': 'Enter', 'tab': 'Tab', 'escape': 'Escape', 'backspace': 'Backspace',
+                                      'delete': 'Delete', 'space': 'Space', 'arrowup': 'ArrowUp', 'arrowdown': 'ArrowDown',
+                                      'arrowleft': 'ArrowLeft', 'arrowright': 'ArrowRight', 'home': 'Home', 'end': 'End',
+                                      'pageup': 'PageUp', 'pagedown': 'PageDown' }};
+                       var code = key.length === 1
+                         ? (/[a-z]/i.test(key) ? 'Key' + key.toUpperCase() : (/^[0-9]$/.test(key) ? 'Digit' + key : key))
+                         : (named[key.toLowerCase()] || key);
+                       var keyCode = key === 'Enter' ? 13 : (key.length === 1 ? (key.charCodeAt(0) || 0) : 0);
+                       ['keydown', 'keypress', 'keyup'].forEach(function (t) {{
+                         try {{
+                           el.dispatchEvent(new KeyboardEvent(t, {{
+                             key: key, code: code, bubbles: true, cancelable: true, keyCode: keyCode
+                           }}));
+                         }} catch (e) {{}}
+                       }});
+                     }})();",
+                    sel = sel,
+                    key = serde_json::to_string(&press_key).unwrap_or_else(|_| "\"\"".into()),
+                )
+            }
+            other => {
+                return Err(ScoutError::invalid(format!(
+                    "Event kind \"{other}\" is not dispatchable"
+                )))
+            }
+        };
+
+        scripts.push(extra);
+        let mut summary = self.run_scripts(session, scripts, net, false)?;
+        if let Some(obj) = summary.as_object_mut() {
+            obj.insert("event".into(), json!({ "kind": kind, "key": key, "scrollPx": scroll_px }));
         }
         Ok(summary)
     }

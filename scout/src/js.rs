@@ -83,6 +83,105 @@ const DOM_SHIM: &str = r##"
 (function () {
   var root = globalThis.__scout_dom || { t: 1, n: "#root", a: {}, c: [] };
 
+  /* ---------------- events ----------------
+     Listeners are real: pages register handlers with addEventListener and the
+     host (a scroll action, a key press, a dispatched event) fires them. Handler
+     exceptions are swallowed so one bad listener cannot take the page down,
+     which is also what a browser guarantees. */
+  var MAX_LISTENERS_PER_TYPE = 64;
+
+  function listenerSet() {
+    var map = {};
+    return {
+      add: function (type, fn) {
+        type = String(type);
+        if (typeof fn !== 'function') return;
+        if (!map[type]) map[type] = [];
+        if (map[type].length < MAX_LISTENERS_PER_TYPE) map[type].push(fn);
+      },
+      remove: function (type, fn) {
+        var l = map[String(type)];
+        if (!l) return;
+        for (var i = 0; i < l.length; i++) {
+          if (l[i] === fn) { l.splice(i, 1); return; }
+        }
+      },
+      fire: function (target, ev) {
+        var type = ev.type;
+        var inline = target['on' + type];
+        if (typeof inline === 'function') {
+          try { inline.call(target, ev); } catch (e) { /* one listener must not stop the rest */ }
+        }
+        var l = map[type] || [];
+        for (var i = 0; i < l.length; i++) {
+          try { l[i].call(target, ev); } catch (e) {}
+        }
+      }
+    };
+  }
+
+  var WINDOW_LS = listenerSet();
+  var DOCUMENT_LS = listenerSet();
+
+  function Event(type, init) {
+    if (!(this instanceof Event)) return new Event(type, init);
+    init = init || {};
+    this.type = String(type);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.detail = init.detail;
+    this.target = null;
+    this.currentTarget = null;
+    this.timeStamp = Date.now();
+    this.defaultPrevented = false;
+    this.isTrusted = false;
+  }
+  Event.prototype.preventDefault = function () { this.defaultPrevented = true; };
+  Event.prototype.stopPropagation = function () { this.__stopped = true; };
+  Event.prototype.stopImmediatePropagation = function () { this.__stopped = true; };
+
+  function CustomEvent(type, init) {
+    var ev = new Event(type, init);
+    ev.detail = (init && init.detail !== undefined) ? init.detail : null;
+    return ev;
+  }
+  CustomEvent.prototype = Event.prototype;
+
+  function KeyboardEvent(type, init) {
+    init = init || {};
+    var ev = new Event(type, init);
+    ev.key = init.key || '';
+    ev.code = init.code || '';
+    ev.altKey = !!init.altKey;
+    ev.ctrlKey = !!init.ctrlKey;
+    ev.shiftKey = !!init.shiftKey;
+    ev.metaKey = !!init.metaKey;
+    ev.charCode = init.charCode || 0;
+    ev.keyCode = init.keyCode || 0;
+    return ev;
+  }
+  KeyboardEvent.prototype = Event.prototype;
+
+  // Dispatch on an element: fire on the element, then (bubbling) on document
+  // and window, which is where delegated listeners live. The wrapper tree is
+  // rebuilt lazily, so full parent-chain propagation is approximated by these
+  // two hops; a handler that stops propagation is honoured between them.
+  function fireOnElement(target, ev) {
+    ev.target = ev.target || target;
+    var ls = target.__scout_ls;
+    if (ls) ls.fire(target, ev);
+    if (ev.__stopped) return;
+    if (ev.bubbles) {
+      ev.currentTarget = globalThis.document;
+      DOCUMENT_LS.fire(globalThis.document, ev);
+      if (ev.__stopped) return;
+      ev.currentTarget = globalThis;
+      WINDOW_LS.fire(globalThis, ev);
+    }
+  }
+
+  var SCROLL_POS = 0;
+
   /* ---------------- selector engine (JS side) ----------------
      Supports: groups (,), descendant and child combinators, and compound
      selectors of tag / #id / .class / [attr] with =, ~=, |=, ^=, $=, *=.
@@ -562,8 +661,18 @@ const DOM_SHIM: &str = r##"
           for (i = 0; i < kids.length; i++) adopt(node, kids[i]);
         }
       },
-      addEventListener: function () {},
-      removeEventListener: function () {},
+      addEventListener: function (type, fn) {
+        if (!this.__scout_ls) this.__scout_ls = listenerSet();
+        this.__scout_ls.add(type, fn);
+      },
+      removeEventListener: function (type, fn) {
+        if (this.__scout_ls) this.__scout_ls.remove(type, fn);
+      },
+      dispatchEvent: function (ev) {
+        if (!ev || !ev.type) return true;
+        fireOnElement(this, ev);
+        return !ev.defaultPrevented;
+      },
       get innerHTML() {
         var o = '';
         for (var i = 0; i < (node.c || []).length; i++) o += serialize(node.c[i]);
@@ -700,8 +809,17 @@ const DOM_SHIM: &str = r##"
     createTextNode: function (t) { return wrapText(mkText(t)); },
     createDocumentFragment: function () { return wrap(mkElement('#fragment')); },
     createComment: function () { return wrapText(mkText('')); },
-    addEventListener: function () {},
-    removeEventListener: function () {},
+    // There is no focus model, so activeElement is the body, which is also
+    // what a browser reports when nothing is focused.
+    get activeElement() { return firstElementNamed('body'); },
+    addEventListener: function (type, fn) { DOCUMENT_LS.add(type, fn); },
+    removeEventListener: function (type, fn) { DOCUMENT_LS.remove(type, fn); },
+    dispatchEvent: function (ev) {
+      if (!ev || !ev.type) return true;
+      ev.target = ev.target || globalThis.document;
+      DOCUMENT_LS.fire(globalThis.document, ev);
+      return !ev.defaultPrevented;
+    },
     cookie: globalThis.__scout_cookie || ''
   };
 
@@ -734,8 +852,27 @@ const DOM_SHIM: &str = r##"
   })();
   globalThis.window = globalThis;
   globalThis.self = globalThis;
-  globalThis.addEventListener = function () {};
-  globalThis.removeEventListener = function () {};
+  globalThis.Event = Event;
+  globalThis.CustomEvent = CustomEvent;
+  globalThis.KeyboardEvent = KeyboardEvent;
+  globalThis.addEventListener = function (type, fn) { WINDOW_LS.add(type, fn); };
+  globalThis.removeEventListener = function (type, fn) { WINDOW_LS.remove(type, fn); };
+  globalThis.dispatchEvent = function (ev) {
+    if (!ev || !ev.type) return true;
+    ev.target = ev.target || globalThis;
+    WINDOW_LS.fire(globalThis, ev);
+    return !ev.defaultPrevented;
+  };
+  // The scroll position a scroll action sets; pages read it in handlers.
+  Object.defineProperty(globalThis, 'scrollY', { get: function () { return SCROLL_POS; }, configurable: true });
+  Object.defineProperty(globalThis, 'pageYOffset', { get: function () { return SCROLL_POS; }, configurable: true });
+  globalThis.scrollTo = function (x, y) {
+    SCROLL_POS = Math.max(0, Number(y) || 0);
+    WINDOW_LS.fire(globalThis, new Event('scroll'));
+  };
+  globalThis.scrollBy = function (x, y) {
+    globalThis.scrollTo(0, SCROLL_POS + (Number(y) || 0));
+  };
   /* Timers run on a virtual clock: callbacks are queued, then the host drains
      them synchronously once the page's scripts have finished, so deferred DOM
      writes are still observed without sleeping in real time. Bounded by count
@@ -2259,6 +2396,94 @@ mod tests {
             Some(json!(["AP8Q", 3, 255])),
             "base64 must be exposed and arrayBuffer must carry the exact bytes: {:?}",
             out.value
+        );
+    }
+
+    #[test]
+    fn event_listeners_receive_dispatched_events() {
+        let out = run_on(
+            "<p id='x'>hi</p>",
+            concat!(
+                "var got = [];",
+                "document.addEventListener('custom', function (e) { got.push(e.detail); });",
+                "var el = document.getElementById('x');",
+                "el.addEventListener('click', function () { got.push('clicked'); });",
+                "el.dispatchEvent(new Event('click'));",
+                "document.dispatchEvent(new CustomEvent('custom', { detail: 'hello' }));",
+                "return got;"
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.value, Some(json!(["clicked", "hello"])));
+    }
+
+    #[test]
+    fn scroll_position_is_readable_and_scroll_fires_window_listeners() {
+        let out = run_on(
+            "<p>x</p>",
+            concat!(
+                "var seen = 0;",
+                "window.addEventListener('scroll', function () { seen = window.scrollY; });",
+                "window.scrollTo(0, 1234);",
+                "return [seen, window.scrollY, window.pageYOffset];"
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.value, Some(json!([1234, 1234, 1234])));
+    }
+
+    #[test]
+    fn a_scroll_listener_can_lazy_load_through_fetch() {
+        let seen = empty_seen();
+        let net = fake_net("[{\"n\":\"lazy-1\"},{\"n\":\"lazy-2\"}]", seen.clone());
+        // The page's own script (registers the listener), then exactly the
+        // dispatch script fire_event generates for a scroll action.
+        let out = run_page_net_on(
+            "<html><body><ul id='list'><li>initial</li></ul></body></html>",
+            &[
+                concat!(
+                    "window.addEventListener('scroll', function () {",
+                    "  fetch('/api/more').then(function (r) { return r.json(); }).then(function (items) {",
+                    "    var ul = document.getElementById('list');",
+                    "    for (var i = 0; i < items.length; i++) {",
+                    "      var li = document.createElement('li');",
+                    "      li.textContent = items[i].n;",
+                    "      ul.appendChild(li);",
+                    "    }",
+                    "  });",
+                    "});"
+                ),
+                "window.scrollTo(0, 800); try { document.dispatchEvent(new Event('scroll')); } catch (e) {}",
+            ],
+            Some(net),
+        )
+        .unwrap();
+        let html = out.html.unwrap_or_default();
+        assert!(
+            html.contains("lazy-1") && html.contains("lazy-2"),
+            "lazy content must land in the DOM, got: {html}"
+        );
+    }
+
+    #[test]
+    fn key_events_carry_key_and_code() {
+        let out = run_on(
+            "<input id='q'>",
+            concat!(
+                "var seen = [];",
+                "document.getElementById('q').addEventListener('keydown', function (e) {",
+                "  seen.push([e.type, e.key, e.code, e.keyCode]);",
+                "});",
+                "var el = document.getElementById('q');",
+                "el.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', keyCode: 65 }));",
+                "el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13 }));",
+                "return seen;"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            out.value,
+            Some(json!([["keydown", "a", "KeyA", 65], ["keydown", "Enter", "Enter", 13]]))
         );
     }
 
