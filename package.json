@@ -1,6 +1,6 @@
 {
   "name": "@graphicmiles/scout",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight headless browser runtime: fetch, DOM, sandboxed page JavaScript, forms, extraction. One small Rust binary, no Chromium.",
   "type": "module",
   "license": "MIT",
@@ -33,5 +33,8 @@
     "browser",
     "automation",
     "extract"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
