@@ -147,6 +147,13 @@ async fn harness() -> Harness {
                 )
             }),
         )
+        // Script-driven navigation, meta refresh and click handlers.
+        .route("/js-nav", get(|| async { Html(JS_NAV_HTML) }))
+        .route("/meta-refresh", get(|| async { Html(META_REFRESH_HTML) }))
+        .route("/js-click", get(|| async { Html(JS_CLICK_HTML) }))
+        .route("/scroll-lazy", get(|| async { Html(SCROLL_LAZY_HTML) }))
+        .route("/target-a", get(|| async { Html(TARGET_A_HTML) }))
+        .route("/target-b", get(|| async { Html(TARGET_B_HTML) }))
         // YouTube pagination: a channel page with ytcfg + a continuation
         // token, then two browse responses.
         .route(
@@ -450,8 +457,188 @@ const UPLOAD_HTML: &str = r#"<!doctype html>
   </form>
 </body></html>"#;
 
+const TARGET_A_HTML: &str = r#"<!doctype html>
+<html><head><title>Target A</title></head><body><h1>Arrived at A</h1></body></html>"#;
+
+const TARGET_B_HTML: &str = r#"<!doctype html>
+<html><head><title>Target B</title></head><body><h1>Arrived at B</h1></body></html>"#;
+
+// A page whose script immediately asks to navigate elsewhere.
+const JS_NAV_HTML: &str = r#"<!doctype html>
+<html><head><title>JS Nav</title></head><body><p>moving on</p>
+<script>location.href = '/target-a';</script>
+</body></html>"#;
+
+// A meta refresh redirect, quoted the way real pages write it.
+const META_REFRESH_HTML: &str = r#"<!doctype html>
+<html><head><meta http-equiv="refresh" content="0; url=/target-b"></head>
+<body><p>refreshing</p></body></html>"#;
+
+// A click handler that navigates, plus a javascript: link and a plain
+// button: the three click shapes a page can have.
+const JS_CLICK_HTML: &str = r#"<!doctype html>
+<html><head><title>Clicks</title></head><body>
+<button type="button" id="go">Go</button>
+<button type="button" id="plain">Plain</button>
+<a id="jslink" href="javascript:void(0)">link</a>
+<script>
+  document.getElementById('go').addEventListener('click', function () {
+    location.href = '/target-a';
+  });
+</script>
+</body></html>"#;
+
+// Content that only exists after a scroll event.
+const SCROLL_LAZY_HTML: &str = r#"<!doctype html>
+<html><head><title>Lazy</title></head><body>
+<div id="more"></div>
+<script>
+  document.addEventListener('scroll', function () {
+    document.getElementById('more').innerHTML = '<p id="lazy-done">loaded</p>';
+  });
+</script>
+</body></html>"#;
+
 // The fixture server must outlive each test, so it is started per-test above and
 // the keepalive task holds the runtime slot.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_navigation_meta_refresh_clicks_waits_and_history() {
+    let h = harness().await;
+    let (status, sess) = h.post("/v1/sessions", json!({})).await;
+    assert_eq!(status, 201, "{sess}");
+    let sid = sess["id"].as_str().unwrap().to_string();
+
+    let text_of = |h: &Harness, sid: &str| {
+        let h = Harness { base: h.base.clone(), fixture: h.fixture.clone(), scout: h.scout.clone(), client: h.client.clone() };
+        let sid = sid.to_string();
+        async move {
+            let (_, out) = h
+                .post("/v1/tools/call", json!({ "name": "page.text", "arguments": { "sessionId": sid } }))
+                .await;
+            out["text"].as_str().unwrap_or("").to_string()
+        }
+    };
+
+    // 1. A script that sets location.href: the page lands where the script
+    //    asked, and the summary says so.
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/js-nav", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "js-nav failed: {nav}");
+    let followed = nav["scriptNavigation"]["url"].as_str().unwrap_or("").to_string();
+    assert!(followed.ends_with("/target-a"), "followed: {followed}");
+    assert!(nav["peakMemoryBytes"].as_u64().unwrap_or(0) > 0, "peak memory missing: {nav}");
+    let t = text_of(&h, &sid).await;
+    assert!(t.contains("Arrived at A"), "page text: {t}");
+
+    // 2. Meta refresh: followed before load, hop count reported.
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/meta-refresh", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "meta-refresh failed: {nav}");
+    assert_eq!(nav["metaRefreshHops"], 1);
+    assert!(nav["url"].as_str().unwrap_or("").ends_with("/target-b"), "landed: {nav}");
+    let t = text_of(&h, &sid).await;
+    assert!(t.contains("Arrived at B"), "page text: {t}");
+
+    // 3. Click on a button whose listener navigates.
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/js-click", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "js-click load failed: {nav}");
+
+    let (status, click) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "click", "selector": "#go" } }))
+        .await;
+    assert_eq!(status, 200, "click #go failed: {click}");
+    assert_eq!(click["effect"], "navigate", "click: {click}");
+    assert!(click["navigation"]["url"].as_str().unwrap_or("").ends_with("/target-a"), "click nav: {click}");
+    let t = text_of(&h, &sid).await;
+    assert!(t.contains("Arrived at A"), "after click: {t}");
+
+    // 4. Clicks with no semantic behaviour are delivered, not rejected:
+    //    a plain button and a javascript: link both come back 200.
+    h.post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/js-click", h.fixture) })).await;
+    let (status, click) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "click", "selector": "#plain" } }))
+        .await;
+    assert_eq!(status, 200, "click #plain failed: {click}");
+    assert_eq!(click["ok"], true);
+
+    let (status, click) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "click", "selector": "#jslink" } }))
+        .await;
+    assert_eq!(status, 200, "click #jslink failed: {click}");
+    assert_eq!(click["ok"], true);
+
+    // 5. Wait: text that is there succeeds; a selector that never appears
+    //    times out with wait_timeout.
+    let (status, w) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "wait", "value": "Go", "timeoutMs": 2000 } }))
+        .await;
+    assert_eq!(status, 200, "wait text failed: {w}");
+    assert!(w["waitedMs"].as_u64().unwrap_or(0) < 1900, "wait took the whole budget: {w}");
+
+    let (status, w) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "wait", "selector": "#never-appears", "timeoutMs": 300 } }))
+        .await;
+    assert_eq!(status, 504, "wait timeout status: {w}");
+    assert_eq!(w["error"]["code"], "wait_timeout", "wait timeout body: {w}");
+
+    // Wait for URL: the page sits on /js-click.
+    let (status, w) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "wait", "url": "js-click", "timeoutMs": 2000 } }))
+        .await;
+    assert_eq!(status, 200, "wait url failed: {w}");
+
+    // Wait for content a scroll handler adds.
+    let (status, _) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/scroll-lazy", h.fixture) }))
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "scroll" } }))
+        .await;
+    assert_eq!(status, 200);
+    let (status, w) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "wait", "selector": "#lazy-done", "timeoutMs": 2000 } }))
+        .await;
+    assert_eq!(status, 200, "wait lazy failed: {w}");
+
+    // 6. History: back and forward walk the pages actually visited.
+    h.post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/target-a", h.fixture) })).await;
+    h.post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/target-b", h.fixture) })).await;
+    let (status, back) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "back" } }))
+        .await;
+    assert_eq!(status, 200, "back failed: {back}");
+    assert_eq!(back["effect"], "navigate");
+    assert!(back["navigation"]["url"].as_str().unwrap_or("").ends_with("/target-a"), "back nav: {back}");
+    let t = text_of(&h, &sid).await;
+    assert!(t.contains("Arrived at A"), "after back: {t}");
+
+    let (status, fwd) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "forward" } }))
+        .await;
+    assert_eq!(status, 200, "forward failed: {fwd}");
+    assert!(fwd["navigation"]["url"].as_str().unwrap_or("").ends_with("/target-b"), "forward nav: {fwd}");
+    let t = text_of(&h, &sid).await;
+    assert!(t.contains("Arrived at B"), "after forward: {t}");
+
+    // Walking past the end of history is a clean 404, not a crash.
+    h.post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "forward" } })).await;
+    let (status, fwd) = h
+        .post("/v1/interact", json!({ "sessionId": sid, "action": { "type": "forward" } }))
+        .await;
+    assert_eq!(status, 404, "forward past end: {fwd}");
+
+    // 7. The wait/back/forward tools work through the tool layer too.
+    let (status, back) = h
+        .post("/v1/tools/call", json!({ "name": "back", "arguments": { "sessionId": sid } }))
+        .await;
+    assert_eq!(status, 200, "tool back failed: {back}");
+}
 
 /// The agent-facing tool layer: discoverable, authenticated, and unable to
 /// reach anything the HTTP API would refuse.

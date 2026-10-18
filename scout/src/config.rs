@@ -200,7 +200,7 @@ impl Config {
                     ]
                 }),
             js_timeout_ms: num(&env, "SCOUT_JS_TIMEOUT_MS", 5_000)?,
-            js_max_memory_bytes: num(&env, "SCOUT_JS_MAX_MEMORY_MB", 64)? * MB,
+            js_max_memory_bytes: num(&env, "SCOUT_JS_MAX_MEMORY_MB", 256)? * MB,
             js_enabled: env
                 .get("SCOUT_JS_ENABLED")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))

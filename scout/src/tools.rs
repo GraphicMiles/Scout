@@ -91,7 +91,7 @@ pub fn manifest() -> Value {
             "schema": { "type": "object" },
             "limit": { "type": "integer", "minimum": 1 },
         }), &[]),
-        tool("interact", "Perform a raw interaction action (click, fill, select, check, uncheck, press, submit).", json!({
+        tool("interact", "Perform a raw interaction action (click, fill, select, check, uncheck, press, submit, wait, back, forward).", json!({
             "sessionId": sid(), "action": { "type": "object" },
         }), &["sessionId", "action"]),
         tool("click", "Click an element matched by selector.", json!({ "sessionId": sid(), "selector": { "type": "string" }, "index": { "type": "integer", "minimum": 0 } }), &["sessionId", "selector"]),
@@ -107,6 +107,15 @@ pub fn manifest() -> Value {
         }), &["sessionId", "selector", "filename", "contentBase64"]),
         tool("scroll", "Scroll the page. Fires scroll events into the page's scripts, so lazy-loading pages fetch and render more content. Runs the page's scripts again first; scripts that append unconditionally on load may duplicate content.", json!({ "sessionId": sid(), "value": { "type": "integer", "minimum": 0, "description": "Pixels to scroll to; default 800" } }), &["sessionId"]),
         tool("submit", "Submit the form containing the matched element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId", "selector"]),
+        tool("wait", "Wait until a selector appears, a text appears, or the URL matches, then return. Fails with wait_timeout otherwise.", json!({
+            "sessionId": sid(),
+            "selector": { "type": "string" },
+            "text": { "type": "string" },
+            "url": { "type": "string", "description": "Substring the URL must contain" },
+            "timeoutMs": { "type": "integer", "minimum": 100, "description": "Budget, default 5000" }
+        }), &["sessionId"]),
+        tool("back", "Go back one page in the session's history.", json!({ "sessionId": sid() }), &["sessionId"]),
+        tool("forward", "Go forward one page in the session's history.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("evaluate", "Run JavaScript in the page and return a value. Scripts run as a function body, so use an explicit `return`.", json!({ "sessionId": sid(), "script": { "type": "string" } }), &["sessionId", "script"]),
         tool("page.text", "Visible text of the page or of one element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId"]),
         tool("page.html", "Outer HTML of the document or of one element.", json!({ "sessionId": sid(), "selector": { "type": "string" } }), &["sessionId"]),
@@ -344,6 +353,37 @@ pub async fn call(
             run_interact(scout, owner, ir).await?
         }
 
+        "wait" => {
+            let mut action = json!({ "type": "wait" });
+            for key in ["selector", "url"] {
+                if let Some(v) = obj.get(key) {
+                    if !v.is_null() {
+                        action[key] = v.clone();
+                    }
+                }
+            }
+            if let Some(t) = obj.get("text") {
+                if !t.is_null() {
+                    action["value"] = t.clone();
+                }
+            }
+            if let Some(t) = obj.get("timeoutMs") {
+                action["timeoutMs"] = t.clone();
+            }
+            let ir = interact(&str_arg("sessionId")?, action)?;
+            run_interact(scout, owner, ir).await?
+        }
+
+        "back" => {
+            let ir = interact(&str_arg("sessionId")?, json!({ "type": "back" }))?;
+            run_interact(scout, owner, ir).await?
+        }
+
+        "forward" => {
+            let ir = interact(&str_arg("sessionId")?, json!({ "type": "forward" }))?;
+            run_interact(scout, owner, ir).await?
+        }
+
         "scroll" => {
             let mut action = json!({ "type": "scroll" });
             if let Some(v) = obj.get("value") {
@@ -502,6 +542,10 @@ async fn eval_value(
 }
 
 /// Escape a string for embedding in generated JavaScript.
+pub(crate) fn js_lit(s: &str) -> String {
+    js_string(s)
+}
+
 fn js_string(s: &str) -> String {
     let escaped = s
         .replace('\\', "\\\\")

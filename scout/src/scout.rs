@@ -146,16 +146,36 @@ impl Scout {
 
     // ---------------------------------------------------------- navigation
 
-    /// Fetch and load a URL into a session.
+    /// Fetch and load a URL into a session. `script_nav_depth` bounds chains
+    /// of script-requested navigations so two pages cannot ping-pong forever.
     async fn do_navigate(
         &self,
         session: &Session,
         worker: usize,
         nav: &NavigateReq,
         abort: &Abort,
+        script_nav_depth: usize,
     ) -> Result<Value> {
         let timeout = clamp_timeout(nav.timeout_ms, self.cfg.nav_timeout_ms, self.cfg.max_nav_timeout_ms);
-        let fetched = self.fetch(session, nav, timeout, abort).await?;
+        let mut fetched = self.fetch(session, nav, timeout, abort).await?;
+        // <meta http-equiv="refresh" content="N; url=U">: a browser follows it.
+        // Follow up to 4 hops, then load whatever the last response was.
+        let mut refresh_hops = 0usize;
+        while refresh_hops < 4 {
+            let Some(target) = crate::page::meta_refresh(&fetched.body, &fetched.url) else {
+                break;
+            };
+            refresh_hops += 1;
+            let req = NavigateReq {
+                url: target,
+                session_id: Some(session.id.clone()),
+                timeout_ms: nav.timeout_ms,
+                method: "GET".into(),
+                body: None,
+                content_type: None,
+            };
+            fetched = self.fetch(session, &req, timeout, abort).await?;
+        }
         let page_url = fetched.url.clone();
 
         // Parsing and DOM construction happen on the page worker.
@@ -168,15 +188,21 @@ impl Scout {
             })
             .await?;
 
+        let mut summary = loaded.summary;
+        if refresh_hops > 0 {
+            if let Some(obj) = summary.as_object_mut() {
+                obj.insert("metaRefreshHops".into(), json!(refresh_hops));
+            }
+        }
         if loaded.scripts.is_empty() {
-            return Ok(loaded.summary);
+            return Ok(summary);
         }
 
         // External scripts are fetched on the async side through the same
         // guarded client as the document, so the SSRF policy applies to them
         // too rather than being bypassed by a page that loads its own code.
         let bodies = self
-            .fetch_scripts(session, &loaded.summary, &loaded.scripts, timeout, abort)
+            .fetch_scripts(session, &summary, &loaded.scripts, timeout, abort)
             .await;
 
         let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
@@ -186,7 +212,6 @@ impl Scout {
             None
         };
 
-        let mut summary = loaded.summary;
         match self
             .workers
             .call(worker, |reply| Cmd::RunScripts {
@@ -199,6 +224,51 @@ impl Scout {
         {
             Ok(js) => {
                 let mut js = js;
+                // Engine memory and the scripts' own warnings belong to the
+                // navigation summary too, not just to an event pass.
+                if let Some(peak) = js.get("peakMemoryBytes").and_then(|v| v.as_u64()) {
+                    if peak > 0 {
+                        if let Some(obj) = summary.as_object_mut() {
+                            obj.insert("peakMemoryBytes".into(), json!(peak));
+                        }
+                    }
+                }
+                if let Some(mut w) = js.get("warnings").and_then(|v| v.as_array()).cloned() {
+                    if !w.is_empty() {
+                        if let Some(obj) = summary.as_object_mut() {
+                            let mut all = obj
+                                .get("warnings")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            all.append(&mut w);
+                            obj.insert("warnings".into(), json!(all));
+                        }
+                    }
+                }
+                // A script or timer asked to leave the page (location.href,
+                // assign, replace). Follow it like a browser would, up to a
+                // small chain limit, so redirect-via-script pages land where
+                // a real visitor lands.
+                let pending = js
+                    .get("pendingNavigation")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(target) = pending.filter(|_| script_nav_depth < 4) {
+                    let nav = NavigateReq {
+                        url: target,
+                        session_id: Some(session.id.clone()),
+                        timeout_ms: None,
+                        method: "GET".into(),
+                        body: None,
+                        content_type: None,
+                    };
+                    let followed = Box::pin(self.do_navigate(&session, worker, &nav, &abort, script_nav_depth + 1)).await?;
+                    if let Some(obj) = summary.as_object_mut() {
+                        obj.insert("scriptNavigation".into(), followed);
+                    }
+                    return Ok(summary);
+                }
                 let stats = *net_stats.lock().unwrap();
                 if stats.requests > 0 || stats.blocked > 0 {
                     if let Some(obj) = js.as_object_mut() {
@@ -677,7 +747,7 @@ impl Scout {
     ) -> Result<Value> {
         let mut attempt = 0u32;
         loop {
-            match self.do_navigate(session, worker, nav, abort).await {
+            match self.do_navigate(session, worker, nav, abort, 0).await {
                 Ok(v) => {
                     self.metrics.inc(
                         "scout_navigations_total",
@@ -723,6 +793,20 @@ impl Scout {
         let session = self.sessions.get(owner, &req.session_id)?;
         let worker = self.worker_of(&req.session_id)?;
         let _guard = session.lock().await?;
+        self.interact_locked(&session, worker, req, abort).await
+    }
+
+    /// The interaction pipeline without the session lock. Task steps already
+    /// hold the lock for the whole task, so they call this directly; the HTTP
+    /// path takes the lock in `interact`.
+    async fn interact_locked(
+        &self,
+        session: &Session,
+        worker: usize,
+        req: InteractReq,
+        abort: &Abort,
+    ) -> Result<Value> {
+        let req = &req;
 
         // Scroll and non-Enter key presses are delivered to the page's scripts:
         // they re-run first (so their listeners exist in the fresh context),
@@ -783,14 +867,129 @@ impl Scout {
             return Ok(out);
         }
 
-        let effect: Effect = self
+        // History walking is not a page interaction: it asks the session where
+        // it would go, then navigates there like any other load.
+        if matches!(req.action.kind.as_str(), "back" | "forward") {
+            let forward = req.action.kind == "forward";
+            let target = self
+                .workers
+                .call(worker, |reply| Cmd::History {
+                    session: session.id.clone(),
+                    forward,
+                    reply,
+                })
+                .await?
+                .ok_or_else(|| {
+                    ScoutError::new(
+                        ErrorCode::NotFound,
+                        if forward {
+                            "No page to go forward to"
+                        } else {
+                            "No page to go back to"
+                        },
+                    )
+                })?;
+            let nav = NavigateReq {
+                url: target,
+                session_id: Some(session.id.clone()),
+                timeout_ms: req.action.timeout_ms,
+                method: "GET".into(),
+                body: None,
+                content_type: None,
+            };
+            let summary = self.do_navigate(&session, worker, &nav, &abort, 0).await?;
+            return Ok(json!({
+                "ok": true,
+                "type": req.action.kind,
+                "navigated": true,
+                "effect": "navigate",
+                "navigation": summary,
+            }));
+        }
+
+        // Waiting observes the page until a condition holds or the budget
+        // runs out; it is a poll, not an interaction.
+        if req.action.kind == "wait" {
+            return self
+                .wait_for(
+                    &session,
+                    worker,
+                    req.action.selector.as_deref(),
+                    req.action.values.first().map(|s| s.as_str()),
+                    req.action.url.as_deref(),
+                    req.action.timeout_ms.unwrap_or(5_000),
+                    &abort,
+                )
+                .await;
+        }
+
+        let effect: Effect = match self
             .workers
             .call(worker, |reply| Cmd::Interact {
                 session: session.id.clone(),
                 action: req.action.clone(),
                 reply,
             })
-            .await?;
+            .await
+        {
+            Ok(e) => e,
+            // A click on an element with no semantic behaviour (plain button,
+            // javascript: link, div with a handler) is delivered to the page's
+            // own listeners, exactly as a browser delivers it, and the result
+            // is whatever the handler did.
+            Err(e) if req.action.kind == "click" && e.code == ErrorCode::UnsupportedCapability => {
+                let url = session.referrer().unwrap_or_default();
+                let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
+                let net = if self.cfg.js_network {
+                    Some(self.page_net(&session, &url, net_stats.clone()))
+                } else {
+                    None
+                };
+                let detail = self
+                    .workers
+                    .call(worker, |reply| Cmd::FireEvent {
+                        session: session.id.clone(),
+                        kind: "click".into(),
+                        key: None,
+                        selector: req.action.selector.clone(),
+                        scroll_px: 0,
+                        net,
+                        reply,
+                    })
+                    .await?;
+                // The handler may have navigated.
+                let pending = detail
+                    .get("pendingNavigation")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(target) = pending {
+                    let nav = NavigateReq {
+                        url: target,
+                        session_id: Some(session.id.clone()),
+                        timeout_ms: req.action.timeout_ms,
+                        method: "GET".into(),
+                        body: None,
+                        content_type: None,
+                    };
+                    let summary = self.do_navigate(&session, worker, &nav, &abort, 0).await?;
+                    return Ok(json!({
+                        "ok": true,
+                        "type": "click",
+                        "navigated": true,
+                        "effect": "navigate",
+                        "navigation": summary,
+                    }));
+                }
+                return Ok(json!({
+                    "ok": true,
+                    "type": "click",
+                    "navigated": false,
+                    "effect": "events",
+                    "detail": detail,
+                }));
+            }
+            Err(e) => return Err(e),
+        };
 
         // The response carries both the descriptive `effect` field and the
         // `ok`/`type`/`navigated`/`page` fields the published contract uses, so
@@ -838,6 +1037,97 @@ impl Scout {
                     },
                     "warnings": summary.get("warnings").cloned().unwrap_or(json!([])),
                 }))
+            }
+        }
+    }
+
+    /// Poll a session until a selector appears, a text shows up, or the URL
+    /// contains a fragment. All given conditions must hold at the same poll.
+    /// The budget is clamped to the same 30s ceiling interactions use.
+    async fn wait_for(
+        &self,
+        session: &Session,
+        worker: usize,
+        selector: Option<&str>,
+        text: Option<&str>,
+        url: Option<&str>,
+        timeout_ms: u64,
+        abort: &Abort,
+    ) -> Result<Value> {
+        if selector.is_none() && text.is_none() && url.is_none() {
+            return Err(ScoutError::invalid(
+                "wait needs one of \"selector\", \"value\" (text) or \"url\"",
+            ));
+        }
+        let budget = timeout_ms.clamp(100, 30_000);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(budget);
+        // One script answers every condition: booleans ANDed together.
+        let mut script = String::from("return ");
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(sel) = selector {
+            parts.push(format!(
+                "(document.querySelector({}) !== null)",
+                crate::tools::js_lit(sel)
+            ));
+        }
+        if let Some(txt) = text {
+            parts.push(format!(
+                "((document.body ? document.body.textContent : '').indexOf({}) !== -1)",
+                crate::tools::js_lit(txt)
+            ));
+        }
+        if let Some(frag) = url {
+            parts.push(format!(
+                "(location.href.indexOf({}) !== -1)",
+                crate::tools::js_lit(frag)
+            ));
+        }
+        script.push_str(&parts.join(" && "));
+        script.push(';');
+
+        loop {
+            let out: Value = self
+                .workers
+                .call(worker, |reply| Cmd::Eval {
+                    session: session.id.clone(),
+                    script: script.clone(),
+                    net: None,
+                    reply,
+                })
+                .await?;
+            let matched = out.get("value").and_then(|v| v.as_bool()).unwrap_or(false);
+            if matched {
+                return Ok(json!({
+                    "ok": true,
+                    "type": "wait",
+                    "navigated": false,
+                    "effect": "none",
+                    "waitedMs": started.elapsed().as_millis() as u64,
+                }));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(ScoutError::new(
+                    ErrorCode::WaitTimeout,
+                    format!(
+                        "waited {}ms without the condition holding",
+                        started.elapsed().as_millis()
+                    ),
+                )
+                .with_details(json!({
+                    "waitedMs": started.elapsed().as_millis() as u64,
+                    "selector": selector,
+                    "text": text,
+                    "url": url,
+                })));
+            }
+            tokio::select! {
+                biased;
+                _ = abort.token().cancelled() => return Err(abort.reason()),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    (now + Duration::from_millis(150)).min(deadline)
+                )) => {}
             }
         }
     }
@@ -995,42 +1285,25 @@ impl Scout {
                         Ok(json!({ "data": out.get("data").cloned().unwrap_or(Value::Null), "warnings": warnings }))
                     }
                     "interact" => {
-                        let mut probe = step.params.clone();
-                        if let Some(o) = probe.as_object_mut() {
-                            o.insert("sessionId".into(), json!(session.id));
-                        }
-                        let ir = crate::validate::interact(&probe, &self.cfg)?;
-                        let action = ir.action.clone();
-                        let effect: Effect = self
-                            .workers
-                            .call(worker, |reply| Cmd::Interact {
-                                session: session.id.clone(),
-                                action,
-                                reply,
-                            })
-                            .await?;
-                        // Interactions are never retried: repeating one is not safe.
-                        match effect {
-                            Effect::None { detail } => Ok(json!({ "effect": "none", "detail": detail })),
-                            Effect::Navigate {
-                                url,
-                                method,
-                                body,
-                                content_type,
-                                timeout_ms,
-                            } => {
-                                let nav = NavigateReq {
-                                    url,
-                                    session_id: Some(session.id.clone()),
-                                    timeout_ms,
-                                    method,
-                                    body,
-                                    content_type,
-                                };
-                                let summary = self.do_navigate(&session, worker, &nav, &abort).await?;
-                                Ok(json!({ "effect": "navigate", "navigation": summary }))
-                            }
-                        }
+                        // Goes through the same path as POST /v1/interact, so
+                        // wait, back, forward and click-with-listeners work in
+                        // tasks exactly as they do over HTTP.
+                        let req = InteractReq {
+                            session_id: session.id.clone(),
+                            action: {
+                                let mut probe = step.params.clone();
+                                if let Some(o) = probe.as_object_mut() {
+                                    o.insert("sessionId".into(), json!(session.id));
+                                }
+                                crate::validate::interact(&probe, &self.cfg)?.action
+                            },
+                        };
+                        let out = self.interact_locked(&session, worker, req, &abort).await?;
+                        Ok(json!({
+                            "effect": out.get("effect").cloned().unwrap_or(Value::Null),
+                            "navigation": out.get("navigation").cloned().unwrap_or(Value::Null),
+                            "detail": out.get("detail").cloned().unwrap_or(Value::Null),
+                        }))
                     }
                         other => Err(ScoutError::unsupported(format!(
                             "Step op \"{other}\" is not supported"

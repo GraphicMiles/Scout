@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 /// an unimplemented feature, so it is refused with `invalid_request`.
 const ACTION_TYPES: &[&str] = &[
     "click", "fill", "select", "check", "uncheck", "press", "submit", "scroll",
-    "upload",
+    "upload", "wait", "back", "forward",
 ];
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,8 @@ pub struct Action {
     pub key: Option<String>,
     /// File contents for `upload`, base64 encoded.
     pub content_base64: Option<String>,
+    /// URL (or URL fragment) to wait for; `wait` only.
+    pub url: Option<String>,
     /// Which match to act on when the selector matches several elements.
     pub index: Option<u64>,
     /// Per-action navigation budget, clamped by the caller.
@@ -53,7 +55,7 @@ impl Action {
             .as_object()
             .ok_or_else(|| bad("action must be an object".into(), "action"))?;
         for k in o.keys() {
-            if !["type", "selector", "index", "value", "key", "contentBase64", "timeoutMs"].contains(&k.as_str()) {
+            if !["type", "selector", "index", "value", "key", "contentBase64", "timeoutMs", "url"].contains(&k.as_str()) {
                 return Err(bad(format!("Unknown field \"{k}\" in action"), k));
             }
         }
@@ -81,7 +83,9 @@ impl Action {
                 ))
             }
         };
-        if selector.is_none() && kind != "scroll" {
+        if selector.is_none()
+            && !matches!(kind.as_str(), "scroll" | "back" | "forward" | "wait")
+        {
             return Err(bad("\"selector\" is required".into(), "selector"));
         }
         let values = match kind.as_str() {
@@ -137,6 +141,17 @@ impl Action {
                 _ => {
                     return Err(bad(
                         "\"value\" for scroll must be a non-negative number of pixels".into(),
+                        "value",
+                    ))
+                }
+            },
+            // Text to wait for on the page; optional.
+            "wait" => match o.get("value") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::String(val)) if val.chars().count() <= 10_000 => vec![val.clone()],
+                _ => {
+                    return Err(bad(
+                        "\"value\" for wait must be a string up to 10000 characters".into(),
                         "value",
                     ))
                 }
@@ -197,6 +212,16 @@ impl Action {
                 ))
             }
         };
+        let url = match o.get("url") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(u)) if u.chars().count() <= 2048 => Some(u.clone()),
+            Some(_) => {
+                return Err(bad(
+                    "\"url\" must be a string up to 2048 characters".into(),
+                    "url",
+                ))
+            }
+        };
         let timeout_ms = match o.get("timeoutMs") {
             None | Some(Value::Null) => None,
             Some(Value::Number(n)) => match n.as_u64() {
@@ -221,6 +246,7 @@ impl Action {
             values,
             key,
             content_base64,
+            url,
             index,
             timeout_ms,
         })
@@ -975,6 +1001,33 @@ pub fn describe(el: &ElementRef) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wait_action_parses_with_optional_parts() {
+        let a = Action::from_json(&json!({ "type": "wait", "selector": "#done", "timeoutMs": 1500 })).unwrap();
+        assert_eq!(a.kind, "wait");
+        assert_eq!(a.selector.as_deref(), Some("#done"));
+        assert!(a.values.is_empty());
+        assert_eq!(a.timeout_ms, Some(1500));
+
+        let a = Action::from_json(&json!({ "type": "wait", "value": "Welcome back", "url": "/dash" })).unwrap();
+        assert_eq!(a.values.first().map(|s| s.as_str()), Some("Welcome back"));
+        assert_eq!(a.url.as_deref(), Some("/dash"));
+        assert!(a.selector.is_none());
+    }
+
+    #[test]
+    fn back_and_forward_need_no_selector() {
+        let a = Action::from_json(&json!({ "type": "back" })).unwrap();
+        assert_eq!(a.kind, "back");
+        assert!(a.selector.is_none());
+        let a = Action::from_json(&json!({ "type": "forward" })).unwrap();
+        assert_eq!(a.kind, "forward");
+    }
+
+    #[test]
+    fn unknown_action_type_still_rejected() {
+        assert!(Action::from_json(&json!({ "type": "hover", "selector": "#x" })).is_err());
+    }
 
     fn page_with(html_src: &str) -> Page {
         let doc = crate::html::parse_html(html_src, 150_000).unwrap();
@@ -1226,7 +1279,6 @@ mod tests {
         let err = apply(&mut p, &bad, &cfg()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidRequest);
 
-        let mut p = page_with("<form><input type='file' name='f'></form>");
         let err = Action::from_json(&json!({
             "type": "upload", "selector": "input[name=f]",
             "value": "../etc/passwd", "contentBase64": "aGk="
