@@ -60,7 +60,16 @@ pub enum Cmd {
     Load {
         session: String,
         fetched: Box<Fetched>,
+        /// The session's locale, so the page's scripts see it.
+        locale: String,
         reply: oneshot::Sender<Result<LoadOutcome>>,
+    },
+    /// Copy one session's page (DOM, storage, form state, history) to another
+    /// session on the same worker. Cookies are copied by the caller.
+    CloneSession {
+        from: String,
+        to: String,
+        reply: oneshot::Sender<Result<bool>>,
     },
     /// Run the page's scripts and rebuild the DOM from what they produced.
     RunScripts {
@@ -147,8 +156,8 @@ impl WorkerState {
 
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Load { session, fetched, reply } => {
-                let _ = reply.send(self.load(&session, *fetched));
+            Cmd::Load { session, fetched, locale, reply } => {
+                let _ = reply.send(self.load(&session, *fetched, &locale));
             }
             Cmd::RunScripts { session, scripts, net, reply } => {
                 let _ = reply.send(self.run_scripts(&session, scripts, net, true));
@@ -172,6 +181,9 @@ impl WorkerState {
             Cmd::History { session, forward, reply } => {
                 let _ = reply.send(self.history_peek(&session, forward));
             }
+            Cmd::CloneSession { from, to, reply } => {
+                let _ = reply.send(self.clone_page(&from, &to));
+            }
             Cmd::Digest { session, reply } => {
                 let _ = reply.send(self.digest(&session));
             }
@@ -185,7 +197,7 @@ impl WorkerState {
         }
     }
 
-    fn load(&mut self, session: &str, fetched: Fetched) -> Result<LoadOutcome> {
+    fn load(&mut self, session: &str, fetched: Fetched, locale: &str) -> Result<LoadOutcome> {
         if fetched.status >= 400 {
             let restricted = matches!(fetched.status, 401 | 403 | 429);
             let msg = if restricted {
@@ -253,6 +265,7 @@ impl WorkerState {
             "redirects": page.redirects,
             "warnings": page.warnings,
         });
+        page.locale = locale.to_string();
         if fetched.from_cache {
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("fromCache".into(), json!(true));
@@ -283,6 +296,32 @@ impl WorkerState {
         }
         self.pages.insert(session.to_string(), page);
         Ok(LoadOutcome { summary, scripts })
+    }
+
+    /// Deep-copy one session's page to another: DOM, storage, typed form
+    /// values, staged files, history. The destination keeps its own identity.
+    fn clone_page(&mut self, from: &str, to: &str) -> Result<bool> {
+        // The source must exist and hold a page.
+        {
+            let page = self
+                .pages
+                .get(from)
+                .ok_or_else(|| ScoutError::new(ErrorCode::NotFound, "Unknown session"))?;
+            if page.doc.is_none() && page.json.is_none() {
+                return Ok(false);
+            }
+        }
+        let page = self.pages.get(from).cloned();
+        match page {
+            Some(mut p) => {
+                // The copy starts life where the source is; its history is
+                // shared up to this point, which is exactly what a fork is.
+                p.url = p.url.clone();
+                self.pages.insert(to.to_string(), p);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn digest(&self, session: &str) -> Result<Value> {
@@ -469,7 +508,8 @@ impl WorkerState {
 
         let snapshot = js::dom_snapshot(doc);
         let storage = page.storage.clone();
-        let out = js::run_page(
+        let locale = page.locale.clone();
+        let out = js::run_page_with_locale(
             &scripts,
             &snapshot,
             &page.url,
@@ -480,6 +520,7 @@ impl WorkerState {
             self.cfg.js_max_memory_bytes as usize,
             self.cfg.js_timer_budget,
             self.cfg.js_job_budget,
+            &locale,
         )?;
 
         if let Some(html) = out.html {
@@ -639,7 +680,7 @@ impl WorkerState {
     }
 
     fn eval(&mut self, session: &str, script: &str, net: Option<js::NetFn>) -> Result<Value> {
-        let (snapshot, url, storage_in) = {
+        let (snapshot, url, storage_in, locale) = {
             let page = self.page(session)?;
             let Some(doc) = page.doc.as_ref() else {
                 return Err(ScoutError::new(
@@ -647,9 +688,9 @@ impl WorkerState {
                     "JavaScript execution needs an HTML page",
                 ));
             };
-            (js::dom_snapshot(doc), page.url.clone(), page.storage.clone())
+            (js::dom_snapshot(doc), page.url.clone(), page.storage.clone(), page.locale.clone())
         };
-        let out = js::run(
+        let out = js::run_with_locale(
             script,
             &snapshot,
             &url,
@@ -658,6 +699,7 @@ impl WorkerState {
             net,
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
+            &locale,
         )?;
         // Persist Web Storage mutations the script made.
         if let Some(st) = out.storage {

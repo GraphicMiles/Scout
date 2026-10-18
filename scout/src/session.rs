@@ -246,11 +246,27 @@ pub(crate) fn is_public_suffix(domain: &str) -> bool {
     PUBLIC_SUFFIXES.contains(&domain)
 }
 
+/// Everything a caller can configure on a new session.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOpts {
+    /// A name shown in listings.
+    pub label: Option<String>,
+    /// BCP-47 style tag, sent as Accept-Language and exposed to page scripts.
+    pub locale: Option<String>,
+    /// IANA timezone name. Stored and reported; Date objects stay UTC.
+    pub timezone: Option<String>,
+    /// Human-feeling pacing on interactions.
+    pub humanize: bool,
+    /// HTTP/HTTPS proxy every request from this session goes through.
+    pub proxy_url: Option<String>,
+}
+
 pub struct Session {
     pub id: String,
     pub owner: String,
     pub ephemeral: bool,
     pub jar: Arc<CookieJar>,
+    pub opts: SessionOpts,
     pub created_at: i64,
     pub last_used: Mutex<i64>,
     /// The document requests are issued from, so a form POST or an XHR carries
@@ -287,11 +303,16 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     pub fn new(owner: String, ephemeral: bool) -> Self {
+        Self::with_opts(owner, ephemeral, SessionOpts::default(), None)
+    }
+
+    pub fn with_opts(owner: String, ephemeral: bool, opts: SessionOpts, jar: Option<Arc<CookieJar>>) -> Self {
         Self {
             id: random_id("ses_", 16),
             owner,
             ephemeral,
-            jar: Arc::new(CookieJar::new()),
+            jar: jar.unwrap_or_else(|| Arc::new(CookieJar::new())),
+            opts,
             created_at: now_ms(),
             last_used: Mutex::new(now_ms()),
             referrer: Mutex::new(None),
@@ -372,6 +393,16 @@ impl SessionManager {
     }
 
     pub fn create(self: &Arc<Self>, owner: String, ephemeral: bool) -> Result<Arc<Session>> {
+        self.create_with(owner, ephemeral, SessionOpts::default(), None)
+    }
+
+    pub fn create_with(
+        self: &Arc<Self>,
+        owner: String,
+        ephemeral: bool,
+        opts: SessionOpts,
+        jar: Option<Arc<CookieJar>>,
+    ) -> Result<Arc<Session>> {
         {
             let mut map = self.sessions.lock().unwrap();
             if map.len() >= self.cfg.max_sessions {
@@ -395,10 +426,22 @@ impl SessionManager {
                 )
                 .with_retry_after(5));
             }
-            let s = Arc::new(Session::new(owner, ephemeral));
+            let s = Arc::new(Session::with_opts(owner, ephemeral, opts, jar));
             map.insert(s.id.clone(), s.clone());
             Ok(s)
         }
+    }
+
+    /// List a key's sessions, oldest first.
+    pub fn list(&self, owner: &str) -> Vec<(String, Arc<Session>)> {
+        let map = self.sessions.lock().unwrap();
+        let mut out: Vec<(String, Arc<Session>)> = map
+            .iter()
+            .filter(|(_, s)| s.owner == owner)
+            .map(|(id, s)| (id.clone(), s.clone()))
+            .collect();
+        out.sort_by_key(|(_, s)| s.created_at);
+        out
     }
 
     /// Sessions are bound to the key that created them; another key sees `not_found`

@@ -830,10 +830,16 @@ const DOM_SHIM: &str = r##"
   // The host calls this after page scripts run to collect the mutated document.
   globalThis.__scout_serialize = function () { return serialize(root); };
 
+  globalThis.__scout_loc = (function () {
+    var l = globalThis.__scout_locale || 'en-US';
+    if (l.indexOf(',') >= 0) return l.split(',');
+    var primary = l.split('-')[0];
+    return l.toLowerCase() === primary.toLowerCase() ? [l] : [l, primary];
+  })();
   globalThis.navigator = {
     userAgent: globalThis.__scout_ua || 'Scout/0.1',
-    language: 'en-US',
-    languages: ['en-US', 'en']
+    language: (globalThis.__scout_loc[0] || 'en-US'),
+    languages: globalThis.__scout_loc
   };
   (function () {
     var raw = globalThis.__scout_url || '';
@@ -1624,6 +1630,24 @@ pub fn run(
     timeout: Duration,
     max_memory: usize,
 ) -> Result<JsOutcome> {
+    run_with_locale(
+        script, snapshot, base_url, user_agent, storage, net, timeout, max_memory, "",
+    )
+}
+
+/// `run` with a locale: `navigator.language` reports it, so pages that switch
+/// on it see the language the session asked for.
+pub fn run_with_locale(
+    script: &str,
+    snapshot: &Value,
+    base_url: &str,
+    user_agent: &str,
+    storage: &Value,
+    net: Option<NetFn>,
+    timeout: Duration,
+    max_memory: usize,
+    locale: &str,
+) -> Result<JsOutcome> {
     use rquickjs::{Context, Runtime};
 
     let started = Instant::now();
@@ -1647,10 +1671,11 @@ pub fn run(
     let ctx = Context::full(&rt).map_err(|e| js_err(format!("could not create JS context: {e}")))?;
 
     let prelude = format!(
-        "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_storage = {};\n",
+        "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_locale = {};\nglobalThis.__scout_storage = {};\n",
         snapshot,
         serde_json::to_string(base_url).unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(user_agent).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(locale).unwrap_or_else(|_| "\"\"".into()),
         storage,
     );
 
@@ -1941,6 +1966,25 @@ pub fn run_page(
     // Total promise jobs one page may run, across every script and drain.
     job_budget: u32,
 ) -> Result<PageRunOutcome> {
+    run_page_with_locale(
+        scripts, snapshot, base_url, user_agent, storage, net, timeout, max_memory,
+        timer_budget, job_budget, "",
+    )
+}
+
+pub fn run_page_with_locale(
+    scripts: &[Script],
+    snapshot: &Value,
+    base_url: &str,
+    user_agent: &str,
+    storage: &Value,
+    net: Option<NetFn>,
+    timeout: Duration,
+    max_memory: usize,
+    timer_budget: u32,
+    job_budget: u32,
+    locale: &str,
+) -> Result<PageRunOutcome> {
     use rquickjs::{Context, Runtime};
 
     let started = Instant::now();
@@ -1991,10 +2035,11 @@ pub fn run_page(
         wire_console(&ctx, &logs)?;
 
         let prelude = format!(
-            "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_storage = {};\n",
+            "globalThis.__scout_dom = {};\nglobalThis.__scout_url = {};\nglobalThis.__scout_ua = {};\nglobalThis.__scout_locale = {};\nglobalThis.__scout_storage = {};\n",
             snapshot,
             serde_json::to_string(base_url).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(user_agent).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(locale).unwrap_or_else(|_| "\"\"".into()),
             storage,
         );
         ctx.eval::<(), _>(prelude.as_str())
