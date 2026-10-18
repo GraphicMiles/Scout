@@ -48,6 +48,8 @@ Docker:
 cd scout
 docker build -t scout .
 docker run --memory=512m --cpus=0.5 -e SCOUT_API_KEYS=your-key -p 8080:8080 scout
+
+To use Scout from an MCP client (Claude Desktop, Cursor, any Model Context Protocol host), point it at the command `scout mcp`. It speaks newline-delimited JSON-RPC on stdin and stdout and exposes the same tools as the HTTP API.
 ```
 
 ## Quick start
@@ -70,13 +72,15 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 - Keeps browser-style history per session: go back and forward through pages actually visited
 - Re-requests pages with ETag and Last-Modified validators; a 304 answer reuses the cached body and says so with fromCache
 - Summarises a page as a token-cheap digest: title, headings, links, forms with fields, and button labels
+- Speaks MCP over stdio: run scout mcp and any Model Context Protocol client sees every tool
+- Serves its own API document at GET /openapi.json
 - Stages files on upload inputs and sends them as multipart/form-data, like a browser
 - Keeps localStorage and sessionStorage per session, across navigations
 - Scrolls pages and delivers key presses and clicks to their scripts, so lazy-loading and search-as-you-type pages work; a click on a plain button runs the page's own click handlers instead of failing
 - Runs ES modules: relative and absolute URL imports are fetched, chained, and cached per page load
 - Signs in with credentials you supply and reports the evidence
 - Extracts videos from YouTube channels, verified against live pages, and follows continuation pages up to the limit you set
-- Queues background tasks with retries, timeouts, and a memory watchdog
+- Queues background tasks with retries, timeouts, and a memory watchdog; a step can name its result with as and later steps can use it as {{name}}
 
 ## What it does not do
 
@@ -101,6 +105,7 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | POST | `/v1/interact` | Click, fill, select, submit, scroll, press a key, upload a file, wait, or go back and forward |
 | POST | `/v1/eval` | Run JavaScript against a page |
 | GET | `/v1/tools` | List every tool an agent can call |
+| GET | `/openapi.json` | The API document, hand-written |
 | POST | `/v1/tasks` | Submit a task |
 | GET | `/v1/tasks/:id` | Task status and result |
 | POST | `/v1/tasks/:id/cancel` | Cancel a task |

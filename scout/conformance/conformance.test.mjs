@@ -1100,3 +1100,52 @@ describe('engine: security', () => {
     assert.equal(code, 0, `expected a clean exit, got ${code}`);
   });
 });
+
+// ------------------------------------------------------------- mcp over stdio
+
+describe('mcp: stdio bridge', () => {
+  it('speaks JSON-RPC: initialize, list tools, call a tool', async () => {
+    const child = spawn(BINARY, ['mcp'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = [];
+    let buf = '';
+    const done = new Promise((resolve, reject) => {
+      child.stdout.on('data', (d) => {
+        buf += String(d);
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          out.push(buf.slice(0, i));
+          buf = buf.slice(i + 1);
+        }
+      });
+      child.on('error', reject);
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
+    });
+
+    const say = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+    say({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } });
+    say({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    say({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    say({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'strategies', arguments: {} } });
+    say({ jsonrpc: '2.0', id: 4, method: 'no/such/method' });
+    child.stdin.end();
+
+    await done;
+
+    assert.equal(out.length, 4, `expected 4 responses, got ${JSON.stringify(out)}`);
+    const byId = Object.fromEntries(out.map((l) => {
+      const m = JSON.parse(l);
+      return [m.id, m];
+    }));
+    assert.equal(byId[1].result.protocolVersion, '2024-11-05');
+    assert.equal(byId[1].result.serverInfo.name, 'scout');
+    assert.ok(Array.isArray(byId[2].result.tools) && byId[2].result.tools.length > 10,
+      'tools/list should carry the tool manifest');
+    const names = byId[2].result.tools.map((t) => t.name);
+    for (const must of ['navigate', 'extract', 'page.digest', 'wait', 'back']) {
+      assert.ok(names.includes(must), `tools/list missing ${must}`);
+    }
+    assert.equal(byId[3].result.isError, false);
+    assert.ok(byId[3].result.content[0].text.includes('strategies'), 'tool call should return strategies');
+    assert.equal(byId[4].error.code, -32601);
+  });
+});

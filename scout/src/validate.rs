@@ -340,9 +340,13 @@ pub fn interact(v: &Value, _cfg: &Config) -> Result<InteractReq> {
 #[derive(Debug, Clone)]
 pub struct TaskStep {
     pub op: String,
-    /// The step's parameters with `op` removed, ready for the same validators the
-    /// synchronous endpoints use — so a step and a direct call cannot drift apart.
+    /// The step's parameters with `op` and `as` removed, ready for the same
+    /// validators the synchronous endpoints use — so a step and a direct call
+    /// cannot drift apart.
     pub params: Value,
+    /// Name this step's result is bound to for `{{name}}` interpolation in
+    /// later steps.
+    pub as_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +383,7 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
                 // Node's parseTask inlines the navigate step rules rather than
                 // reusing parseNavigate: a step runs on the task's session, so
                 // it carries no session of its own.
-                unknown(sm, &["op", "url", "timeoutMs"], &where_)?;
+                unknown(sm, &["op", "url", "timeoutMs", "as"], &where_)?;
                 match opt_str(sm, "url")? {
                     Some(u) if !u.trim().is_empty() => {}
                     _ => {
@@ -400,7 +404,7 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
             "extract" => {
                 unknown(
                     sm,
-                    &["op", "url", "strategy", "schema", "limit", "timeoutMs"],
+                    &["op", "url", "strategy", "schema", "limit", "timeoutMs", "as"],
                     &where_,
                 )?;
                 let mut probe = sm.clone();
@@ -411,7 +415,7 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
                 extract_fields(&probe, cfg, false, false)?;
             }
             "interact" => {
-                unknown(sm, &["op", "action"], &where_)?;
+                unknown(sm, &["op", "action", "as"], &where_)?;
                 let action = sm
                     .get("action")
                     .ok_or_else(|| ScoutError::invalid(format!("{where_}.action is required")))?;
@@ -424,11 +428,33 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
                 .with_details(serde_json::json!({ "field": "steps", "op": other })))
             }
         }
+        let as_name = match sm.get("as") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let ok = (1..=40).contains(&s.chars().count())
+                    && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if ok {
+                    Some(s.clone())
+                } else {
+                    return Err(ScoutError::invalid(format!(
+                        "{where_}.\"as\" must be 1 to 40 characters: letters, digits or underscore, starting with a letter or underscore"
+                    ))
+                    .with_details(serde_json::json!({ "field": "as" })));
+                }
+            }
+            Some(_) => {
+                return Err(ScoutError::invalid(format!("{where_}.\"as\" must be a string"))
+                    .with_details(serde_json::json!({ "field": "as" })));
+            }
+        };
         let mut params = sm.clone();
         params.remove("op");
+        params.remove("as");
         out.push(TaskStep {
             op: op.to_string(),
             params: Value::Object(params),
+            as_name,
         });
     }
 

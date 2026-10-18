@@ -34,6 +34,27 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Map an HTTP status to the closest Scout code. Used by bridges that
+    /// re-serve another Scout's answers.
+    pub fn from_status(status: u16) -> Self {
+        use ErrorCode::*;
+        match status {
+            400 => InvalidRequest,
+            401 | 403 => Unauthorized,
+            404 => NotFound,
+            405 => MethodNotAllowed,
+            409 => Conflict,
+            413 => PayloadTooLarge,
+            415 => UnsupportedContent,
+            422 => ElementNotFound,
+            429 => RateLimited,
+            501 => UnsupportedCapability,
+            502 | 503 => Overloaded,
+            504 => NavigationTimeout,
+            _ => Internal,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         use ErrorCode::*;
         match self {

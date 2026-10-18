@@ -20,6 +20,7 @@ pub mod interaction;
 pub mod js;
 pub mod logger;
 pub mod metrics;
+pub mod mcp;
 pub mod page;
 pub mod resources;
 pub mod scout;
