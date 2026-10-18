@@ -114,6 +114,11 @@ pub enum Cmd {
         forward: bool,
         reply: oneshot::Sender<Result<Option<String>>>,
     },
+    /// The page's digest: title, headings, links, forms, buttons.
+    Digest {
+        session: String,
+        reply: oneshot::Sender<Result<Value>>,
+    },
     Stats {
         reply: oneshot::Sender<Result<Value>>,
     },
@@ -166,6 +171,9 @@ impl WorkerState {
             }
             Cmd::History { session, forward, reply } => {
                 let _ = reply.send(self.history_peek(&session, forward));
+            }
+            Cmd::Digest { session, reply } => {
+                let _ = reply.send(self.digest(&session));
             }
             Cmd::Stats { reply } => {
                 let bytes: usize = self.pages.values().map(|p| p.bytes).sum();
@@ -236,7 +244,7 @@ impl WorkerState {
         }
 
 
-        let summary = json!({
+        let mut summary = json!({
             "url": page.url,
             "status": page.status,
             "contentType": page.content_type,
@@ -245,6 +253,11 @@ impl WorkerState {
             "redirects": page.redirects,
             "warnings": page.warnings,
         });
+        if fetched.from_cache {
+            if let Some(obj) = summary.as_object_mut() {
+                obj.insert("fromCache".into(), json!(true));
+            }
+        }
         // Browser history semantics: a visit to the previous entry moves back,
         // a visit to the next moves forward, anything else truncates the
         // forward stack and appends. History survives the load: it is carried
@@ -270,6 +283,11 @@ impl WorkerState {
         }
         self.pages.insert(session.to_string(), page);
         Ok(LoadOutcome { summary, scripts })
+    }
+
+    fn digest(&self, session: &str) -> Result<Value> {
+        let page = self.page(session)?;
+        Ok(page.digest())
     }
 
     fn history_peek(&self, session: &str, forward: bool) -> Result<Option<String>> {

@@ -147,6 +147,26 @@ async fn harness() -> Harness {
                 )
             }),
         )
+        // Conditional fetch: serves an ETag and honours If-None-Match.
+        .route("/etag", get(|headers: axum::http::HeaderMap| async move {
+            const ETAG: &str = "\"etag-v1\"";
+            let inm = headers
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if inm == ETAG {
+                return (
+                    axum::http::StatusCode::NOT_MODIFIED,
+                    [(axum::http::header::ETAG, ETAG)],
+                )
+                    .into_response();
+            }
+            (
+                [(axum::http::header::ETAG, ETAG)],
+                Html("<html><head><title>ETagged</title></head><body><h1>stable page</h1></body></html>"),
+            )
+                .into_response()
+        }))
         // Script-driven navigation, meta refresh and click handlers.
         .route("/js-nav", get(|| async { Html(JS_NAV_HTML) }))
         .route("/meta-refresh", get(|| async { Html(META_REFRESH_HTML) }))
@@ -638,6 +658,42 @@ async fn script_navigation_meta_refresh_clicks_waits_and_history() {
         .post("/v1/tools/call", json!({ "name": "back", "arguments": { "sessionId": sid } }))
         .await;
     assert_eq!(status, 200, "tool back failed: {back}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conditional_fetch_and_page_digest() {
+    let h = harness().await;
+    let (status, sess) = h.post("/v1/sessions", json!({})).await;
+    assert_eq!(status, 201);
+    let sid = sess["id"].as_str().unwrap().to_string();
+
+    // First visit: a full 200, no cache marker.
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/etag", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "first etag nav: {nav}");
+    assert!(nav.get("fromCache").is_none(), "first visit must not be cached: {nav}");
+    assert_eq!(nav["title"], "ETagged");
+
+    // Second visit: the server answers 304 and the cached body is reused.
+    let (status, nav2) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/etag", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "second etag nav: {nav2}");
+    assert_eq!(nav2["fromCache"], true, "second visit should reuse the cache: {nav2}");
+    assert_eq!(nav2["title"], "ETagged");
+    assert_eq!(nav2["status"], 200);
+
+    // The digest tool summarises the page without shipping the document.
+    let (status, d) = h
+        .post("/v1/tools/call", json!({ "name": "page.digest", "arguments": { "sessionId": sid } }))
+        .await;
+    assert_eq!(status, 200, "digest failed: {d}");
+    assert_eq!(d["title"], "ETagged");
+    assert_eq!(d["headings"]["h1"][0], "stable page");
+    assert!(d["links"].as_array().unwrap().is_empty());
+    assert!(d["forms"].as_array().unwrap().is_empty());
+    assert!(d["buttons"].as_array().unwrap().is_empty());
 }
 
 /// The agent-facing tool layer: discoverable, authenticated, and unable to

@@ -114,6 +114,132 @@ impl Page {
     pub fn title(&self) -> Option<String> {
         self.doc.as_ref().and_then(crate::html::title)
     }
+
+    /// A token-cheap page summary for agents: what the page is about and what
+    /// can be done on it, without shipping the whole document. Everything is
+    /// capped so a huge page cannot blow the context window.
+    pub fn digest(&self) -> serde_json::Value {
+        use serde_json::json;
+        let Some(doc) = self.doc.as_ref() else {
+            return serde_json::Value::Null;
+        };
+        let base = url::Url::parse(&self.url).ok();
+
+        let headings = |tags: &[&str]| -> serde_json::Value {
+            let mut out: Vec<String> = Vec::new();
+            for tag in tags {
+                if let Ok(sel) = crate::selector::compile(tag) {
+                    for el in doc.select(&sel) {
+                        let t = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+                        let t = t.chars().take(120).collect::<String>();
+                        if !t.is_empty() && !out.contains(&t) {
+                            out.push(t);
+                        }
+                        if out.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+                if out.len() >= 5 {
+                    break;
+                }
+            }
+            json!(out)
+        };
+
+        let mut links: Vec<String> = Vec::new();
+        if let Ok(sel) = crate::selector::compile("a[href]") {
+            for el in doc.select(&sel) {
+                let href = el.value().attr("href").unwrap_or_default();
+                let abs = base
+                    .as_ref()
+                    .and_then(|b| b.join(href).ok())
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| href.to_string());
+                let label = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+                let label = label.chars().take(60).collect::<String>();
+                let entry = if label.is_empty() {
+                    abs
+                } else {
+                    format!("{label} -> {abs}")
+                };
+                if !links.contains(&entry) {
+                    links.push(entry);
+                }
+                if links.len() >= 12 {
+                    break;
+                }
+            }
+        }
+
+        let mut forms: Vec<serde_json::Value> = Vec::new();
+        if let Ok(sel) = crate::selector::compile("form") {
+            for el in doc.select(&sel) {
+                let action = el.value().attr("action").unwrap_or("");
+                let action = base
+                    .as_ref()
+                    .and_then(|b| b.join(action).ok())
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| action.to_string());
+                let method = el.value().attr("method").unwrap_or("GET").to_ascii_uppercase();
+                let mut fields: Vec<String> = Vec::new();
+                if let Ok(field_sel) = crate::selector::compile("input, select, textarea") {
+                    for f in el.select(&field_sel) {
+                        if let Some(name) = f.value().attr("name") {
+                            let kind = f.value().name();
+                            if !fields.contains(&name.to_string()) {
+                                fields.push(format!("{kind}[name={name}]"));
+                            }
+                        }
+                        if fields.len() >= 12 {
+                            break;
+                        }
+                    }
+                }
+                forms.push(json!({ "action": action, "method": method, "fields": fields }));
+                if forms.len() >= 5 {
+                    break;
+                }
+            }
+        }
+
+        let mut buttons: Vec<String> = Vec::new();
+        if let Ok(sel) = crate::selector::compile("button, input[type=submit], input[type=button]") {
+            for el in doc.select(&sel) {
+                let label = el
+                    .text()
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let label = if label.is_empty() {
+                    el.value().attr("value").unwrap_or_default().to_string()
+                } else {
+                    label
+                };
+                let label = label.chars().take(60).collect::<String>();
+                if !label.is_empty() && !buttons.contains(&label) {
+                    buttons.push(label);
+                }
+                if buttons.len() >= 12 {
+                    break;
+                }
+            }
+        }
+
+        json!({
+            "title": self.title(),
+            "url": self.url,
+            "headings": {
+                "h1": headings(&["h1"]),
+                "h2": headings(&["h2"]),
+                "h3": headings(&["h3"]),
+            },
+            "links": links,
+            "forms": forms,
+            "buttons": buttons,
+        })
+    }
 }
 
 /// The target of `<meta http-equiv="refresh" content="N; url=U">`, resolved
@@ -200,6 +326,46 @@ fn parse_attrs(tag: &str) -> Vec<(String, String)> {
     out
 }
 
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn digest_summarizes_a_page() {
+        let html = r#"<html><head><title>Shop</title></head><body>
+        <h1>Widgets</h1><h2>Catalog</h2><h2>Catalog</h2>
+        <a href="/p/1">First</a><a href="https://other.example/x">Elsewhere</a>
+        <form action="/search" method="post"><input name="q"><select name="c"></select></form>
+        <button>Buy</button><input type="submit" value="Go">
+        </body></html>"#;
+        let doc = crate::html::parse_html(html, 150_000).unwrap();
+        let p = Page::html(
+            "https://example.com/shop".into(),
+            200,
+            "text/html".into(),
+            html.len(),
+            doc,
+            Vec::new(),
+            Vec::new(),
+        );
+        let d = p.digest();
+        assert_eq!(d["title"], "Shop");
+        assert_eq!(d["headings"]["h1"][0], "Widgets");
+        let links = d["links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], "First -> https://example.com/p/1");
+        assert_eq!(links[1], "Elsewhere -> https://other.example/x");
+        let form = &d["forms"][0];
+        assert_eq!(form["action"], "https://example.com/search");
+        assert_eq!(form["method"], "POST");
+        let fields = form["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f == "input[name=q]"));
+        let buttons = d["buttons"].as_array().unwrap();
+        assert!(buttons.contains(&serde_json::json!("Buy")));
+        assert!(buttons.contains(&serde_json::json!("Go")));
+    }
+}
 
 #[cfg(test)]
 mod meta_refresh_tests {

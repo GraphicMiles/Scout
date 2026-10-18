@@ -122,6 +122,7 @@ pub fn manifest() -> Value {
         tool("page.links", "Every link on the page, with absolute URLs.", json!({ "sessionId": sid(), "limit": { "type": "integer", "minimum": 1 } }), &["sessionId"]),
         tool("page.forms", "Every form on the page with its fields, methods and actions.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("page.title", "Document title and current URL.", json!({ "sessionId": sid() }), &["sessionId"]),
+        tool("page.digest", "A token-cheap summary of the page: title, top headings, links, forms with their fields, and button labels.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("cookies.get", "List every cookie in the session jar, including HttpOnly ones that page scripts cannot see.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("cookies.set", "Seed the jar with a raw cookie value, for example to resume a signed-in session.", json!({ "sessionId": sid(), "url": { "type": "string" }, "cookie": { "type": "string" } }), &["sessionId", "url", "cookie"]),
         tool("cookies.clear", "Empty the session cookie jar.", json!({ "sessionId": sid() }), &["sessionId"]),
@@ -394,6 +395,19 @@ pub async fn call(
         }
 
         "evaluate" => scout.eval(owner, &str_arg("sessionId")?, str_arg("script")?, abort).await?,
+
+        "page.digest" => {
+            let sid = str_arg("sessionId")?;
+            let session = scout.sessions.get(owner, &sid)?;
+            let worker = scout.worker_of(&sid)?;
+            scout
+                .workers
+                .call(worker, |reply| crate::worker::Cmd::Digest {
+                    session: session.id.clone(),
+                    reply,
+                })
+                .await?
+        }
 
         "page.text" => {
             let sel = opt_str("selector");

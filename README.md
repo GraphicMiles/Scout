@@ -68,6 +68,8 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 - Follows script and meta-refresh navigations: a page whose script sets location.href, or that carries a meta refresh tag, lands where a browser would land
 - Waits for a selector, text, or URL before continuing, with its own timeout code
 - Keeps browser-style history per session: go back and forward through pages actually visited
+- Re-requests pages with ETag and Last-Modified validators; a 304 answer reuses the cached body and says so with fromCache
+- Summarises a page as a token-cheap digest: title, headings, links, forms with fields, and button labels
 - Stages files on upload inputs and sends them as multipart/form-data, like a browser
 - Keeps localStorage and sessionStorage per session, across navigations
 - Scrolls pages and delivers key presses and clicks to their scripts, so lazy-loading and search-as-you-type pages work; a click on a plain button runs the page's own click handlers instead of failing
@@ -98,6 +100,7 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | POST | `/v1/extract` | Extract fields from a page |
 | POST | `/v1/interact` | Click, fill, select, submit, scroll, press a key, upload a file, wait, or go back and forward |
 | POST | `/v1/eval` | Run JavaScript against a page |
+| GET | `/v1/tools` | List every tool an agent can call |
 | POST | `/v1/tasks` | Submit a task |
 | GET | `/v1/tasks/:id` | Task status and result |
 | POST | `/v1/tasks/:id/cancel` | Cancel a task |

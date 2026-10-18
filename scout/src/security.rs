@@ -253,6 +253,7 @@ impl reqwest::dns::Resolve for ValidatingResolver {
 
 // --------------------------------------------------------- guarded fetch
 
+#[derive(Clone)]
 pub struct Fetched {
     pub url: String,
     pub status: u16,
@@ -264,6 +265,9 @@ pub struct Fetched {
     pub body_b64: Option<String>,
     pub bytes: usize,
     pub redirects: Vec<serde_json::Value>,
+    /// True when the body came from the session's fetch cache after the
+    /// server answered 304 Not Modified.
+    pub from_cache: bool,
 }
 
 /// Reason phrase for the status codes a page script can observe. `Fetched`
@@ -698,6 +702,7 @@ pub async fn guarded_fetch(
             body_b64,
             bytes,
             redirects,
+            from_cache: false,
         });
     }
 
