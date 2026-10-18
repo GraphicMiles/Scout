@@ -342,6 +342,7 @@ const DOM_SHIM: &str = r##"
   function mkText(text) { return { t: 3, v: String(text) }; }
 
   function adopt(parent, child, index) {
+      globalThis.__scout_mutated = true;
     if (!parent || !child) return null;
     // A document fragment contributes its children, as in a browser, rather
     // than nesting itself as a node that no selector will ever match.
@@ -362,6 +363,7 @@ const DOM_SHIM: &str = r##"
   }
 
   function detach(node) {
+      globalThis.__scout_mutated = true;
     if (!node) return node;
     var p = node.__parent;
     if (p && p.c) {
@@ -512,6 +514,7 @@ const DOM_SHIM: &str = r##"
         if (list.indexOf(arguments[i]) < 0) list.push(arguments[i]);
       }
       attrs.class = list.filter(function (x) { return typeof x === 'string'; }).join(' ');
+      globalThis.__scout_mutated = true;
     };
     list.remove = function () {
       for (var i = 0; i < arguments.length; i++) {
@@ -519,6 +522,7 @@ const DOM_SHIM: &str = r##"
         if (j >= 0) list.splice(j, 1);
       }
       attrs.class = list.filter(function (x) { return typeof x === 'string'; }).join(' ');
+      globalThis.__scout_mutated = true;
     };
     list.toggle = function (c, force) {
       var has = list.indexOf(c) >= 0;
@@ -569,7 +573,7 @@ const DOM_SHIM: &str = r##"
       get id() { return attrs.id || ''; },
       set id(v) { attrs.id = String(v); },
       get className() { return attrs.class || ''; },
-      set className(v) { attrs.class = String(v); },
+      set className(v) { attrs.class = String(v); globalThis.__scout_mutated = true; },
       get innerText() { return textOf(node); },
       set innerText(v) { this.textContent = v; },
       get href() { return resolveUrl(attrs.href || ''); },
@@ -648,8 +652,8 @@ const DOM_SHIM: &str = r##"
       },
       removeChild: function (child) { return wrap(detach(nodeOf(child))); },
       remove: function () { detach(node); },
-      setAttribute: function (n, v) { attrs[n] = String(v); },
-      removeAttribute: function (n) { delete attrs[n]; },
+      setAttribute: function (n, v) { attrs[n] = String(v); globalThis.__scout_mutated = true; },
+      removeAttribute: function (n) { delete attrs[n]; globalThis.__scout_mutated = true; },
       cloneNode: function (deep) { return wrap(cloneTree(node, !!deep)); },
       insertAdjacentHTML: function (where, html) {
         var kids = parseFragment(html), i;
@@ -838,6 +842,7 @@ const DOM_SHIM: &str = r##"
     var protocol = m && m[1] ? m[1].toLowerCase() : '';
     var host = m && m[2] ? m[2] : '';
     globalThis.__scout_pending_nav = null;
+    globalThis.__scout_mutated = false;
     var pathname = m && m[3] ? m[3] : '';
     var search = m && m[4] ? m[4] : '';
     var hash = m && m[5] ? m[5] : '';
@@ -2070,7 +2075,12 @@ pub fn run_page(
         }
         timer_counts.set((timers_run, timers_pending));
 
-        let html = if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+        let mutated = ctx
+            .eval::<bool, _>("globalThis.__scout_mutated === true")
+            .unwrap_or(true);
+        let html = if timed_out.load(std::sync::atomic::Ordering::SeqCst) || !mutated {
+            // Nothing touched the DOM: keep the parsed document as-is and
+            // skip re-serializing and re-parsing it.
             None
         } else {
             ctx.eval::<String, _>("__scout_serialize()")
@@ -2256,6 +2266,33 @@ mod tests {
             64,
             500,
         )
+    }
+
+    #[test]
+    fn unmutated_scripts_leave_the_document_alone() {
+        // A script that only reads: no rebuild, html stays None.
+        let out = run_page_on(
+            "<html><body><p id='x'>hi</p></body></html>",
+            &["var t = document.getElementById('x').textContent; window.__t = t;"],
+        )
+        .unwrap();
+        assert!(out.html.is_none());
+
+        // A script that appends: the DOM is rebuilt.
+        let out = run_page_on(
+            "<html><body><ul id='l'></ul></body></html>",
+            &["document.getElementById('l').innerHTML = '<li>one</li>';"],
+        )
+        .unwrap();
+        assert!(out.html.as_deref().unwrap_or("").contains("<li>one</li>"));
+
+        // Attribute-only mutations count too.
+        let out = run_page_on(
+            "<html><body><p id='x'>hi</p></body></html>",
+            &["document.getElementById('x').setAttribute('data-seen', '1');"],
+        )
+        .unwrap();
+        assert!(out.html.is_some());
     }
 
     #[test]

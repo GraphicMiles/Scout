@@ -261,6 +261,17 @@ pub struct Session {
     /// Serialises operations: one active operation per session, later callers wait.
     op: Arc<AsyncMutex<()>>,
     pub destroyed: std::sync::atomic::AtomicBool,
+    /// Validator-tagged GET responses, so a repeat visit sends
+    /// If-None-Match/If-Modified-Since and reuses the body on 304. Bounded:
+    /// a session that walks thousands of pages does not hold them all.
+    pub fetch_cache: std::sync::Mutex<std::collections::HashMap<String, CachedFetch>>,
+}
+
+/// One cached response with its validators.
+pub struct CachedFetch {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub fetched: crate::security::Fetched,
 }
 
 impl std::fmt::Debug for Session {
@@ -287,6 +298,7 @@ impl Session {
             ctl: CancellationToken::new(),
             op: Arc::new(AsyncMutex::new(())),
             destroyed: std::sync::atomic::AtomicBool::new(false),
+            fetch_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

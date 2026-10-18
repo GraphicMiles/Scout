@@ -8,7 +8,7 @@ use crate::js;
 use crate::metrics::Metrics;
 use crate::resources::ResourceManager;
 use crate::security::{guarded_fetch, Fetched, FetchKind, FetchRequest};
-use crate::session::{Session, SessionManager};
+use crate::session::{CachedFetch, Session, SessionManager};
 use crate::tasks::TaskManager;
 use crate::validate::{clamp_timeout, ExtractReq, InteractReq, NavigateReq, TaskReq};
 use crate::worker::{Cmd, ScriptSource, StrategySpec, WorkerPool};
@@ -135,7 +135,7 @@ impl Scout {
         }
     }
 
-    fn worker_of(&self, session_id: &str) -> Result<usize> {
+    pub(crate) fn worker_of(&self, session_id: &str) -> Result<usize> {
         self.routing
             .lock()
             .unwrap()
@@ -370,6 +370,14 @@ impl Scout {
         out
     }
 
+    /// Case-insensitive header lookup on a fetched response.
+    fn header_of(f: &Fetched, name: &str) -> Option<String> {
+        f.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
     async fn fetch(
         &self,
         session: &Session,
@@ -382,6 +390,28 @@ impl Scout {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(ct) = &nav.content_type {
             headers.push(("content-type".into(), ct.clone()));
+        }
+
+        // Conditional GET: if this session already holds a validator-tagged
+        // copy of this URL, offer it. A 304 answer reuses the cached body.
+        let cacheable = nav.method == "GET" && nav.body.is_none();
+        let cached = if cacheable {
+            session
+                .fetch_cache
+                .lock()
+                .unwrap()
+                .get(url.as_str())
+                .map(|c| (c.etag.clone(), c.last_modified.clone()))
+        } else {
+            None
+        };
+        if let Some((etag, last_modified)) = &cached {
+            if let Some(e) = etag {
+                headers.push(("if-none-match".into(), e.clone()));
+            }
+            if let Some(lm) = last_modified {
+                headers.push(("if-modified-since".into(), lm.clone()));
+            }
         }
 
         let referer = session.referrer();
@@ -407,6 +437,39 @@ impl Scout {
             _ = abort.token().cancelled() => Err(abort.reason()),
             r = fut => r,
         }?;
+
+        let mut result = result;
+        if result.status == 304 {
+            let fresh_etag = Self::header_of(&result, "etag");
+            let fresh_lm = Self::header_of(&result, "last-modified");
+            if let Some(entry) = session.fetch_cache.lock().unwrap().get_mut(url.as_str()) {
+                // Validators can rotate between responses; keep the newest.
+                if fresh_etag.is_some() {
+                    entry.etag = fresh_etag;
+                }
+                if fresh_lm.is_some() {
+                    entry.last_modified = fresh_lm;
+                }
+                let mut again = entry.fetched.clone();
+                again.from_cache = true;
+                result = again;
+            }
+        } else if result.status == 200 && cacheable {
+            let etag = Self::header_of(&result, "etag");
+            let last_modified = Self::header_of(&result, "last-modified");
+            if etag.is_some() || last_modified.is_some() {
+                let mut cache = session.fetch_cache.lock().unwrap();
+                if cache.len() >= 16 {
+                    if let Some(oldest) = cache.keys().next().cloned() {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(
+                    url.to_string(),
+                    CachedFetch { etag, last_modified, fetched: result.clone() },
+                );
+            }
+        }
 
         // Subsequent requests come *from* this document, which is what makes a
         // form POST carry the Referer and Origin a server expects to see.
