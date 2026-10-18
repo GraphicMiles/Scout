@@ -205,6 +205,32 @@ async fn harness() -> Harness {
             )
                 .into_response()
         }))
+        // Pagination fixture: three list pages linked by a next link.
+        .route(
+            "/pages/:n",
+            get(|axum::extract::Path(n): axum::extract::Path<u32>| async move {
+                let item = |i: u32| {
+                    format!("<li class=\"item\"><span class=\"name\">Page {n} item {i}</span></li>")
+                };
+                let mut html = format!(
+                    "<html><head><title>Page {n}</title></head><body><ul class=\"items\">{}{}</ul>",
+                    item(1),
+                    item(2)
+                );
+                if n < 3 {
+                    html.push_str(&format!("<a id=\"next\" href=\"/pages/{}\">Next</a>", n + 1));
+                }
+                html.push_str("</body></html>");
+                Html(html)
+            }),
+        )
+        // Iframe folding fixture.
+        .route("/frames", get(|| async {
+            Html("<html><head><title>Frames</title></head><body><h1>outer</h1><iframe src=\"/frame-body\" title=\"f\"></iframe></body></html>")
+        }))
+        .route("/frame-body", get(|| async {
+            Html("<html><body><p class=\"inside\">frame content here</p><a href=\"/elsewhere\">link</a></body></html>")
+        }))
         // Script-driven navigation, meta refresh and click handlers.
         .route("/js-nav", get(|| async { Html(JS_NAV_HTML) }))
         .route("/meta-refresh", get(|| async { Html(META_REFRESH_HTML) }))
@@ -772,6 +798,110 @@ async fn openapi_document_is_served() {
         .await;
     assert_eq!(status, 400, "bad as accepted: {body}");
     assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pagination_and_iframe_folding() {
+    let h = harness().await;
+
+    // 1. Walk three pages with nextSelector.
+    let (status, ex) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "url": format!("{}/pages/1", h.fixture),
+                "strategy": "selectors",
+                "schema": {
+                    "item": "li.item",
+                    "fields": { "name": { "selector": ".name" } }
+                },
+                "nextSelector": "#next",
+                "maxPages": 3,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "paginated extract failed: {ex}");
+    let rows = ex["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 6, "three pages of two rows each: {ex}");
+    assert_eq!(ex["meta"]["pages"], 3);
+    let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(names.contains(&"Page 1 item 1"));
+    assert!(names.contains(&"Page 2 item 2"));
+    assert!(names.contains(&"Page 3 item 1"));
+
+    // 2. Without nextSelector: one page only.
+    let (status, ex) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "url": format!("{}/pages/1", h.fixture),
+                "strategy": "selectors",
+                "schema": { "item": "li.item", "fields": { "name": { "selector": ".name" } } },
+            }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(ex["meta"]["pages"], 1);
+    assert_eq!(ex["data"].as_array().unwrap().len(), 2);
+
+    // 3. maxPages caps the walk.
+    let (status, ex) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "url": format!("{}/pages/1", h.fixture),
+                "strategy": "selectors",
+                "schema": { "item": "li.item", "fields": { "name": { "selector": ".name" } } },
+                "nextSelector": "#next",
+                "maxPages": 2,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(ex["meta"]["pages"], 2);
+    assert_eq!(ex["data"].as_array().unwrap().len(), 4);
+
+    // 4. Iframe content is folded into the document.
+    let (status, sess) = h.post("/v1/sessions", json!({})).await;
+    assert_eq!(status, 201);
+    let sid = sess["id"].as_str().unwrap().to_string();
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/frames", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "frames nav failed: {nav}");
+    let (status, t) = h
+        .post("/v1/tools/call", json!({ "name": "page.text", "arguments": { "sessionId": sid } }))
+        .await;
+    assert_eq!(status, 200);
+    let text = t["text"].as_str().unwrap_or_default();
+    assert!(text.contains("frame content here"), "frame body not folded: {text}");
+
+    // Selectors reach into the folded frame.
+    let (status, link) = h
+        .post("/v1/extract", json!({
+            "sessionId": sid,
+            "strategy": "selectors",
+            "schema": { "item": "scout-frame", "fields": { "href": { "selector": "a", "type": "url" } } }
+        }))
+        .await;
+    assert_eq!(status, 200, "frame extract failed: {link}");
+    let rows = link["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["href"].as_str().unwrap_or("").ends_with("/elsewhere"), "row: {rows:?}");
+
+    // 5. Validation: maxPages without nextSelector is refused.
+    let (status, body) = h
+        .post(
+            "/v1/extract",
+            json!({
+                "url": format!("{}/pages/1", h.fixture),
+                "strategy": "selectors",
+                "schema": { "item": "li.item", "fields": { "name": { "selector": ".name" } } },
+                "maxPages": 3,
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "maxPages alone accepted: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
