@@ -50,7 +50,16 @@ pub fn manifest() -> Value {
     let tools = vec![
         tool("session.create", "Create an isolated browsing session with its own cookie jar. Sessions never share cookies or credentials.", json!({}), &[]),
         tool("session.destroy", "Destroy a session and release its DOM, jar and worker slot.", json!({ "sessionId": sid() }), &["sessionId"]),
-        tool("session.export", "Export the session's cookies and current document, so a signed-in session can be saved and resumed later.", json!({ "sessionId": sid() }), &["sessionId"]),
+
+        tool("session.create", "Create a session with options: a label, a locale sent as Accept-Language and shown to page scripts, a timezone name, human-feeling interaction pacing, or an http/https proxy.", json!({
+            "label": { "type": "string", "maxLength": 64 },
+            "locale": { "type": "string", "description": "Language tag like en-GB" },
+            "timezone": { "type": "string", "description": "IANA name like Europe/Lagos; stored and reported, Date objects stay UTC" },
+            "humanize": { "type": "boolean" },
+            "proxyUrl": { "type": "string" }
+        }), &[]),
+        tool("session.list", "List this key's sessions with labels and referrers.", json!({}), &[]),
+        tool("session.clone", "Fork a session: the same cookies, storage and current page under a new id.", json!({ "sessionId": sid() }), &["sessionId"]),        tool("session.export", "Export the session's cookies and current document, so a signed-in session can be saved and resumed later.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("session.import", "Restore cookies exported by session.export into a session, so an existing signed-in session can be resumed without replaying a login.", json!({
             "sessionId": sid(),
             "url": { "type": "string", "description": "An origin URL the cookies are scoped to, e.g. https://example.com/" },
@@ -177,7 +186,12 @@ pub async fn call(
     };
 
     let out = match name {
-        "session.create" => scout.create_session(owner)?,
+        "session.create" => {
+            let opts = validate::create_session(&args)?;
+            scout.create_session_with(owner, opts)?
+        }
+        "session.list" => scout.list_sessions(owner),
+        "session.clone" => scout.clone_session(owner, &str_arg("sessionId")?).await?,
         "session.destroy" => {
             scout.destroy_session(owner, &str_arg("sessionId")?)?;
             json!({ "ok": true })

@@ -17,9 +17,12 @@ pub enum PageKind {
 /// lifetime guarantee the reference implementation got from a WeakMap, made
 /// explicit here. Values are a list per element because a `<select multiple>`
 /// legitimately holds several.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Page {
     pub url: String,
+    /// The session's locale, so page scripts see the same language the
+    /// requests asked for.
+    pub locale: String,
     pub status: u16,
     pub content_type: String,
     pub bytes: usize,
@@ -66,6 +69,7 @@ impl Page {
     ) -> Self {
         Self {
             url,
+            locale: String::new(),
             status,
             content_type,
             bytes,
@@ -94,6 +98,7 @@ impl Page {
     ) -> Self {
         Self {
             url,
+            locale: String::new(),
             status,
             content_type,
             bytes,

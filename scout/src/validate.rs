@@ -61,9 +61,79 @@ fn opt_u64(map: &Map<String, Value>, key: &str) -> Result<Option<u64>> {
     }
 }
 
-pub fn create_session(v: &Value) -> Result<()> {
+pub fn create_session(v: &Value) -> Result<crate::session::SessionOpts> {
     let m = obj(v, "body")?;
-    unknown(m, &[], "body")
+    unknown(
+        m,
+        &["label", "locale", "timezone", "humanize", "proxyUrl"],
+        "body",
+    )?;
+    let bad = |msg: String, field: &str| {
+        ScoutError::invalid(msg).with_details(serde_json::json!({ "field": field }))
+    };
+    let label = match m.get("label") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if (1..=64).contains(&s.chars().count()) => Some(s.clone()),
+        Some(_) => {
+            return Err(bad(
+                "\"label\" must be a string of 1 to 64 characters".into(),
+                "label",
+            ))
+        }
+    };
+    let locale = match m.get("locale") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let ok = (2..=35).contains(&s.chars().count())
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if ok { Some(s.clone()) } else {
+                return Err(bad(
+                    "\"locale\" must be a language tag like en-GB, 2 to 35 characters".into(),
+                    "locale",
+                ));
+            }
+        }
+        Some(_) => return Err(bad("\"locale\" must be a string".into(), "locale")),
+    };
+    let timezone = match m.get("timezone") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let ok = (1..=64).contains(&s.chars().count())
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '/' || c == '+' || c == '-');
+            if ok { Some(s.clone()) } else {
+                return Err(bad(
+                    "\"timezone\" must be an IANA name like Europe/Lagos".into(),
+                    "timezone",
+                ));
+            }
+        }
+        Some(_) => return Err(bad("\"timezone\" must be a string".into(), "timezone")),
+    };
+    let humanize = match m.get("humanize") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("\"humanize\" must be true or false".into(), "humanize")),
+    };
+    let proxy_url = match m.get("proxyUrl") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if (8..=2048).contains(&s.chars().count()) => {
+            if !s.starts_with("http://") && !s.starts_with("https://") {
+                return Err(bad(
+                    "\"proxyUrl\" must be an http or https URL; SOCKS is not supported".into(),
+                    "proxyUrl",
+                ));
+            }
+            Some(s.clone())
+        }
+        Some(_) => return Err(bad("\"proxyUrl\" must be a URL string".into(), "proxyUrl")),
+    };
+    Ok(crate::session::SessionOpts {
+        label,
+        locale,
+        timezone,
+        humanize,
+        proxy_url,
+    })
 }
 
 #[derive(Debug, Clone)]

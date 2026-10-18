@@ -292,6 +292,8 @@ fn route_name(method: &Method, path: &str) -> &'static str {
         ("GET", "/v1/strategies") => "strategies",
         ("GET", "/openapi.json") => "openapi",
         ("POST", "/v1/sessions") => "sessions.create",
+        ("GET", "/v1/sessions") => "sessions.list",
+        _ if path.starts_with("/v1/sessions/") && path.ends_with("/clone") => "sessions.clone",
         ("POST", "/v1/navigate") => "navigate",
         ("POST", "/v1/extract") => "extract",
         ("POST", "/v1/interact") => "interact",
@@ -421,6 +423,7 @@ async fn openapi(State(state): State<AppState>) -> Response {
                 "post": op("Create a session", Some(body_of(json!({ "label": { "type": "string" } }), vec![]))),
             },
             "/v1/sessions/{id}": { "delete": op("Destroy a session", None) },
+            "/v1/sessions/{id}/clone": { "post": op("Fork a session: cookies, storage and the current page, under a new id", None) },
             "/v1/navigate": {
                 "post": op("Load a page into a session", Some(body_of(json!({
                     "sessionId": sid,
@@ -529,8 +532,23 @@ async fn tools_call(State(state): State<AppState>, req: Request<Body>) -> Result
 async fn create_session(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
     let owner = owner_of(&req);
     let body = read_json(req, state.cfg.max_body_bytes).await?;
-    crate::validate::create_session(&body)?;
-    Ok((StatusCode::CREATED, Json(state.scout.create_session(&owner)?)).into_response())
+    let opts = crate::validate::create_session(&body)?;
+    Ok((StatusCode::CREATED, Json(state.scout.create_session_with(&owner, opts)?)).into_response())
+}
+
+async fn list_sessions(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
+    let owner = owner_of(&req);
+    Ok(Json(state.scout.list_sessions(&owner)).into_response())
+}
+
+async fn clone_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> Result<Response> {
+    let owner = owner_of(&req);
+    let view = state.scout.clone_session(&owner, &id).await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
 async fn destroy_session(
@@ -722,6 +740,7 @@ async fn not_found(method: Method, uri: axum::http::Uri) -> Response {
     let allow = match uri.path() {
         "/health" | "/metrics" | "/v1/strategies" | "/openapi.json" | "/v1/schedules" => "GET",
         "/v1/sessions" | "/v1/navigate" | "/v1/extract" | "/v1/interact" | "/v1/eval" | "/v1/tasks" => "POST",
+        p if p.starts_with("/v1/sessions/") && p.ends_with("/clone") => "POST",
         p if p.starts_with("/v1/sessions/") => "DELETE",
         p if p.starts_with("/v1/tasks/") => "GET, POST",
         p if p.starts_with("/v1/schedules/") => "GET, DELETE",
@@ -750,8 +769,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/strategies", get(strategies))
         .route("/v1/tools", get(tools_manifest))
         .route("/v1/tools/call", post(tools_call))
-        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions", post(create_session).get(list_sessions))
         .route("/v1/sessions/:id", delete(destroy_session))
+        .route("/v1/sessions/:id/clone", post(clone_session))
         .route("/v1/navigate", post(navigate))
         .route("/v1/request", post(request))
         .route("/v1/extract", post(extract))

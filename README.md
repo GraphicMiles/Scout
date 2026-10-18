@@ -74,6 +74,9 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 - Summarises a page as a token-cheap digest: title, headings, links, forms with fields, and button labels
 - Speaks MCP over stdio: run scout mcp and any Model Context Protocol client sees every tool
 - Serves its own API document at GET /openapi.json
+- Sessions carry options: a label, a locale sent as Accept-Language and reported by navigator.language, a timezone name, and a proxy
+- Forks a session with POST /v1/sessions/:id/clone: the same cookies, storage and current page under a new id
+- Optional humanize pacing: actions pause 80 to 300ms, fills send one key event per character, scrolls miss the exact pixel
 - Stages files on upload inputs and sends them as multipart/form-data, like a browser
 - Keeps localStorage and sessionStorage per session, across navigations
 - Scrolls pages and delivers key presses and clicks to their scripts, so lazy-loading and search-as-you-type pages work; a click on a plain button runs the page's own click handlers instead of failing
@@ -86,7 +89,7 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 
 ## What it does not do
 
-There is no layout, no CSS cascade, no Web Workers, no IndexedDB. Page event listeners live only inside one script pass, so a scroll, key press or click re-runs the page's own scripts before dispatching; scripts that append unconditionally on load may duplicate content. Script and meta-refresh navigations are followed up to 4 hops, then the last response is returned as-is. ES module imports resolve relative and absolute URLs only: there is no package registry, so `import 'react'` fails with a script error rather than a guess. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
+There is no layout, no CSS cascade, no Web Workers, no IndexedDB. A session's timezone is stored and reported but Date objects stay UTC: there is no timezone engine. Proxies are http/https only, no SOCKS. Page event listeners live only inside one script pass, so a scroll, key press or click re-runs the page's own scripts before dispatching; scripts that append unconditionally on load may duplicate content. Script and meta-refresh navigations are followed up to 4 hops, then the last response is returned as-is. ES module imports resolve relative and absolute URLs only: there is no package registry, so `import 'react'` fails with a script error rather than a guess. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
 
 ## API
 
@@ -99,8 +102,10 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | GET | `/v1/strategies` | Strategies and verification states |
 | GET | `/v1/tools` | Tool manifest |
 | POST | `/v1/tools/call` | Call a tool |
-| POST | `/v1/sessions` | Create a session |
+| POST | `/v1/sessions` | Create a session, optionally with label, locale, timezone, humanize and proxyUrl |
+| GET | `/v1/sessions` | List this key's sessions |
 | DELETE | `/v1/sessions/:id` | Destroy a session |
+| POST | `/v1/sessions/:id/clone` | Fork a session: cookies, storage and page under a new id |
 | POST | `/v1/navigate` | Load a page into a session |
 | POST | `/v1/request` | Raw HTTP request with session cookies |
 | POST | `/v1/extract` | Extract fields from a page |

@@ -8,7 +8,7 @@ use crate::js;
 use crate::metrics::Metrics;
 use crate::resources::ResourceManager;
 use crate::security::{guarded_fetch, Fetched, FetchKind, FetchRequest};
-use crate::session::{CachedFetch, Session, SessionManager};
+use crate::session::{CachedFetch, Session, SessionManager, SessionOpts};
 use crate::tasks::TaskManager;
 use crate::validate::{clamp_timeout, ExtractReq, InteractReq, NavigateReq, TaskReq};
 use crate::worker::{Cmd, ScriptSource, StrategySpec, WorkerPool};
@@ -27,6 +27,9 @@ pub struct Scout {
     pub workers: Arc<WorkerPool>,
     /// Recurring task schedules and their change history.
     pub schedules: Arc<crate::schedules::Scheduler>,
+    /// One HTTP client per distinct proxy URL, so sessions with a proxyUrl
+    /// do not pay a client build per request.
+    proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
     pub client: reqwest::Client,
     /// Handle on the async runtime, so a blocking in-page request issued from a
     /// page worker can drive the same guarded client everything else uses.
@@ -70,6 +73,7 @@ impl Scout {
         let schedules = Arc::new(crate::schedules::Scheduler::new(&cfg));
 
         let scout = Arc::new(Self {
+            proxy_clients: Mutex::new(HashMap::new()),
             cfg: cfg.clone(),
             metrics: metrics.clone(),
             resources,
@@ -117,14 +121,174 @@ impl Scout {
     // ------------------------------------------------------------- sessions
 
     pub fn create_session(&self, owner: &str) -> Result<Value> {
-        let s = self.sessions.create(owner.to_string(), false)?;
+        self.create_session_with(owner, SessionOpts::default())
+    }
+
+    pub fn create_session_with(&self, owner: &str, opts: SessionOpts) -> Result<Value> {
+        // A proxy URL is checked the moment the session is made, not on the
+        // first request: http/https only, and the SSRF policy applies.
+        if let Some(p) = &opts.proxy_url {
+            crate::security::validate_url(p, &self.cfg)?;
+            if !p.starts_with("http://") && !p.starts_with("https://") {
+                return Err(ScoutError::invalid(
+                    "\"proxyUrl\" must be an http or https URL",
+                ));
+            }
+            // Fail fast when the proxy client cannot even be built.
+            self.client_for_proxy(p)?;
+        }
+        let s = self.sessions.create_with(owner.to_string(), false, opts, None)?;
         let idx = self.workers.assign();
         self.routing.lock().unwrap().insert(s.id.clone(), idx);
-        Ok(json!({
+        Ok(self.session_view(&s))
+    }
+
+    /// Fork a session: a new id that starts exactly where the source is,
+    /// cookies and all, so a signed-in session can be reused without
+    /// replaying the login.
+    pub async fn clone_session(&self, owner: &str, id: &str) -> Result<Value> {
+        let src = self.sessions.get(owner, id)?;
+        let worker = self.worker_of(id)?;
+        // Cookies travel by rebuilding the jar from the source's cookie list.
+        // A host-only cookie reports no domain, so the session's own last URL
+        // supplies the host it belongs to.
+        let jar = {
+            let fresh = Arc::new(crate::session::CookieJar::new());
+            let fallback_host = src
+                .referrer()
+                .and_then(|r| url::Url::parse(&r).ok())
+                .map(|u| u.host_str().unwrap_or("localhost").to_string())
+                .unwrap_or_else(|| "localhost".into());
+            for c in src.jar.cookies() {
+                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                let host = c
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .filter(|d| !d.is_empty() && *d != "null")
+                    .map(|d| d.trim_start_matches('.').to_string())
+                    .unwrap_or_else(|| fallback_host.clone());
+                let mut raw = format!("{name}={value}; Path={path}");
+                let mut secure = false;
+                if !host.is_empty() && c.get("domain").and_then(|v| v.as_str()).is_some() {
+                    raw.push_str(&format!("; Domain={host}"));
+                }
+                if c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    raw.push_str("; Secure");
+                    secure = true;
+                }
+                if c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    raw.push_str("; HttpOnly");
+                }
+                let insecure = raw.replace("; Secure", "");
+                // Cookies refuse to land in several picky combinations (https
+                // on a bare IP, Secure over http, Domain on a host-only
+                // name); try the strictest form first and relax in steps.
+                let candidates = [
+                    (format!("https://{host}"), raw.clone()),
+                    (format!("https://{host}"), insecure.clone()),
+                    (format!("http://{host}"), insecure.clone()),
+                    (format!("http://{host}"), format!("{name}={value}; Path={path}")),
+                ];
+                let _ = secure;
+                for (target, line) in candidates {
+                    if fresh.set_cookie(&target, &line) {
+                        break;
+                    }
+                }
+            }
+            fresh
+        };
+        let s = self.sessions.create_with(
+            owner.to_string(),
+            false,
+            src.opts.clone(),
+            Some(jar),
+        )?;
+        // The fork lives on the same worker as the source: its page copy is
+        // a worker-side operation.
+        self.routing.lock().unwrap().insert(s.id.clone(), worker);
+        let had_page: bool = self
+            .workers
+            .call(worker, |reply| Cmd::CloneSession {
+                from: src.id.clone(),
+                to: s.id.clone(),
+                reply,
+            })
+            .await?;
+        let mut v = self.session_view(&s);
+        v["clonedFrom"] = json!(src.id);
+        v["hasPage"] = json!(had_page);
+        Ok(v)
+    }
+
+    /// List a key's sessions.
+    pub fn list_sessions(&self, owner: &str) -> Value {
+        let list = self.sessions.list(owner);
+        json!({
+            "sessions": list.iter().map(|(_, s)| self.session_view(s)).collect::<Vec<_>>(),
+            "count": list.len(),
+        })
+    }
+
+    fn session_view(&self, s: &Session) -> Value {
+        let mut v = json!({
             "id": s.id,
+            "label": s.opts.label,
             "createdAt": crate::logger::iso8601_from_unix_ms(s.created_at),
             "expiresInMs": self.cfg.session_ttl_ms,
-        }))
+            "referrer": s.referrer(),
+        });
+        if s.opts.locale.is_some() || s.opts.timezone.is_some() {
+            v["locale"] = s.opts.locale.clone().into();
+            v["timezone"] = s.opts.timezone.clone().into();
+        }
+        if s.opts.humanize {
+            v["humanize"] = json!(true);
+        }
+        if let Some(p) = &s.opts.proxy_url {
+            v["proxyUrl"] = json!(p);
+        }
+        v
+    }
+
+    /// The client a session's requests go through: the shared one, or one
+    /// bound to the session's proxy.
+    fn client_for(&self, session: &Session) -> reqwest::Client {
+        match &session.opts.proxy_url {
+            None => self.client.clone(),
+            Some(p) => self.client_for_proxy(p).unwrap_or_else(|_| self.client.clone()),
+        }
+    }
+
+    fn client_for_proxy(&self, proxy: &str) -> Result<reqwest::Client> {
+        {
+            let map = self.proxy_clients.lock().unwrap();
+            if let Some(c) = map.get(proxy) {
+                return Ok(c.clone());
+            }
+        }
+        let p = reqwest::Proxy::all(proxy).map_err(|e| {
+            ScoutError::invalid(format!("\"proxyUrl\" is not usable: {e}"))
+        })?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .tcp_nodelay(true)
+            .dns_resolver(Arc::new(crate::security::ValidatingResolver::new(&self.cfg)))
+            .pool_max_idle_per_host(2)
+            .connect_timeout(Duration::from_millis(10_000))
+            .proxy(p)
+            .build()
+            .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("client build failed: {e}")))?;
+        self.proxy_clients
+            .lock()
+            .unwrap()
+            .insert(proxy.to_string(), client.clone());
+        Ok(client)
     }
 
     pub fn destroy_session(&self, owner: &str, id: &str) -> Result<()> {
@@ -189,6 +353,7 @@ impl Scout {
             .call(worker, |reply| Cmd::Load {
                 session: session.id.clone(),
                 fetched: Box::new(fetched),
+                locale: session.opts.locale.clone().unwrap_or_default(),
                 reply,
             })
             .await?;
@@ -420,10 +585,16 @@ impl Scout {
         }
 
         let referer = session.referrer();
+        // The session's language preference rides on every document request,
+        // exactly like a browser profile setting.
+        if let Some(locale) = &session.opts.locale {
+            headers.push(("accept-language".into(), accept_language_value(locale)));
+        }
 
+        let client = self.client_for(session);
         let fut = guarded_fetch(
             &self.cfg,
-            &self.client,
+            &client,
             FetchRequest {
                 url: url.as_str(),
                 method: &nav.method,
@@ -502,8 +673,13 @@ impl Scout {
         base_url: &str,
         stats: std::sync::Arc<Mutex<js::NetStats>>,
     ) -> js::NetFn {
-        let client = self.client.clone();
+        let client = self.client_for(session);
         let cfg = self.cfg.clone();
+        let accept_language = session
+            .opts
+            .locale
+            .as_ref()
+            .map(|l| accept_language_value(l));
         let jar = session.jar.clone();
         let base = base_url.to_string();
         let referer = session.referrer().unwrap_or_else(|| base_url.to_string());
@@ -613,9 +789,13 @@ impl Scout {
             if let Some(ct) = &content_type {
                 headers.push(("content-type".into(), ct.clone()));
             }
+            if let Some(locale) = &session.opts.locale {
+                headers.push(("accept-language".into(), accept_language_value(locale)));
+            }
+            let client = self.client_for(&session);
             let fut = guarded_fetch(
                 &self.cfg,
-                &self.client,
+                &client,
                 FetchRequest {
                     url: &req.url,
                     method: &req.method,
@@ -876,6 +1056,57 @@ impl Scout {
     ) -> Result<Value> {
         let req = &req;
 
+        // Humanize, when the session asked for it: actions arrive on a
+        // human-feeling schedule rather than in one machine burst. A small
+        // pause before the action, key events per character on fills, and a
+        // scroll that does not land on exactly the same pixel every time.
+        if session.opts.humanize {
+            let paced = matches!(
+                req.action.kind.as_str(),
+                "click" | "fill" | "select" | "check" | "uncheck" | "press" | "submit" | "scroll"
+            );
+            if paced {
+                let pause = 80 + (crate::util::now_ms() % 221) as u64;
+                tokio::select! {
+                    biased;
+                    _ = abort.token().cancelled() => return Err(abort.reason()),
+                    _ = tokio::time::sleep(Duration::from_millis(pause)) => {}
+                }
+            }
+            // A fill is typed: one key event per character, up to 64, before
+            // the value itself is set. Listeners that count keys or react per
+            // keystroke see what they would see from a person.
+            if req.action.kind == "fill" {
+                if let Some(text) = req.action.values.first() {
+                    for ch in text.chars().take(64) {
+                        if ch.is_whitespace() {
+                            continue;
+                        }
+                        let url = session.referrer().unwrap_or_default();
+                        let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
+                        let net = if self.cfg.js_network {
+                            Some(self.page_net(&session, &url, net_stats.clone()))
+                        } else {
+                            None
+                        };
+                        let key = if ch == ' ' { "space".to_string() } else { ch.to_string() };
+                        let _ = self
+                            .workers
+                            .call(worker, |reply| Cmd::FireEvent {
+                                session: session.id.clone(),
+                                kind: "press".into(),
+                                key: Some(key),
+                                selector: req.action.selector.clone(),
+                                scroll_px: 0,
+                                net,
+                                reply,
+                            })
+                            .await?;
+                    }
+                }
+            }
+        }
+
         // Scroll and non-Enter key presses are delivered to the page's scripts:
         // they re-run first (so their listeners exist in the fresh context),
         // then the event is dispatched and the DOM is rebuilt from the result.
@@ -897,6 +1128,13 @@ impl Scout {
                 .first()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(800);
+            // Humanized scrolls miss the exact pixel: plus or minus 15%.
+            let scroll_px = if session.opts.humanize && scroll_px > 0 {
+                let jitter = 85 + (crate::util::now_ms() % 31) as u64;
+                (scroll_px * jitter / 100).max(1)
+            } else {
+                scroll_px
+            };
             let url = session.referrer().unwrap_or_default();
             let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
             let net = if self.cfg.js_network {
@@ -1688,6 +1926,17 @@ impl Scout {
 #[allow(dead_code)]
 fn _order() -> Ordering {
     Ordering::SeqCst
+}
+
+/// The Accept-Language value for a locale tag: `en-GB` becomes
+/// `en-GB,en;q=0.9`, the shape browsers send.
+fn accept_language_value(locale: &str) -> String {
+    let primary = locale.split('-').next().unwrap_or(locale);
+    if primary.eq_ignore_ascii_case(locale) {
+        locale.to_string()
+    } else {
+        format!("{locale},{primary};q=0.9")
+    }
 }
 
 #[cfg(test)]

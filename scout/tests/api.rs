@@ -775,6 +775,96 @@ async fn openapi_document_is_served() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn humanized_sessions_act_the_same_only_slower() {
+    let h = harness().await;
+    let (status, sess) = h
+        .post("/v1/sessions", json!({ "humanize": true, "label": "slow hand" }))
+        .await;
+    assert_eq!(status, 201, "{sess}");
+    assert_eq!(sess["humanize"], true);
+    let sid = sess["id"].as_str().unwrap().to_string();
+
+    let (status, _) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/", h.fixture) }))
+        .await;
+    assert_eq!(status, 200);
+
+    // A fill still lands, key events and all; it just takes a moment.
+    let started = std::time::Instant::now();
+    let (status, fill) = h
+        .post(
+            "/v1/interact",
+            json!({ "sessionId": sid, "action": { "type": "fill", "selector": "input[name=q]", "value": "typed like a person" } }),
+        )
+        .await;
+    assert_eq!(status, 200, "humanized fill failed: {fill}");
+    assert!(started.elapsed().as_millis() >= 80, "humanize pacing did not happen");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_labels_cloning_locale_and_listing() {
+    let h = harness().await;
+
+    // Create with a label, a locale and a timezone.
+    let (status, sess) = h
+        .post(
+            "/v1/sessions",
+            json!({ "label": "watchtower", "locale": "en-GB", "timezone": "Europe/Lagos" }),
+        )
+        .await;
+    assert_eq!(status, 201, "{sess}");
+    let sid = sess["id"].as_str().unwrap().to_string();
+    assert_eq!(sess["label"], "watchtower");
+    assert_eq!(sess["locale"], "en-GB");
+    assert_eq!(sess["timezone"], "Europe/Lagos");
+
+    // The locale reaches the page: the fixture echoes request headers, and
+    // page scripts see navigator.language.
+    let (status, nav) = h
+        .post("/v1/navigate", json!({ "sessionId": sid, "url": format!("{}/setcookie", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "{nav}");
+    let (status, ev) = h
+        .post("/v1/eval", json!({ "sessionId": sid, "script": "return navigator.language + '|' + navigator.languages.join(',');" }))
+        .await;
+    assert_eq!(status, 200, "{ev}");
+    let langs = ev["value"].as_str().unwrap_or_default().to_string();
+    assert_eq!(langs, "en-GB|en-GB,en", "navigator languages: {langs}");
+
+    // Listing shows the label and referrer.
+    let (status, list) = h.get("/v1/sessions").await;
+    assert_eq!(status, 200, "{list}");
+    let mine = list["sessions"].as_array().unwrap();
+    assert!(mine.iter().any(|s| s["id"] == sid.as_str() && s["label"] == "watchtower"), "list: {list}");
+
+    // Clone: same cookies, same page, new id.
+    let (status, clone) = h.post(&format!("/v1/sessions/{sid}/clone"), json!({})).await;
+    assert_eq!(status, 201, "clone failed: {clone}");
+    let cid = clone["id"].as_str().unwrap().to_string();
+    assert_ne!(cid, sid);
+    assert_eq!(clone["label"], "watchtower");
+    assert_eq!(clone["hasPage"], true);
+    // The clone sees the same page text.
+    let (_, a) = h.post("/v1/tools/call", json!({ "name": "page.text", "arguments": { "sessionId": cid } })).await;
+    let (_, b) = h.post("/v1/tools/call", json!({ "name": "page.text", "arguments": { "sessionId": sid } })).await;
+    assert_eq!(a["text"], b["text"], "clone page differs");
+
+    // The clone inherited the session cookie from /setcookie.
+    let (status, nav2) = h
+        .post("/v1/navigate", json!({ "sessionId": cid, "url": format!("{}/needs-cookie", h.fixture) }))
+        .await;
+    assert_eq!(status, 200, "{nav2}");
+    let (_, t) = h.post("/v1/tools/call", json!({ "name": "page.text", "arguments": { "sessionId": cid } })).await;
+    assert!(t["text"].as_str().unwrap_or("").contains("authorised"), "cookie did not survive the clone: {t}");
+
+    // Validation: a bad locale and a socks proxy are refused.
+    let (status, body) = h.post("/v1/sessions", json!({ "locale": "e" })).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = h.post("/v1/sessions", json!({ "proxyUrl": "socks5://127.0.0.1:1080" })).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn webhooks_and_recurring_schedules() {
     let h = harness().await;
 
