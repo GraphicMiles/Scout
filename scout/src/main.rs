@@ -5,6 +5,26 @@ use scout::server;
 use std::sync::atomic::Ordering;
 
 fn main() {
+    // `scout mcp`: Model Context Protocol over stdio. The HTTP server still
+    // runs, on a private loopback port, and the bridge talks to it.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Scout could not start the async runtime: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = runtime.block_on(scout::mcp::run()) {
+            eprintln!("Scout mcp bridge error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {

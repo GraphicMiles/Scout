@@ -223,7 +223,7 @@ async fn handle(
     _started: Instant,
 ) -> Result<Response> {
     let path = req.uri().path().to_string();
-    let is_public = path == "/health";
+    let is_public = path == "/health" || path == "/openapi.json";
     let is_metrics = path == "/metrics";
 
     if !is_public {
@@ -290,6 +290,7 @@ fn route_name(method: &Method, path: &str) -> &'static str {
         ("GET", "/health") => "health",
         ("GET", "/metrics") => "metrics",
         ("GET", "/v1/strategies") => "strategies",
+        ("GET", "/openapi.json") => "openapi",
         ("POST", "/v1/sessions") => "sessions.create",
         ("POST", "/v1/navigate") => "navigate",
         ("POST", "/v1/extract") => "extract",
@@ -364,6 +365,120 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
 async fn strategies() -> Response {
     Json(crate::adapters::list_json()).into_response()
+}
+
+/// The API surface, hand-written: the file is small, needs no dependency, and
+/// stays in step with the routes above because it lives next to them.
+async fn openapi(State(state): State<AppState>) -> Response {
+    let sid = json!({ "type": "string", "description": "A session id from POST /v1/sessions" });
+    let error_schema = json!({
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "retryable": { "type": "boolean" }
+                }
+            }
+        }
+    });
+    let body_of = |props: Value, required: Vec<&str>| {
+        json!({
+            "type": "object",
+            "properties": props,
+            "required": required,
+        })
+    };
+    let op = |summary: &str, body: Option<Value>| {
+        let mut v = json!({ "summary": summary, "responses": {
+            "200": { "description": "Success" },
+            "default": { "description": "Error", "content": { "application/json": { "schema": error_schema.clone() } } }
+        }});
+        if let Some(b) = body {
+            v["requestBody"] = json!({
+                "required": true,
+                "content": { "application/json": { "schema": b } }
+            });
+        }
+        v
+    };
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Scout",
+            "version": state.cfg.version,
+            "description": "Headless page automation: fetch, run page scripts in a sandboxed engine, interact, extract, and run multi-step tasks.",
+        },
+        "servers": [{ "url": "/" }],
+        "paths": {
+            "/health": { "get": op("Liveness and version", None) },
+            "/openapi.json": { "get": op("This document", None) },
+            "/v1/sessions": {
+                "post": op("Create a session", Some(body_of(json!({ "label": { "type": "string" } }), vec![]))),
+            },
+            "/v1/sessions/{id}": { "delete": op("Destroy a session", None) },
+            "/v1/navigate": {
+                "post": op("Load a page into a session", Some(body_of(json!({
+                    "sessionId": sid,
+                    "url": { "type": "string", "format": "uri" },
+                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] },
+                    "body": { "type": "string" },
+                    "contentType": { "type": "string" },
+                    "timeoutMs": { "type": "integer" },
+                }), vec!["url"]))),
+            },
+            "/v1/request": {
+                "post": op("Raw HTTP request with the session's cookies", Some(body_of(json!({
+                    "sessionId": sid,
+                    "url": { "type": "string", "format": "uri" },
+                    "method": { "type": "string" },
+                    "headers": { "type": "object" },
+                    "body": { "type": "string" },
+                }), vec!["url"]))),
+            },
+            "/v1/extract": {
+                "post": op("Extract structured data with a strategy or a selector schema", Some(body_of(json!({
+                    "sessionId": sid,
+                    "url": { "type": "string", "format": "uri" },
+                    "strategy": { "type": "string" },
+                    "schema": { "type": "object" },
+                    "limit": { "type": "integer" },
+                }), vec![]))),
+            },
+            "/v1/interact": {
+                "post": op("Click, fill, select, check, press, submit, scroll, upload, wait, back, forward", Some(body_of(json!({
+                    "sessionId": sid,
+                    "action": { "type": "object", "description": "See /v1/tools for the action schemas" },
+                }), vec!["sessionId", "action"]))),
+            },
+            "/v1/eval": {
+                "post": op("Run JavaScript against a loaded page", Some(body_of(json!({
+                    "sessionId": sid,
+                    "script": { "type": "string" },
+                }), vec!["sessionId", "script"]))),
+            },
+            "/v1/tasks": {
+                "post": op("Submit a multi-step task; steps may name results with as and reference them as {{name}}", Some(body_of(json!({
+                    "sessionId": sid,
+                    "steps": { "type": "array", "items": { "type": "object" } },
+                    "timeoutMs": { "type": "integer" },
+                    "retries": { "type": "integer" },
+                }), vec!["steps"]))),
+            },
+            "/v1/tasks/{id}": { "get": op("Task status and result", None) },
+            "/v1/tasks/{id}/cancel": { "post": op("Cancel a queued or running task", None) },
+            "/v1/tools": { "get": op("Tool manifest for agents", None) },
+            "/v1/tools/call": {
+                "post": op("Call a tool by name", Some(body_of(json!({
+                    "name": { "type": "string" },
+                    "arguments": { "type": "object" },
+                }), vec!["name"]))),
+            },
+        },
+    });
+    Json(spec).into_response()
 }
 
 /// Machine-readable tool manifest, so an agent can discover the surface
@@ -569,7 +684,7 @@ async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>, req:
 
 async fn not_found(method: Method, uri: axum::http::Uri) -> Response {
     let allow = match uri.path() {
-        "/health" | "/metrics" | "/v1/strategies" => "GET",
+        "/health" | "/metrics" | "/v1/strategies" | "/openapi.json" => "GET",
         "/v1/sessions" | "/v1/navigate" | "/v1/extract" | "/v1/interact" | "/v1/eval" | "/v1/tasks" => "POST",
         p if p.starts_with("/v1/sessions/") => "DELETE",
         p if p.starts_with("/v1/tasks/") => "GET, POST",
@@ -593,6 +708,7 @@ pub fn build_router(state: AppState) -> Router {
     let mw = state.clone();
     Router::new()
         .route("/health", get(health))
+        .route("/openapi.json", get(openapi))
         .route("/metrics", get(metrics))
         .route("/v1/strategies", get(strategies))
         .route("/v1/tools", get(tools_manifest))

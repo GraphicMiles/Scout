@@ -661,6 +661,80 @@ async fn script_navigation_meta_refresh_clicks_waits_and_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_step_bindings_and_interpolation() {
+    let h = harness().await;
+
+    // Step 1 names its result; step 2 builds a URL from it.
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({
+                "steps": [
+                    { "op": "navigate", "url": format!("{}/json", h.fixture), "as": "first" },
+                    { "op": "extract", "url": "{{first.url}}", "strategy": "generic-page", "as": "page" },
+                    { "op": "navigate", "url": "{{first.url}}" },
+                ],
+                "timeoutMs": 20000,
+            }),
+        )
+        .await;
+    assert_eq!(status, 202, "task submit failed: {body}");
+    let task_id = body["id"].as_str().unwrap().to_string();
+
+    // Wait for the task to finish.
+    let mut final_state = None;
+    for _ in 0..100 {
+        let (_, t) = h.get(&format!("/v1/tasks/{task_id}")).await;
+        let finished = matches!(
+            t["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled" | "timed_out")
+        );
+        if finished {
+            final_state = Some(t);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let t = final_state.expect("task never finished");
+    assert_eq!(t["status"], "succeeded", "task failed: {t}");
+    let steps = t["result"]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0]["as"], "first");
+    assert_eq!(steps[1]["as"], "page");
+    assert!(steps[2].get("as").is_none());
+    // The bound navigate result carried the fixture's JSON page URL.
+    let bound_url = steps[0]["result"]["url"].as_str().unwrap().to_string();
+    assert!(bound_url.ends_with("/json"), "bound url: {bound_url}");
+    // The interpolated extract step ran against that same URL: a literal
+    // "{{first.url}}" would have failed navigation and failed the task, so a
+    // succeeded extract step with data is proof the value was substituted.
+    assert_eq!(steps[1]["ok"], true, "extract step failed: {}", steps[1]);
+    assert!(steps[1]["result"].get("data").is_some(), "extract result: {}", steps[1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openapi_document_is_served() {
+    let h = harness().await;
+    let (status, doc) = h.get("/openapi.json").await;
+    assert_eq!(status, 200, "openapi: {doc}");
+    assert_eq!(doc["openapi"], "3.1.0");
+    assert_eq!(doc["info"]["title"], "Scout");
+    let paths = doc["paths"].as_object().unwrap();
+    for must in ["/health", "/v1/sessions", "/v1/navigate", "/v1/interact", "/v1/tasks", "/v1/tools/call"] {
+        assert!(paths.contains_key(must), "openapi missing {must}");
+    }
+    // Unknown as-names are still rejected at submit time.
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({ "steps": [{ "op": "navigate", "url": "https://example.com/", "as": "1bad name" }] }),
+        )
+        .await;
+    assert_eq!(status, 400, "bad as accepted: {body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conditional_fetch_and_page_digest() {
     let h = harness().await;
     let (status, sess) = h.post("/v1/sessions", json!({})).await;

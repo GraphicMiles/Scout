@@ -1222,6 +1222,74 @@ impl Scout {
 
     // --------------------------------------------------------------- tasks
 
+    /// Look up `name` or `name.path.to.value` (array indices allowed) in the
+    /// step variables.
+    fn var_lookup(vars: &std::collections::HashMap<String, Value>, path: &str) -> Option<Value> {
+        let mut parts = path.split('.');
+        let first = parts.next()?;
+        let mut cur = vars.get(first)?;
+        for p in parts {
+            cur = match p.parse::<usize>() {
+                Ok(i) => cur.get(i)?,
+                Err(_) => cur.get(p)?,
+            };
+        }
+        Some(cur.clone())
+    }
+
+    /// Replace `{{name}}` / `{{name.path}}` in every string of a step's
+    /// parameters. A string that is exactly one reference takes the value's
+    /// type; a string with embedded references gets them stringified in place.
+    fn interpolate_vars(v: &Value, vars: &std::collections::HashMap<String, Value>) -> Value {
+        match v {
+            Value::String(s) => {
+                if let Some(name) = s
+                    .strip_prefix("{{")
+                    .and_then(|x| x.strip_suffix("}}"))
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty() && !n.contains("{{"))
+                {
+                    if let Some(val) = Self::var_lookup(vars, name) {
+                        return val;
+                    }
+                }
+                if !s.contains("{{") {
+                    return v.clone();
+                }
+                let mut out = String::new();
+                let mut rest = s.as_str();
+                while let Some(start) = rest.find("{{") {
+                    out.push_str(&rest[..start]);
+                    let after = &rest[start + 2..];
+                    match after.find("}}") {
+                        Some(end) => {
+                            let name = after[..end].trim();
+                            match Self::var_lookup(vars, name) {
+                                Some(Value::String(t)) => out.push_str(&t),
+                                Some(other) => out.push_str(&other.to_string()),
+                                None => out.push_str(&rest[start..start + 2 + end + 2]),
+                            }
+                            rest = &after[end + 2..];
+                        }
+                        None => {
+                            out.push_str(rest);
+                            rest = "";
+                        }
+                    }
+                }
+                out.push_str(rest);
+                Value::String(out)
+            }
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), Self::interpolate_vars(v, vars)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(|v| Self::interpolate_vars(v, vars)).collect()),
+            other => other.clone(),
+        }
+    }
+
     pub fn submit_task(self: &Arc<Self>, owner: &str, req: TaskReq) -> Result<Value> {
         // Validate sessions up front so an unknown session is a 404 at submit
         // time rather than a task that fails asynchronously.
@@ -1261,11 +1329,17 @@ impl Scout {
             let mut steps: Vec<Value> = Vec::new();
             let mut data: Option<Value> = None;
 
+            // Named step results, for `{{name}}` interpolation in later steps.
+            let mut vars: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
             for (index, step) in req.steps.iter().enumerate() {
                 if abort.is_cancelled() {
                     return Err(abort.reason());
                 }
                 let started = std::time::Instant::now();
+                // Interpolate `{{name}}` and `{{name.path}}` references into a
+                // local copy of the step's parameters. Unknown names stay as
+                // written; the step's own validation then reports the problem.
+                let step_params = Self::interpolate_vars(&step.params, &vars);
                 // Each step runs inside its own future so that a `?` inside an
                 // arm reports the *step* that failed rather than escaping the
                 // loop and losing the step index.
@@ -1277,14 +1351,13 @@ impl Scout {
                         // which (like Node's `parseNavigate`) expects a session to
                         // come from the caller.
                         let nav = NavigateReq {
-                            url: step
-                                .params
+                            url: step_params
                                 .get("url")
                                 .and_then(|u| u.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
                             session_id: Some(session.id.clone()),
-                            timeout_ms: step.params.get("timeoutMs").and_then(|t| t.as_u64()),
+                            timeout_ms: step_params.get("timeoutMs").and_then(|t| t.as_u64()),
                             method: "GET".into(),
                             body: None,
                             content_type: None,
@@ -1293,7 +1366,7 @@ impl Scout {
                     }
                     "extract" => {
                         let mut er = {
-                            let mut probe = step.params.clone();
+                            let mut probe = step_params.clone();
                             if !probe.get("url").is_some() {
                                 if let Some(o) = probe.as_object_mut() {
                                     o.insert("sessionId".into(), json!(session.id));
@@ -1354,7 +1427,7 @@ impl Scout {
                         let req = InteractReq {
                             session_id: session.id.clone(),
                             action: {
-                                let mut probe = step.params.clone();
+                                let mut probe = step_params.clone();
                                 if let Some(o) = probe.as_object_mut() {
                                     o.insert("sessionId".into(), json!(session.id));
                                 }
@@ -1376,13 +1449,22 @@ impl Scout {
                 .await;
 
                 match outcome {
-                    Ok(v) => steps.push(json!({
-                        "index": index,
-                        "op": step.op,
-                        "ok": true,
-                        "durationMs": started.elapsed().as_millis() as u64,
-                        "result": v,
-                    })),
+                    Ok(v) => {
+                        if let Some(name) = &step.as_name {
+                            vars.insert(name.clone(), v.clone());
+                        }
+                        let mut entry = json!({
+                            "index": index,
+                            "op": step.op,
+                            "ok": true,
+                            "durationMs": started.elapsed().as_millis() as u64,
+                            "result": v,
+                        });
+                        if let Some(name) = &step.as_name {
+                            entry["as"] = json!(name);
+                        }
+                        steps.push(entry);
+                    }
                     Err(e) => {
                         return Err(ScoutError::new(e.code, e.message)
                             .with_retryable(e.retryable)
@@ -1493,4 +1575,53 @@ impl Scout {
 #[allow(dead_code)]
 fn _order() -> Ordering {
     Ordering::SeqCst
+}
+
+#[cfg(test)]
+mod step_var_tests {
+    use super::Scout;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn vars() -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert("page".to_string(), json!({ "url": "https://example.com/a", "status": 200 }));
+        m.insert("rows".to_string(), json!(["one", "two"]));
+        m.insert("count".to_string(), json!(7));
+        m
+    }
+
+    #[test]
+    fn whole_reference_keeps_the_type() {
+        let out = Scout::interpolate_vars(&json!("{{page.url}}"), &vars());
+        assert_eq!(out, json!("https://example.com/a"));
+        let out = Scout::interpolate_vars(&json!("{{count}}"), &vars());
+        assert_eq!(out, json!(7));
+    }
+
+    #[test]
+    fn embedded_references_are_stringified() {
+        let out = Scout::interpolate_vars(&json!("got {{count}} rows"), &vars());
+        assert_eq!(out, json!("got 7 rows"));
+    }
+
+    #[test]
+    fn array_paths_and_unknown_names() {
+        let out = Scout::interpolate_vars(&json!("{{rows.1}}"), &vars());
+        assert_eq!(out, json!("two"));
+        // Unknown names stay exactly as written.
+        let out = Scout::interpolate_vars(&json!("{{missing.name}}"), &vars());
+        assert_eq!(out, json!("{{missing.name}}"));
+        // A ref that resolves partway stays too.
+        let out = Scout::interpolate_vars(&json!("x {{page.nope}} y"), &vars());
+        assert_eq!(out, json!("x {{page.nope}} y"));
+    }
+
+    #[test]
+    fn interpolation_reaches_nested_params() {
+        let step = json!({ "url": "{{page.url}}?page={{count}}", "opts": { "tag": "{{rows.0}}" } });
+        let out = Scout::interpolate_vars(&step, &vars());
+        assert_eq!(out["url"], json!("https://example.com/a?page=7"));
+        assert_eq!(out["opts"]["tag"], json!("one"));
+    }
 }
