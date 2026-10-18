@@ -78,6 +78,7 @@ fn main() {
         }
 
         let sweeper = scout::scout::spawn_session_sweeper(scout.clone());
+        let ticker = scout::schedules::spawn_ticker(scout.clone());
 
         shutdown_signal().await;
         scout::logger::info("shutting down", serde_json::json!({ "signal": "terminate" }));
@@ -97,6 +98,7 @@ fn main() {
             scout::logger::warn("shutdown grace period elapsed", serde_json::json!({}));
         }
         sweeper.abort();
+        ticker.abort();
         server_task.abort();
     });
 }

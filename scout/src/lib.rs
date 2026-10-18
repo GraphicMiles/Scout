@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod mcp;
 pub mod page;
 pub mod resources;
+pub mod schedules;
 pub mod scout;
 pub mod server;
 pub mod security;

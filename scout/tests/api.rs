@@ -21,6 +21,8 @@ struct Harness {
     fixture: String,
     scout: Arc<scout::scout::Scout>,
     client: reqwest::Client,
+    /// Webhooks received by the fixture's /hook route: (body, signature).
+    hooks: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl Harness {
@@ -35,6 +37,19 @@ impl Harness {
         let status = r.status().as_u16();
         let body = r.json().await.unwrap_or(Value::Null);
         (status, body)
+    }
+
+    async fn reqwest_delete(&self, path: &str) -> (u16, Value) {
+        let r = self
+            .client
+            .delete(format!("{}{}", self.base, path))
+            .bearer_auth(KEY)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap_or_default();
+        (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
@@ -57,6 +72,10 @@ impl Harness {
 /// The fixture listener task is intentionally left running: `tokio::spawn`
 /// keeps it alive for the duration of the test's runtime.
 async fn harness() -> Harness {
+    // Every webhook the tests fire lands here, with its signature.
+    let hook_hits: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let fixture = Router::new()
         .route("/", get(|| async { Html(FIXTURE_HTML) }))
         .route("/deep", get(|| async { Html(FIXTURE_HTML) }))
@@ -146,6 +165,25 @@ async fn harness() -> Harness {
                     "export function label() { return 'module chain ok'; }",
                 )
             }),
+        )
+        // Webhook receiver: records every POST for the callback tests.
+        .route(
+            "/hook",
+            {
+                let hits = hook_hits.clone();
+                post(move |headers: axum::http::HeaderMap, body: String| {
+                let hits = hits.clone();
+                async move {
+                    let sig = headers
+                        .get("x-scout-signature")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    hits.lock().unwrap().push((body, sig));
+                    axum::http::StatusCode::OK
+                }
+                })
+            },
         )
         // Conditional fetch: serves an ETag and honours If-None-Match.
         .route("/etag", get(|headers: axum::http::HeaderMap| async move {
@@ -301,11 +339,13 @@ async fn harness() -> Harness {
     cfg.youtube_hosts = vec!["127.0.0.1".into()];
 
     let (scout, _server_task, local) = scout::server::start(cfg).await.unwrap();
+    let _ticker = scout::schedules::spawn_ticker(scout.clone());
     Harness {
         base: format!("http://127.0.0.1:{}", local.port()),
         fixture: format!("http://{}:{}", fixture_addr.ip(), fixture_addr.port()),
         scout,
         client: reqwest::Client::new(),
+        hooks: hook_hits,
     }
 }
 
@@ -530,7 +570,7 @@ async fn script_navigation_meta_refresh_clicks_waits_and_history() {
     let sid = sess["id"].as_str().unwrap().to_string();
 
     let text_of = |h: &Harness, sid: &str| {
-        let h = Harness { base: h.base.clone(), fixture: h.fixture.clone(), scout: h.scout.clone(), client: h.client.clone() };
+        let h = Harness { base: h.base.clone(), fixture: h.fixture.clone(), scout: h.scout.clone(), client: h.client.clone(), hooks: h.hooks.clone() };
         let sid = sid.to_string();
         async move {
             let (_, out) = h
@@ -732,6 +772,148 @@ async fn openapi_document_is_served() {
         .await;
     assert_eq!(status, 400, "bad as accepted: {body}");
     assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhooks_and_recurring_schedules() {
+    let h = harness().await;
+
+    // 1. A one-shot task with a signed callback.
+    let secret = "whsec_test_0123456789";
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({
+                "steps": [
+                    { "op": "navigate", "url": format!("{}/json", h.fixture) },
+                    { "op": "extract", "strategy": "generic-page", "as": "page" },
+                ],
+                "callbackUrl": format!("{}/hook", h.fixture),
+                "callbackSecret": secret,
+                "timeoutMs": 20000,
+            }),
+        )
+        .await;
+    assert_eq!(status, 202, "task submit: {body}");
+    let task_id = body["id"].as_str().unwrap().to_string();
+
+    // Wait for the webhook.
+    let mut hit: Option<(String, String)> = None;
+    for _ in 0..100 {
+        let hits = h.hooks.lock().unwrap();
+        if let Some(x) = hits.first().cloned() {
+            hit = Some(x);
+            break;
+        }
+        drop(hits);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (raw, sig) = hit.expect("webhook never arrived");
+    let payload: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(payload["type"], "task");
+    assert_eq!(payload["task"]["id"], task_id);
+    assert_eq!(payload["task"]["status"], "succeeded");
+    // The signature is verifiable from the raw bytes and the secret.
+    assert_eq!(
+        sig,
+        format!("sha256={}", scout::schedules::hmac_sha256_hex(secret, raw.as_bytes())),
+        "signature must be HMAC-SHA256 of the exact body"
+    );
+
+    // 2. A recurring schedule: first run fires immediately, changed is true.
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({
+                "steps": [{ "op": "navigate", "url": format!("{}/json", h.fixture) }],
+                "everyMs": 60000,
+                "callbackUrl": format!("{}/hook", h.fixture),
+                "callbackSecret": secret,
+                "timeoutMs": 20000,
+            }),
+        )
+        .await;
+    assert_eq!(status, 202, "schedule submit: {body}");
+    assert!(body["id"].as_str().unwrap().starts_with("sch_"), "not a schedule: {body}");
+    assert_eq!(body["everyMs"], 60000);
+    let sch_id = body["id"].as_str().unwrap().to_string();
+
+    // The first run happens in the background: poll the schedule view.
+    let mut view = None;
+    for _ in 0..150 {
+        let (_, v) = h.get(&format!("/v1/schedules/{sch_id}")).await;
+        if v.get("runs").and_then(|r| r.as_u64()).unwrap_or(0) >= 1 {
+            view = Some(v);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let v = view.expect("schedule never ran");
+    assert_eq!(v["lastStatus"], "succeeded", "schedule run: {v}");
+    assert_eq!(v["changed"], true, "first run is news: {v}");
+    assert_eq!(v["runs"], 1);
+
+    // The change callback arrived too.
+    let mut run_hit: Option<(String, String)> = None;
+    for _ in 0..50 {
+        let hits = h.hooks.lock().unwrap();
+        if let Some(x) = hits.get(1).cloned() {
+            run_hit = Some(x);
+            break;
+        }
+        drop(hits);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (raw2, sig2) = run_hit.expect("schedule webhook never arrived");
+    let payload2: Value = serde_json::from_str(&raw2).unwrap();
+    assert_eq!(payload2["type"], "schedule.run");
+    assert_eq!(payload2["scheduleId"], sch_id);
+    assert_eq!(payload2["changed"], true);
+    assert_eq!(
+        sig2,
+        format!("sha256={}", scout::schedules::hmac_sha256_hex(secret, raw2.as_bytes()))
+    );
+
+    // 3. Listing and deletion.
+    let (_, list) = h.get("/v1/schedules").await;
+    assert!(list["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == sch_id.as_str()));
+
+    let (status, _) = h
+        .reqwest_delete(&format!("/v1/schedules/{sch_id}"))
+        .await;
+    assert_eq!(status, 204);
+    let (status, gone) = h.get(&format!("/v1/schedules/{sch_id}")).await;
+    assert_eq!(status, 404);
+    assert_eq!(gone["error"]["code"], "not_found");
+
+    // 4. Validation: everyMs below the floor and a bogus callback are refused.
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({
+                "steps": [{ "op": "navigate", "url": "https://example.com/" }],
+                "everyMs": 100,
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "tiny everyMs accepted: {body}");
+    let (status, body) = h
+        .post(
+            "/v1/tasks",
+            json!({
+                "steps": [{ "op": "navigate", "url": "https://example.com/" }],
+                "callbackUrl": "ftp://nope.example/x",
+            }),
+        )
+        .await;
+    assert!(
+        status == 400 || status == 403,
+        "bad callbackUrl accepted: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::error::{ErrorCode, Result, ScoutError};
 use crate::extract::Schema;
 use crate::interaction::Action;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Node caps a task at 20 steps; keep the same ceiling so a spec that a Node
 /// deployment rejects is not quietly accepted here.
@@ -355,11 +355,21 @@ pub struct TaskReq {
     pub session_id: Option<String>,
     pub retries: Option<u32>,
     pub timeout_ms: Option<u64>,
+    /// Present means recurring: the task runs now, then every interval.
+    pub every_ms: Option<u64>,
+    /// Signed webhook to POST when the task finishes (or, when recurring,
+    /// when a run's result changed).
+    pub callback_url: Option<String>,
+    pub callback_secret: Option<String>,
 }
 
 pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
     let m = obj(v, "body")?;
-    unknown(m, &["sessionId", "steps", "timeoutMs", "retries"], "body")?;
+    unknown(
+        m,
+        &["sessionId", "steps", "timeoutMs", "retries", "everyMs", "callbackUrl", "callbackSecret"],
+        "body",
+    )?;
 
     let steps = match m.get("steps").and_then(|s| s.as_array()) {
         Some(list) if !list.is_empty() && list.len() <= MAX_TASK_STEPS => list,
@@ -480,12 +490,79 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
         other => other,
     };
 
+    let every_ms = match opt_u64(m, "everyMs")? {
+        None => None,
+        Some(ms) if (5_000..=86_400_000).contains(&ms) => Some(ms),
+        Some(_) => {
+            return Err(ScoutError::invalid(
+                "\"everyMs\" must be between 5000 (5s) and 86400000 (24h)",
+            )
+            .with_details(serde_json::json!({ "field": "everyMs" })))
+        }
+    };
+    let callback_url = match m.get("callbackUrl") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(u)) if u.chars().count() <= 2048 => {
+            // Same policy as any other outbound URL: scheme, port and private
+            // ranges all checked here so a webhook cannot be an SSRF trampoline.
+            crate::security::validate_url(u, cfg)?;
+            Some(u.clone())
+        }
+        Some(_) => {
+            return Err(ScoutError::invalid("\"callbackUrl\" must be a URL string")
+                .with_details(serde_json::json!({ "field": "callbackUrl" })))
+        }
+    };
+    let callback_secret = match m.get("callbackSecret") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.chars().count() <= 256 => Some(s.clone()),
+        Some(_) => {
+            return Err(ScoutError::invalid(
+                "\"callbackSecret\" must be a string up to 256 characters",
+            )
+            .with_details(serde_json::json!({ "field": "callbackSecret" })))
+        }
+    };
+
     Ok(TaskReq {
         steps: out,
         session_id: session_id(m, false)?,
         retries,
         timeout_ms,
+        every_ms,
+        callback_url,
+        callback_secret,
     })
+}
+
+impl TaskReq {
+    /// The task body a schedule re-runs: everything except the schedule-only
+    /// fields, serialised so it can be validated afresh on every run.
+    pub fn to_spec(&self) -> Value {
+        let steps: Vec<Value> = self
+            .steps
+            .iter()
+            .map(|s| {
+                let mut o = s.params.as_object().cloned().unwrap_or_default();
+                o.insert("op".into(), json!(s.op));
+                if let Some(name) = &s.as_name {
+                    o.insert("as".into(), json!(name));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        let mut spec = json!({ "steps": steps });
+        if let Some(sid) = &self.session_id {
+            spec["sessionId"] = json!(sid);
+        }
+        if let Some(r) = self.retries {
+            spec["retries"] = json!(r);
+        }
+        if let Some(t) = self.timeout_ms {
+            spec["timeoutMs"] = json!(t);
+        }
+        spec
+    }
 }
 
 /// Clamp a requested timeout to the configured ceiling.
