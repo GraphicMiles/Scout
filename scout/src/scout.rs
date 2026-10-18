@@ -347,6 +347,13 @@ impl Scout {
         }
         let page_url = fetched.url.clone();
 
+        // One level of iframe folding: up to 3 same-or-cross-origin frames
+        // are fetched (through the same guarded client, so the SSRF policy
+        // applies) and their HTML is placed inside the iframe element, where
+        // selectors can reach it. The frame element remembers its source in
+        // data-frame-src.
+        let fold_warnings = self.fold_iframes(&session, &mut fetched, timeout, &abort).await;
+
         // Parsing and DOM construction happen on the page worker.
         let loaded = self
             .workers
@@ -359,6 +366,17 @@ impl Scout {
             .await?;
 
         let mut summary = loaded.summary;
+        if !fold_warnings.is_empty() {
+            if let Some(obj) = summary.as_object_mut() {
+                let mut all = obj
+                    .get("warnings")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                all.extend(fold_warnings);
+                obj.insert("warnings".into(), json!(all));
+            }
+        }
         if refresh_hops > 0 {
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("metaRefreshHops".into(), json!(refresh_hops));
@@ -659,6 +677,117 @@ impl Scout {
         Ok(result)
     }
 
+    /// Fold up to 3 iframe sources into the document body, one level deep.
+    /// Frame bodies are fetched with the session's cookies and the guarded
+    /// client; non-HTML frames and frames over the byte budget are skipped
+    /// with a warning rather than failing the page.
+    async fn fold_iframes(
+        &self,
+        session: &Session,
+        fetched: &mut Fetched,
+        timeout_ms: u64,
+        abort: &Abort,
+    ) -> Vec<Value> {
+        // Only HTML documents can carry iframes worth folding.
+        if !fetched.content_type.contains("html") {
+            return Vec::new();
+        }
+        let tags = iframe_tags(&fetched.body, 3);
+        if tags.is_empty() {
+            return Vec::new();
+        }
+        let client = self.client_for(session);
+        let mut warnings = Vec::new();
+        let mut body = fetched.body.clone();
+        // Splice from the last tag to the first so earlier offsets stay valid.
+        for (start, end, url) in tags.into_iter().rev() {
+            if abort.is_cancelled() {
+                break;
+            }
+            // Frame sources may be relative; resolve them against the page.
+            let absolute = url::Url::parse(&fetched.url)
+                .and_then(|base| base.join(&url))
+                .ok()
+                .filter(|u| matches!(u.scheme(), "http" | "https"));
+            let Some(absolute) = absolute else {
+                continue;
+            };
+            let url = absolute.as_str().to_string();
+            let req_url = match crate::security::validate_url(&url, &self.cfg) {
+                Ok(u) => u,
+                Err(e) => {
+                    warnings.push(json!({
+                        "code": "frame_not_fetched",
+                        "message": format!("iframe {} was not fetched: {}", url, e.message),
+                    }));
+                    continue;
+                }
+            };
+            let fut = guarded_fetch(
+                &self.cfg,
+                &client,
+                FetchRequest {
+                    url: req_url.as_str(),
+                    method: "GET",
+                    headers: Vec::new(),
+                    body: None,
+                    jar: Some(&session.jar),
+                    kind: FetchKind::Script,
+                    referer: Some(&fetched.url),
+                    timeout_ms,
+                    max_bytes: 512 * 1024,
+                },
+            );
+            let res = tokio::select! {
+                biased;
+                _ = abort.token().cancelled() => break,
+                r = fut => r,
+            };
+            match res {
+                Ok(f) if f.status < 400 && f.content_type.contains("html") => {
+                    // The HTML parser treats iframe content as raw text, so
+                    // the frame document is folded under a scout-frame
+                    // element instead: its children parse as real nodes a
+                    // selector can reach. The leftover </iframe> close tag
+                    // is ignored by the parser. The original attributes are
+                    // kept, and data-frame-src carries the resolved source.
+                    let tag = &fetched.body[start..end];
+                    let head = tag.strip_prefix("<iframe").unwrap_or(tag);
+                    let head = head.strip_suffix('>').unwrap_or(head);
+                    let head = head.strip_suffix('/').unwrap_or(head);
+                    let spliced = format!(
+                        "<scout-frame{} data-frame-src=\"{}\">{}</scout-frame>",
+                        head,
+                        url.replace('"', "&quot;"),
+                        f.body
+                    );
+                    body.replace_range(start..end, &spliced);
+                }
+                Ok(f) => {
+                    warnings.push(json!({
+                        "code": "frame_not_fetched",
+                        "message": format!("iframe {} returned {} ({})", url, f.status, f.content_type),
+                    }));
+                }
+                Err(e) => {
+                    warnings.push(json!({
+                        "code": "frame_not_fetched",
+                        "message": format!("iframe {} was not fetched: {}", url, e.message),
+                    }));
+                }
+            }
+        }
+        if body.len() <= self.cfg.max_response_bytes {
+            fetched.body = body;
+        } else {
+            warnings.push(json!({
+                "code": "frame_not_fetched",
+                "message": "folded frames would exceed the response budget; frames were dropped",
+            }));
+        }
+        warnings
+    }
+
     /// The network a page's scripts see.
     ///
     /// Built here, on the async side, because everything that constrains a
@@ -719,13 +848,19 @@ impl Scout {
                 Some(js::NetBody::Text(t)) => Some(t.as_bytes().to_vec()),
                 Some(js::NetBody::Bytes(b)) => Some(b.clone()),
             };
+            let mut headers = req.headers.clone();
+            if let Some(al) = &accept_language {
+                if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-language")) {
+                    headers.push(("accept-language".into(), al.clone()));
+                }
+            }
             let fut = guarded_fetch(
                 &cfg,
                 &client,
                 FetchRequest {
                     url: joined.as_str(),
                     method: &req.method,
-                    headers: req.headers.clone(),
+                    headers,
                     body,
                     jar: Some(&jar),
                     kind: FetchKind::Xhr,
@@ -956,6 +1091,94 @@ impl Scout {
                 })
                 .await?;
 
+            // Pagination: with nextSelector (selectors strategy only), walk
+            // to the next page and keep extracting, merging rows, up to
+            // maxPages. A schema whose data is not a list stops the walk.
+            let mut data = out.get("data").cloned().unwrap_or(Value::Null);
+            let mut pages_walked = 1u64;
+            let mut pages_meta: Vec<Value> = vec![json!({
+                "url": out.get("page").and_then(|p| p.get("url")).cloned().unwrap_or(Value::Null),
+            })];
+            let mut last_url = out.get("page").and_then(|p| p.get("url")).cloned().unwrap_or(Value::Null);
+            let mut last_status = out.get("page").and_then(|p| p.get("status")).cloned().unwrap_or(Value::Null);
+            let mut extract_warnings: Vec<Value> = out
+                .get("warnings")
+                .and_then(|w| w.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if let (Some(next_sel), Some(max_pages)) = (&req.next_selector, req.max_pages) {
+                let is_selectors = strategy_name == "selectors";
+                let mut current: Option<String> = None;
+                loop {
+                    if pages_walked >= max_pages || !is_selectors {
+                        break;
+                    }
+                    // Where does the next link point?
+                    let probe = format!(
+                        "var e = document.querySelector({}); return e ? (e.href || e.getAttribute('href') || '') : null;",
+                        crate::tools::js_lit(next_sel)
+                    );
+                    let link: Option<String> = self
+                        .workers
+                        .call(worker, |reply| Cmd::Eval {
+                            session: session.id.clone(),
+                            script: probe,
+                            net: None,
+                            reply,
+                        })
+                        .await?
+                        .get("value")
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .filter(|s| !s.is_empty());
+                    let Some(link) = link else { break };
+                    if Some(link.clone()) == current {
+                        break; // a page pointing at itself is the end
+                    }
+                    current = Some(link.clone());
+                    let nav = NavigateReq {
+                        url: link,
+                        session_id: Some(session.id.clone()),
+                        timeout_ms: req.timeout_ms,
+                        method: "GET".into(),
+                        body: None,
+                        content_type: None,
+                    };
+                    self.navigate_with_retry(&session, worker, &nav, abort, self.cfg.max_retries)
+                        .await?;
+                    let more: Value = self
+                        .workers
+                        .call(worker, |reply| Cmd::Extract {
+                            session: session.id.clone(),
+                            spec: spec.clone(),
+                            limit,
+                            reply,
+                        })
+                        .await?;
+                    pages_walked += 1;
+                    last_url = more.get("page").and_then(|p| p.get("url")).cloned().unwrap_or(Value::Null);
+                    last_status = more.get("page").and_then(|p| p.get("status")).cloned().unwrap_or(Value::Null);
+                    if let Some(ws) = more.get("warnings").and_then(|w| w.as_array()) {
+                        extract_warnings.extend(ws.iter().cloned());
+                    }
+                    pages_meta.push(json!({ "url": last_url.clone() }));
+                    match (&mut data, more.get("data")) {
+                        (Value::Array(rows), Some(Value::Array(new_rows))) => {
+                            for r in new_rows {
+                                if rows.len() < limit {
+                                    rows.push(r.clone());
+                                }
+                            }
+                        }
+                        _ => break, // not a list schema: pagination ends here
+                    }
+                }
+            }
+            let out = json!({
+                "data": data,
+                "page": { "url": last_url, "status": last_status },
+                "warnings": extract_warnings,
+            });
+
             let mut warnings: Vec<Value> = nav_warnings
                 .into_iter()
                 .filter(|w| !(embedded && w.get("code").and_then(|c| c.as_str()) == Some("js_required_likely")))
@@ -972,6 +1195,8 @@ impl Scout {
                     "url": out.get("page").and_then(|p| p.get("url")).cloned().unwrap_or(Value::Null),
                     "status": out.get("page").and_then(|p| p.get("status")).cloned().unwrap_or(Value::Null),
                     "durationMs": started.elapsed().as_millis() as u64,
+                    "pages": pages_walked,
+                    "pageUrls": pages_meta,
                 },
             }))
         }
@@ -1928,6 +2153,56 @@ fn _order() -> Ordering {
     Ordering::SeqCst
 }
 
+/// Find the first `max` iframe opening tags with an http(s) src.
+/// Returns (start, end, url) where the range covers `<iframe ...>` inclusive.
+fn iframe_tags(body: &str, max: usize) -> Vec<(usize, usize, String)> {
+    let lower = body.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while out.len() < max {
+        let Some(rel) = lower[at..].find("<iframe") else { break };
+        let start = at + rel;
+        let Some(rel_end) = lower[start..].find('>') else { break };
+        let end = start + rel_end + 1;
+        let tag = &body[start..end];
+        // src attribute, single or double quoted, or bare.
+        let lower_tag = tag.to_ascii_lowercase();
+        let src = match lower_tag.find("src") {
+            Some(i) => {
+                let after = &tag[i + 3..];
+                let after = after.trim_start();
+                let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+                let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'');
+                match quote {
+                    Some(q) => after[1..]
+                        .split(q)
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    None => after
+                        .split(|c: char| c.is_whitespace() || c == '>')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                }
+            }
+            None => String::new(),
+        };
+        // javascript:, data:, about:, fragment-only and empty srcs are skipped;
+        // anything else is resolved against the page URL by the caller.
+        let skip = src.is_empty()
+            || src.starts_with("javascript:")
+            || src.starts_with("data:")
+            || src.starts_with("about:")
+            || src.starts_with('#');
+        if !skip {
+            out.push((start, end, src));
+        }
+        at = end;
+    }
+    out
+}
+
 /// The Accept-Language value for a locale tag: `en-GB` becomes
 /// `en-GB,en;q=0.9`, the shape browsers send.
 fn accept_language_value(locale: &str) -> String {
@@ -1985,5 +2260,49 @@ mod step_var_tests {
         let out = Scout::interpolate_vars(&step, &vars());
         assert_eq!(out["url"], json!("https://example.com/a?page=7"));
         assert_eq!(out["opts"]["tag"], json!("one"));
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::iframe_tags;
+
+    #[test]
+    fn iframe_tags_finds_srcs_in_all_quote_styles() {
+        let html = "<p>x</p>\
+                    <iframe src=\"https://a.example/one\"></iframe>\
+                    <iframe src='https://a.example/two'></iframe>\
+                    <iframe src=https://a.example/three></iframe>";
+        let tags = iframe_tags(html, 3);
+        let urls: Vec<&str> = tags.iter().map(|(_, _, u)| u.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://a.example/one", "https://a.example/two", "https://a.example/three"]
+        );
+        // Every range must be the opening tag, ending just past its '>'.
+        for (start, end, _) in &tags {
+            assert!(html[*start..*end].starts_with("<iframe"));
+            assert!(html[*start..*end].ends_with('>'));
+        }
+    }
+
+    #[test]
+    fn iframe_tags_skips_non_document_srcs_and_caps_count() {
+        let html = "<iframe src=\"javascript:alert(1)\"></iframe>\
+                    <iframe src=\"https://a.example/1\"></iframe>\
+                    <iframe></iframe>\
+                    <iframe src=\"https://a.example/2\"></iframe>\
+                    <iframe src=\"https://a.example/3\"></iframe>";
+        let tags = iframe_tags(html, 3);
+        assert_eq!(tags.len(), 3, "cap applies");
+        assert!(tags.iter().all(|(_, _, u)| u.starts_with("https://")));
+    }
+
+    #[test]
+    fn iframe_tags_finds_case_insensitive_and_relative() {
+        let html = "<IFRAME SRC=\"/frame-body\"></IFRAME>";
+        let tags = iframe_tags(html, 3);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].2, "/frame-body");
     }
 }

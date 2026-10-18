@@ -1,6 +1,6 @@
 [package]
 name = "scout"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Lightweight browser automation runtime with an authenticated HTTP API"

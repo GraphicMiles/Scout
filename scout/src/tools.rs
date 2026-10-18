@@ -93,12 +93,14 @@ pub fn manifest() -> Value {
             "body": { "type": "string" },
             "timeoutMs": { "type": "integer", "minimum": 1 },
         }), &["sessionId", "url"]),
-        tool("extract", "Extract structured data using CSS selectors or a named strategy.", json!({
+        tool("extract", "Extract structured data using CSS selectors or a named strategy. With nextSelector, walk to the next page and keep extracting, up to maxPages.", json!({
             "sessionId": sid(),
             "url": { "type": "string", "format": "uri" },
             "strategy": { "type": "string" },
             "schema": { "type": "object" },
             "limit": { "type": "integer", "minimum": 1 },
+            "nextSelector": { "type": "string", "description": "Selectors strategy only: the next-page link" },
+            "maxPages": { "type": "integer", "minimum": 1, "maximum": 10 }
         }), &[]),
         tool("interact", "Perform a raw interaction action (click, fill, select, check, uncheck, press, submit, wait, back, forward).", json!({
             "sessionId": sid(), "action": { "type": "object" },
@@ -223,9 +225,11 @@ pub async fn call(
 
         "extract" => {
             let mut body = json!({});
-            for key in ["sessionId", "url", "strategy", "schema", "limit"] {
+            for key in ["sessionId", "url", "strategy", "schema", "limit", "nextSelector", "maxPages"] {
                 if let Some(v) = obj.get(key) {
-                    body[key] = v.clone();
+                    if !v.is_null() {
+                        body[key] = v.clone();
+                    }
                 }
             }
             let er = validate::extract(&body, &scout.cfg)?;

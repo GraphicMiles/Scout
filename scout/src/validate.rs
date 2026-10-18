@@ -310,6 +310,11 @@ pub struct ExtractReq {
     pub schema: Option<Schema>,
     pub limit: Option<usize>,
     pub timeout_ms: Option<u64>,
+    /// Selectors strategy only: a selector for the "next page" link. When it
+    /// matches, the next page is loaded and extracted too.
+    pub next_selector: Option<String>,
+    /// How many pages to walk when nextSelector is set: 1 to 10.
+    pub max_pages: Option<u64>,
 }
 
 fn extract_fields(
@@ -368,6 +373,38 @@ fn extract_fields(
         }
     }
 
+    let next_selector = match m.get("nextSelector") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if schema.is_none() {
+                return Err(ScoutError::invalid(
+                    "\"nextSelector\" is only valid with the \"selectors\" strategy",
+                )
+                .with_details(serde_json::json!({ "field": "nextSelector" })));
+            }
+            crate::validate::check_selector(s)?;
+            Some(s.clone())
+        }
+        Some(_) => {
+            return Err(ScoutError::invalid("\"nextSelector\" must be a CSS selector string")
+                .with_details(serde_json::json!({ "field": "nextSelector" })))
+        }
+    };
+    let max_pages = match opt_u64(m, "maxPages")? {
+        None => None,
+        Some(p) if (1..=10).contains(&p) => Some(p),
+        Some(_) => {
+            return Err(ScoutError::invalid("\"maxPages\" must be between 1 and 10")
+                .with_details(serde_json::json!({ "field": "maxPages" })))
+        }
+    };
+    if max_pages.is_some() && next_selector.is_none() {
+        return Err(ScoutError::invalid(
+            "\"maxPages\" needs \"nextSelector\"; without it there is nothing to walk",
+        )
+        .with_details(serde_json::json!({ "field": "maxPages" })));
+    }
+
     Ok(ExtractReq {
         url,
         session_id: sid,
@@ -375,6 +412,8 @@ fn extract_fields(
         schema,
         limit,
         timeout_ms: opt_u64(m, "timeoutMs")?,
+        next_selector,
+        max_pages,
     })
 }
 
@@ -382,7 +421,16 @@ pub fn extract(v: &Value, cfg: &Config) -> Result<ExtractReq> {
     let m = obj(v, "body")?;
     unknown(
         m,
-        &["url", "sessionId", "strategy", "schema", "limit", "timeoutMs"],
+        &[
+            "url",
+            "sessionId",
+            "strategy",
+            "schema",
+            "limit",
+            "timeoutMs",
+            "nextSelector",
+            "maxPages",
+        ],
         "body",
     )?;
     extract_fields(m, cfg, true, true)
@@ -484,7 +532,7 @@ pub fn task(v: &Value, cfg: &Config) -> Result<TaskReq> {
             "extract" => {
                 unknown(
                     sm,
-                    &["op", "url", "strategy", "schema", "limit", "timeoutMs", "as"],
+                    &["op", "url", "strategy", "schema", "limit", "timeoutMs", "nextSelector", "maxPages", "as"],
                     &where_,
                 )?;
                 let mut probe = sm.clone();
