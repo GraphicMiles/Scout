@@ -29,6 +29,7 @@ pub enum ErrorCode {
     ShuttingDown,
     NavigationTimeout,
     TaskTimeout,
+    WaitTimeout,
     Internal,
 }
 
@@ -58,6 +59,7 @@ impl ErrorCode {
             ShuttingDown => "shutting_down",
             NavigationTimeout => "navigation_timeout",
             TaskTimeout => "task_timeout",
+            WaitTimeout => "wait_timeout",
             Internal => "internal",
         }
     }
@@ -78,7 +80,7 @@ impl ErrorCode {
             UnsupportedCapability => 501,
             NavigationFailed | ResponseTooLarge => 502,
             QueueFull | Overloaded | TooManySessions | ResourceLimit | ShuttingDown => 503,
-            NavigationTimeout | TaskTimeout => 504,
+            NavigationTimeout | TaskTimeout | WaitTimeout => 504,
             Internal => 500,
         }
     }

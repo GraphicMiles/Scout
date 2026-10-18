@@ -107,6 +107,13 @@ pub enum Cmd {
     Drop {
         session: String,
     },
+    /// Report where back/forward would go, without moving: the history
+    /// pointer advances when the navigation actually happens.
+    History {
+        session: String,
+        forward: bool,
+        reply: oneshot::Sender<Result<Option<String>>>,
+    },
     Stats {
         reply: oneshot::Sender<Result<Value>>,
     },
@@ -156,6 +163,9 @@ impl WorkerState {
             Cmd::Drop { session } => {
                 // Dropping the Page releases the DOM tree and any typed form values.
                 self.pages.remove(&session);
+            }
+            Cmd::History { session, forward, reply } => {
+                let _ = reply.send(self.history_peek(&session, forward));
             }
             Cmd::Stats { reply } => {
                 let bytes: usize = self.pages.values().map(|p| p.bytes).sum();
@@ -235,8 +245,42 @@ impl WorkerState {
             "redirects": page.redirects,
             "warnings": page.warnings,
         });
+        // Browser history semantics: a visit to the previous entry moves back,
+        // a visit to the next moves forward, anything else truncates the
+        // forward stack and appends. History survives the load: it is carried
+        // over from the page the session already holds.
+        {
+            if let Some(prev) = self.pages.get(session) {
+                page.history = prev.history.clone();
+                page.history_pos = prev.history_pos;
+            }
+            let url = page.url.clone();
+            let pos = page.history_pos;
+            if page.history.get(pos) != Some(&url) {
+                if pos > 0 && page.history.get(pos - 1) == Some(&url) {
+                    page.history_pos = pos - 1;
+                } else if page.history.get(pos + 1) == Some(&url) {
+                    page.history_pos = pos + 1;
+                } else {
+                    page.history.truncate(pos + 1);
+                    page.history.push(url);
+                    page.history_pos = page.history.len() - 1;
+                }
+            }
+        }
         self.pages.insert(session.to_string(), page);
         Ok(LoadOutcome { summary, scripts })
+    }
+
+    fn history_peek(&self, session: &str, forward: bool) -> Result<Option<String>> {
+        let page = self.page(session)?;
+        if forward {
+            Ok(page.history.get(page.history_pos + 1).cloned())
+        } else if page.history_pos > 0 {
+            Ok(page.history.get(page.history_pos - 1).cloned())
+        } else {
+            Ok(None)
+        }
     }
 
     fn page(&self, session: &str) -> Result<&Page> {
@@ -422,9 +466,17 @@ impl WorkerState {
 
         if let Some(html) = out.html {
             if let Ok(new_doc) = html::parse_html(&html, self.cfg.max_dom_nodes) {
-                let warnings = js_warnings(&new_doc);
+                let mut warnings = js_warnings(&new_doc);
+                // The engine's own near-limit note travels with the page.
+                warnings.extend(out.warnings.iter().cloned());
                 page.doc = Some(new_doc);
                 page.warnings = warnings;
+            }
+        } else {
+            for w in &out.warnings {
+                if !page.warnings.contains(w) {
+                    page.warnings.push(w.clone());
+                }
             }
         }
         // Persist Web Storage mutations from the scripts.
@@ -453,6 +505,16 @@ impl WorkerState {
         }
         if !out.logs.is_empty() {
             summary["logs"] = json!(out.logs);
+        }
+        // A script or listener asked to navigate: the async side follows it.
+        if let Some(nav) = &out.pending_nav {
+            summary["pendingNavigation"] = json!(nav);
+        }
+        if !out.warnings.is_empty() {
+            summary["warnings"] = json!(out.warnings);
+        }
+        if out.peak_memory_bytes > 0 {
+            summary["peakMemoryBytes"] = json!(out.peak_memory_bytes);
         }
         Ok(summary)
     }
@@ -527,6 +589,20 @@ impl WorkerState {
                      }})();",
                     sel = sel,
                     key = serde_json::to_string(&press_key).unwrap_or_else(|_| "\"\"".into()),
+                )
+            }
+            "click" => {
+                let sel = selector
+                    .as_deref()
+                    .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+                    .unwrap_or_else(|| "null".into());
+                format!(
+                    "(function () {{
+                       var el = {sel} ? document.querySelector({sel}) : (document.activeElement || document.body);
+                       if (!el) return;
+                       try {{ el.dispatchEvent(new Event('click', {{ bubbles: true, cancelable: true }})); }} catch (e) {{}}
+                     }})();",
+                    sel = sel,
                 )
             }
             other => {

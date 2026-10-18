@@ -837,18 +837,30 @@ const DOM_SHIM: &str = r##"
     var href = raw;
     var protocol = m && m[1] ? m[1].toLowerCase() : '';
     var host = m && m[2] ? m[2] : '';
+    globalThis.__scout_pending_nav = null;
     var pathname = m && m[3] ? m[3] : '';
     var search = m && m[4] ? m[4] : '';
     var hash = m && m[5] ? m[5] : '';
     var hostname = host.replace(/:\d+$/, '');
-    globalThis.location = {
-      href: href, protocol: protocol, host: host, hostname: hostname,
+    // Scripts navigate by assignment or by assign/replace. The host cannot
+    // follow mid-script, so the request is recorded and the caller navigates
+    // after the pass, the way a browser leaves the page after the handler
+    // returns. reload() does nothing: the page is already the latest state.
+    var loc = {
+      protocol: protocol, host: host, hostname: hostname,
       port: /:(\d+)$/.test(host) ? host.split(':').pop() : '',
       pathname: pathname, search: search, hash: hash,
       origin: protocol && host ? protocol + '//' + host : '',
-      assign: function () {}, replace: function () {}, reload: function () {},
+      assign: function (u) { globalThis.__scout_pending_nav = resolveUrl(String(u)); },
+      replace: function (u) { globalThis.__scout_pending_nav = resolveUrl(String(u)); },
+      reload: function () {},
       toString: function () { return href; }
     };
+    Object.defineProperty(loc, 'href', {
+      get: function () { return href; },
+      set: function (u) { globalThis.__scout_pending_nav = resolveUrl(String(u)); }
+    });
+    globalThis.location = loc;
   })();
   globalThis.window = globalThis;
   globalThis.self = globalThis;
@@ -1572,6 +1584,8 @@ pub struct JsOutcome {
     pub warnings: Vec<Value>,
     /// Web Storage after the script ran: `{local: {...}, session: {...}}`.
     pub storage: Option<Value>,
+    /// A navigation the script requested (location.href, assign, replace).
+    pub pending_nav: Option<String>,
 }
 
 /// Heuristic: does the script contain an explicit `return`?
@@ -1638,7 +1652,7 @@ pub fn run(
     let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let logs_in = logs.clone();
 
-    let result = ctx.with(|ctx| -> Result<(Option<Value>, Option<Value>)> {
+    let result = ctx.with(|ctx| -> Result<(Option<Value>, Option<Value>, Option<String>)> {
         // console capture
         let console = rquickjs::Object::new(ctx.clone()).map_err(|e| js_err(format!("{e}")))?;
         for level in ["log", "info", "warn", "error", "debug"] {
@@ -1704,9 +1718,16 @@ pub fn run(
             .eval::<String, _>("JSON.stringify(globalThis.__scout_storage || {})")
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        Ok((value, storage))
+
+        // A script that set location.href or called assign/replace leaves the
+        // request here; the caller decides whether to follow it.
+        let pending_nav = ctx
+            .eval::<String, _>("globalThis.__scout_pending_nav || ''")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Ok((value, storage, pending_nav))
     })?;
-    let (result, storage) = result;
+    let (result, storage, pending_nav) = result;
 
     let duration_ms = started.elapsed().as_millis() as u64;
     let logs = logs.borrow().clone();
@@ -1731,10 +1752,25 @@ pub fn run(
         timed_out,
         warnings,
         storage,
+        pending_nav,
     })
 }
 
 /// What running a page's scripts produced.
+/// Warnings worth raising about a page-script run. A run that peaked near
+/// the engine cap says so before the caller wonders why the DOM came back
+/// short: scripts that hit the wall mid-way can leave a half-built page.
+pub(crate) fn memory_warnings(peak: usize, max_memory: usize) -> Vec<Value> {
+    if max_memory > 0 && peak > max_memory * 8 / 10 {
+        vec![json!({
+            "code": "js_memory_near_limit",
+            "message": format!("Page scripts peaked at {peak} bytes of the {max_memory}-byte engine cap."),
+        })]
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct PageRunOutcome {
     /// The mutated document, serialised back to HTML. `None` when execution was
@@ -1755,6 +1791,12 @@ pub struct PageRunOutcome {
     pub errors: Vec<String>,
     /// Web Storage after the scripts ran: `{local: {...}, session: {...}}`.
     pub storage: Option<Value>,
+    /// A navigation the scripts or listeners requested.
+    pub pending_nav: Option<String>,
+    /// Peak engine memory during the run.
+    pub peak_memory_bytes: usize,
+    /// Runtime warnings, merged into the page's warnings by the caller.
+    pub warnings: Vec<Value>,
 }
 
 /// Run a page's scripts, in document order, inside a single context.
@@ -1844,7 +1886,6 @@ impl rquickjs::loader::Resolver for PageResolver {
 /// synchronously, the way a browser blocks on `<script type="module">`.
 struct PageLoader {
     net: Option<NetFn>,
-    page_base: String,
     /// Bytes already fetched for imports this run. Bounded so a page that
     /// imports in a loop cannot pull unbounded data.
     budget: std::rc::Rc<std::cell::Cell<usize>>,
@@ -1923,7 +1964,6 @@ pub fn run_page(
             PageResolver { page_base: base_url.to_string() },
             PageLoader {
                 net: net.clone(),
-                page_base: base_url.to_string(),
                 budget: import_budget.clone(),
             },
         );
@@ -1942,7 +1982,7 @@ pub fn run_page(
     let jobs: std::rc::Rc<std::cell::Cell<u32>> = std::rc::Rc::new(std::cell::Cell::new(0));
     let mut jobs_left = job_budget;
 
-    let outcome = ctx.with(|ctx| -> Result<(Option<String>, Option<Value>)> {
+    let outcome = ctx.with(|ctx| -> Result<(Option<String>, Option<Value>, Option<String>)> {
         wire_console(&ctx, &logs)?;
 
         let prelude = format!(
@@ -2044,10 +2084,18 @@ pub fn run_page(
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
-        Ok((html, storage))
+        // A listener or timer that navigated leaves its request here.
+        let pending_nav = ctx
+            .eval::<String, _>("globalThis.__scout_pending_nav || ''")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        Ok((html, storage, pending_nav))
     });
 
-    let (html, storage) = outcome?;
+    let (html, storage, pending_nav) = outcome?;
+    let peak = rt.memory_usage().memory_used_size.max(0) as usize;
+    let warnings = memory_warnings(peak, max_memory);
     let duration_ms = started.elapsed().as_millis() as u64;
     let logs = logs.borrow().clone();
     let (timers_run, timers_pending) = timer_counts.get();
@@ -2064,6 +2112,9 @@ pub fn run_page(
         timed_out: timed_out.load(std::sync::atomic::Ordering::SeqCst),
         errors,
         storage,
+        pending_nav,
+        peak_memory_bytes: peak,
+        warnings,
     })
 }
 
@@ -2207,12 +2258,80 @@ mod tests {
         )
     }
 
+    #[test]
+    fn location_href_set_requests_navigation() {
+        let out = run_page_on(
+            "<html><body></body></html>",
+            &["location.href = '/next';"],
+        )
+        .unwrap();
+        assert_eq!(out.pending_nav.as_deref(), Some("https://example.com/next"));
+    }
+
+    #[test]
+    fn location_assign_and_replace_request_navigation() {
+        let out = run_page_on(
+            "<html><body></body></html>",
+            &["location.assign('https://example.com/a');"],
+        )
+        .unwrap();
+        assert_eq!(out.pending_nav.as_deref(), Some("https://example.com/a"));
+
+        let out = run_page_on(
+            "<html><body></body></html>",
+            &["location.replace('/b?x=1');"],
+        )
+        .unwrap();
+        assert_eq!(out.pending_nav.as_deref(), Some("https://example.com/b?x=1"));
+    }
+
+    #[test]
+    fn location_reads_stay_reads() {
+        let out = run_page_on(
+            "<html><body></body></html>",
+            &["window.__kept = location.pathname + '?' + location.search;"],
+        )
+        .unwrap();
+        assert!(out.pending_nav.is_none());
+        let out2 = run(
+            "return location.pathname;",
+            &dom_snapshot(&doc("<html><body></body></html>")),
+            "https://example.com/p/q?r=1",
+            "Scout/0.1",
+            &json!({ "local": {}, "session": {} }),
+            None,
+            Duration::from_millis(1_000),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(out2.value.and_then(|v| v.as_str().map(|s| s.to_string())), Some("/p/q".to_string()));
+    }
+
+    #[test]
+    fn memory_near_limit_is_reported_not_hidden() {
+        // Quiet runs say nothing.
+        assert!(memory_warnings(100, 1_000).is_empty());
+        // Past eight tenths of the cap, exactly one warning, by code.
+        let w = memory_warnings(900, 1_000);
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w[0].get("code").and_then(|c| c.as_str()),
+            Some("js_memory_near_limit")
+        );
+        // The boundary itself is quiet: only past the line warns.
+        assert!(memory_warnings(800, 1_000).is_empty());
+
+        // And a real run reports its peak without warnings.
+        let out = run_page_on("<html><body></body></html>", &["var a = 1;"]).unwrap();
+        assert!(out.warnings.is_empty());
+    }
+
     fn run_page_budget_on(
         html: &str,
         scripts: &[&str],
         net: Option<NetFn>,
-        timer_budget: u32,
-        job_budget: u32,
+        _timer_budget: u32,
+        _job_budget: u32,
     ) -> Result<PageRunOutcome> {
         run_page_storage_on(html, scripts, &json!({ "local": {}, "session": {} }), net)
     }

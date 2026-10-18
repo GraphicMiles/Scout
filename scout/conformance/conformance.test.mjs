@@ -775,8 +775,6 @@ describe('engine: interaction', () => {
       await client.navigate({ sessionId: id, url: `${fx}/form` });
       const cases = [
         [{ type: 'click', selector: '#nope' }, 'element_not_found', 422],
-        [{ type: 'click', selector: '#js-link' }, 'unsupported_capability', 501],
-        [{ type: 'click', selector: '#js' }, 'unsupported_capability', 501],
         [{ type: 'fill', selector: 'input[type=file]', value: 'x' }, 'unsupported_capability', 501],
         [{ type: 'select', selector: 'select', value: 'green' }, 'element_not_found', 422],
         // Beyond the Node list, same contract:
@@ -788,6 +786,27 @@ describe('engine: interaction', () => {
         assert.equal(r.status, status, `${JSON.stringify(action)} → ${r.status} ${r.text.slice(0, 140)}`);
         assert.equal(r.json.error.code, code, `${JSON.stringify(action)} code was ${r.json.error.code}`);
       }
+      // A click with no semantic behaviour is delivered to the page's
+      // scripts instead of refused: a plain button and a javascript: link.
+      for (const sel of ['#js', '#js-link']) {
+        const r = await act(id, { type: 'click', selector: sel });
+        assert.equal(r.status, 200, `${sel} → ${r.status} ${r.text.slice(0, 140)}`);
+        assert.equal(r.json.ok, true, `${sel} body was ${r.text.slice(0, 140)}`);
+        assert.equal(r.json.type, 'click');
+      }
+
+      // Wait times out with its own code when nothing matches.
+      const wait = await act(id, { type: 'wait', selector: '#never', timeoutMs: 250 });
+      assert.equal(wait.status, 504, `wait → ${wait.status} ${wait.text.slice(0, 140)}`);
+      assert.equal(wait.json.error.code, 'wait_timeout');
+      const waitOk = await act(id, { type: 'wait', value: 'Go', timeoutMs: 2000 });
+      assert.equal(waitOk.status, 200, `wait ok → ${waitOk.status} ${waitOk.text.slice(0, 140)}`);
+
+      // History: nothing behind the first page, so back is a clean 404.
+      const back = await act(id, { type: 'back' });
+      assert.equal(back.status, 404, `back → ${back.status} ${back.text.slice(0, 140)}`);
+      assert.equal(back.json.error.code, 'not_found');
+
       // The enctype form used to be refused; multipart submits now. Its file
       // input has nothing staged, so it sends an empty file part, like a browser.
       const mp = await act(id, { type: 'submit', selector: 'form[enctype] input' });

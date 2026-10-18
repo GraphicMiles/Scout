@@ -65,9 +65,12 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 - Runs page JavaScript during navigation, including fetch and XMLHttpRequest
 - Extracts typed fields: text, URLs, numbers, prices, dates
 - Clicks, fills, selects, and submits forms, including multipart forms and file uploads
+- Follows script and meta-refresh navigations: a page whose script sets location.href, or that carries a meta refresh tag, lands where a browser would land
+- Waits for a selector, text, or URL before continuing, with its own timeout code
+- Keeps browser-style history per session: go back and forward through pages actually visited
 - Stages files on upload inputs and sends them as multipart/form-data, like a browser
 - Keeps localStorage and sessionStorage per session, across navigations
-- Scrolls pages and delivers key presses to their scripts, so lazy-loading and search-as-you-type pages work
+- Scrolls pages and delivers key presses and clicks to their scripts, so lazy-loading and search-as-you-type pages work; a click on a plain button runs the page's own click handlers instead of failing
 - Runs ES modules: relative and absolute URL imports are fetched, chained, and cached per page load
 - Signs in with credentials you supply and reports the evidence
 - Extracts videos from YouTube channels, verified against live pages, and follows continuation pages up to the limit you set
@@ -75,7 +78,7 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 
 ## What it does not do
 
-There is no layout, no CSS cascade, no Web Workers, no IndexedDB. Page event listeners live only inside one script pass, so a scroll or key press re-runs the page's own scripts before dispatching; scripts that append unconditionally on load may duplicate content. ES module imports resolve relative and absolute URLs only: there is no package registry, so `import 'react'` fails with a script error rather than a guess. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
+There is no layout, no CSS cascade, no Web Workers, no IndexedDB. Page event listeners live only inside one script pass, so a scroll, key press or click re-runs the page's own scripts before dispatching; scripts that append unconditionally on load may duplicate content. Script and meta-refresh navigations are followed up to 4 hops, then the last response is returned as-is. ES module imports resolve relative and absolute URLs only: there is no package registry, so `import 'react'` fails with a script error rather than a guess. The Facebook and TikTok strategies are not implemented and return `unsupported_capability` rather than guessing. Every strategy reports its verification state at `GET /v1/strategies`.
 
 ## API
 
@@ -93,7 +96,7 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | POST | `/v1/navigate` | Load a page into a session |
 | POST | `/v1/request` | Raw HTTP request with session cookies |
 | POST | `/v1/extract` | Extract fields from a page |
-| POST | `/v1/interact` | Click, fill, select, submit, scroll, press a key, or upload a file |
+| POST | `/v1/interact` | Click, fill, select, submit, scroll, press a key, upload a file, wait, or go back and forward |
 | POST | `/v1/eval` | Run JavaScript against a page |
 | POST | `/v1/tasks` | Submit a task |
 | GET | `/v1/tasks/:id` | Task status and result |
