@@ -81,6 +81,8 @@ curl -s -H "authorization: Bearer $SCOUT_API_KEYS" http://127.0.0.1:8080/health
 - Signs in with credentials you supply and reports the evidence
 - Extracts videos from YouTube channels, verified against live pages, and follows continuation pages up to the limit you set
 - Queues background tasks with retries, timeouts, and a memory watchdog; a step can name its result with as and later steps can use it as {{name}}
+- Fires signed webhooks when a task finishes: HMAC-SHA256 in the X-Scout-Signature header over the exact body
+- Runs recurring schedules with everyMs, notices when a result changed by hashing it, and only calls the webhook on change; schedules persist across restarts when SCOUT_TASK_STORE is set
 
 ## What it does not do
 
@@ -109,6 +111,9 @@ All `/v1` routes require a bearer token from `SCOUT_API_KEYS`.
 | POST | `/v1/tasks` | Submit a task |
 | GET | `/v1/tasks/:id` | Task status and result |
 | POST | `/v1/tasks/:id/cancel` | Cancel a task |
+| GET | `/v1/schedules` | List recurring schedules |
+| GET | `/v1/schedules/:id` | One schedule: interval, last run, changed flag |
+| DELETE | `/v1/schedules/:id` | Delete a schedule |
 
 Example:
 
@@ -160,6 +165,8 @@ Defaults suit local use. The settings most worth knowing:
 | `PORT` | 8080 | Listen port |
 | `SCOUT_ALLOWED_DOMAINS` | unset | Restrict navigation to these domains |
 | `SCOUT_MEM_HARD_MB` | 400 | Hard memory budget |
+| `SCOUT_TASK_STORE` | unset | File where recurring schedules survive restarts |
+| `SCOUT_MAX_SCHEDULES` | 64 | Most schedules at once |
 | `SCOUT_JS_ENABLED` | 1 | Run page scripts during navigation |
 | `SCOUT_JS_NETWORK` | 1 | Let page scripts make requests |
 | `SCOUT_USER_AGENT` | Chrome desktop | User agent sent to sites |

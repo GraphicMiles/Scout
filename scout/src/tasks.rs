@@ -56,9 +56,21 @@ pub struct TaskRecord {
     pub result: Option<Value>,
     pub error: Option<Value>,
     pub abort: Abort,
+    /// Run once when the task reaches a terminal state, with the final view.
+    /// Used for webhooks: the caller hears about completion wherever it
+    /// happened, including cancellation and shutdown.
+    pub on_terminal: Option<Box<dyn FnOnce(Value) + Send>>,
 }
 
 impl TaskRecord {
+    /// Take the terminal hook, if it has not fired yet, with the final view.
+    fn take_hook(&mut self) -> Option<Box<dyn FnOnce(Value) + Send>> {
+        if !self.status.is_terminal() {
+            return None;
+        }
+        self.on_terminal.take()
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -219,6 +231,21 @@ impl TaskManager {
         F: FnOnce(Abort) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
+        self.submit_with_hook(owner, timeout_override_ms, None, f)
+    }
+
+    /// Queue a background task with a hook fired once at its terminal state.
+    pub fn submit_with_hook<F, Fut>(
+        self: &Arc<Self>,
+        owner: String,
+        timeout_override_ms: Option<u64>,
+        on_terminal: Option<Box<dyn FnOnce(Value) + Send>>,
+        f: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce(Abort) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+    {
         self.admit()?;
         let id = random_id("tsk_", 12);
         let abort = Abort::new();
@@ -232,6 +259,7 @@ impl TaskManager {
             result: None,
             error: None,
             abort: abort.clone(),
+            on_terminal,
         }));
 
         {
@@ -259,6 +287,11 @@ impl TaskManager {
                                 .clone(),
                         );
                     }
+                    let hook = r.take_hook();
+                    drop(r);
+                    if let Some(h) = hook {
+                        h(record.lock().unwrap().view());
+                    }
                     return;
                 }
             };
@@ -273,6 +306,11 @@ impl TaskManager {
                 };
                 r.finished_at = Some(now_ms());
                 r.error = Some(err.to_json()["error"].clone());
+                let hook = r.take_hook();
+                drop(r);
+                if let Some(h) = hook {
+                    h(record.lock().unwrap().view());
+                }
                 return;
             }
 
@@ -325,7 +363,12 @@ impl TaskManager {
                 }
             }
             let status = r.status.as_str().to_string();
+            let hook = r.take_hook();
+            let view_now = r.view();
             drop(r);
+            if let Some(h) = hook {
+                h(view_now);
+            }
             this.metrics.inc(
                 "scout_tasks_total",
                 "Background tasks by terminal status",
@@ -383,7 +426,13 @@ impl TaskManager {
             "Background tasks by terminal status",
             &[("status", "cancelled")],
         );
-        let view = record.lock().unwrap().view();
+        let (view, hook) = {
+            let mut r = record.lock().unwrap();
+            (r.view(), r.take_hook())
+        };
+        if let Some(h) = hook {
+            h(view.clone());
+        }
         Ok(view)
     }
 

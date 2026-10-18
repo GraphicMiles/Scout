@@ -126,9 +126,12 @@ pub fn manifest() -> Value {
         tool("cookies.get", "List every cookie in the session jar, including HttpOnly ones that page scripts cannot see.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("cookies.set", "Seed the jar with a raw cookie value, for example to resume a signed-in session.", json!({ "sessionId": sid(), "url": { "type": "string" }, "cookie": { "type": "string" } }), &["sessionId", "url", "cookie"]),
         tool("cookies.clear", "Empty the session cookie jar.", json!({ "sessionId": sid() }), &["sessionId"]),
-        tool("task.submit", "Run a multi-step automation task in the background.", json!({ "sessionId": sid(), "steps": { "type": "array" }, "timeoutMs": { "type": "integer" } }), &["steps"]),
+        tool("task.submit", "Run a multi-step automation task in the background. With everyMs it becomes a recurring schedule that only fires its callback when the result changes.", json!({ "sessionId": sid(), "steps": { "type": "array" }, "timeoutMs": { "type": "integer" }, "retries": { "type": "integer" }, "everyMs": { "type": "integer", "minimum": 5000 }, "callbackUrl": { "type": "string" }, "callbackSecret": { "type": "string" } }), &["steps"]),
         tool("task.status", "Status and result of a submitted task.", json!({ "taskId": { "type": "string" } }), &["taskId"]),
         tool("task.cancel", "Cancel a queued or running task.", json!({ "taskId": { "type": "string" } }), &["taskId"]),
+        tool("schedule.list", "List recurring task schedules with their last run and changed flag.", json!({}), &[]),
+        tool("schedule.get", "One recurring schedule by id.", json!({ "scheduleId": { "type": "string" } }), &["scheduleId"]),
+        tool("schedule.delete", "Stop and remove a recurring schedule.", json!({ "scheduleId": { "type": "string" } }), &["scheduleId"]),
         tool("strategies", "List extraction strategies and their verification state.", json!({}), &[]),
     ];
 
@@ -495,11 +498,21 @@ pub async fn call(
             if let Some(s) = opt_str("sessionId") {
                 body["sessionId"] = json!(s);
             }
-            if let Some(t) = obj.get("timeoutMs") {
-                body["timeoutMs"] = t.clone();
+            for key in ["timeoutMs", "retries", "everyMs", "callbackUrl", "callbackSecret"] {
+                if let Some(v) = obj.get(key) {
+                    if !v.is_null() {
+                        body[key] = v.clone();
+                    }
+                }
             }
             let tr = validate::task(&body, &scout.cfg)?;
             scout.submit_task(owner, tr)?
+        }
+        "schedule.get" => scout.schedules.get(owner, &str_arg("scheduleId")?)?,
+        "schedule.list" => scout.schedules.list(owner),
+        "schedule.delete" => {
+            scout.schedules.delete(owner, &str_arg("scheduleId")?)?;
+            json!({ "ok": true })
         }
         "task.status" => scout.get_task(owner, &str_arg("taskId")?)?,
         "task.cancel" => scout.cancel_task(owner, &str_arg("taskId")?)?,

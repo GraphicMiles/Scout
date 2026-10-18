@@ -39,6 +39,11 @@ pub struct Config {
     pub max_queued: usize,
     pub task_result_ttl_ms: u64,
     pub max_retained_tasks: usize,
+    /// Where recurring task schedules persist across restarts. Unset means
+    /// schedules live in memory only.
+    pub task_store: Option<String>,
+    /// How many schedules may exist at once.
+    pub max_schedules: usize,
     pub max_retries: u32,
     pub rate_limit_per_min: u64,
 
@@ -163,6 +168,8 @@ impl Config {
             concurrency: num(&env, "SCOUT_CONCURRENCY", 1)? as usize,
             max_queued: num(&env, "SCOUT_MAX_QUEUED", 64)? as usize,
             task_result_ttl_ms: num(&env, "SCOUT_TASK_RESULT_TTL_MS", 600_000)?,
+            task_store: env.get("SCOUT_TASK_STORE").filter(|v| !v.is_empty()).cloned(),
+            max_schedules: num(&env, "SCOUT_MAX_SCHEDULES", 64)? as usize,
             max_retained_tasks: 500,
             max_retries: num(&env, "SCOUT_MAX_RETRIES", 2)? as u32,
             rate_limit_per_min: num(&env, "SCOUT_RATE_LIMIT_PER_MIN", 120)?,

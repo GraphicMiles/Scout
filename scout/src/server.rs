@@ -299,6 +299,8 @@ fn route_name(method: &Method, path: &str) -> &'static str {
         ("POST", "/v1/tasks") => "tasks.create",
         _ if path.starts_with("/v1/sessions/") => "sessions.delete",
         _ if path.starts_with("/v1/tasks/") && path.ends_with("/cancel") => "tasks.cancel",
+        ("GET", "/v1/schedules") => "schedules.list",
+        _ if path.starts_with("/v1/schedules/") => "schedules.get",
         _ if path.starts_with("/v1/tasks/") => "tasks.get",
         _ => "unmatched",
     }
@@ -468,6 +470,12 @@ async fn openapi(State(state): State<AppState>) -> Response {
                 }), vec!["steps"]))),
             },
             "/v1/tasks/{id}": { "get": op("Task status and result", None) },
+            "/v1/schedules": { "get": op("List recurring task schedules", None) },
+            "/v1/schedules/{id}": {
+                "get": op("One schedule: interval, last run, changed flag",
+                    Some(body_of(json!({ "id": { "type": "string" } }), vec!["id"]))),
+                "delete": op("Delete a schedule", None),
+            },
             "/v1/tasks/{id}/cancel": { "post": op("Cancel a queued or running task", None) },
             "/v1/tools": { "get": op("Tool manifest for agents", None) },
             "/v1/tools/call": {
@@ -682,12 +690,41 @@ async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>, req:
     Ok(Json(state.scout.cancel_task(&owner, &id)?).into_response())
 }
 
+async fn list_schedules(
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> Result<Response> {
+    let owner = owner_of(&req);
+    Ok(Json(state.scout.schedules.list(&owner)).into_response())
+}
+
+async fn get_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> Result<Response> {
+    let owner = owner_of(&req);
+    let view = state.scout.schedules.get(&owner, &id)?;
+    Ok(Json(view).into_response())
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> Result<Response> {
+    let owner = owner_of(&req);
+    state.scout.schedules.delete(&owner, &id)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 async fn not_found(method: Method, uri: axum::http::Uri) -> Response {
     let allow = match uri.path() {
-        "/health" | "/metrics" | "/v1/strategies" | "/openapi.json" => "GET",
+        "/health" | "/metrics" | "/v1/strategies" | "/openapi.json" | "/v1/schedules" => "GET",
         "/v1/sessions" | "/v1/navigate" | "/v1/extract" | "/v1/interact" | "/v1/eval" | "/v1/tasks" => "POST",
         p if p.starts_with("/v1/sessions/") => "DELETE",
         p if p.starts_with("/v1/tasks/") => "GET, POST",
+        p if p.starts_with("/v1/schedules/") => "GET, DELETE",
         _ => "",
     };
     if !allow.is_empty() {
@@ -723,6 +760,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/tasks", post(create_task))
         .route("/v1/tasks/:id", get(get_task))
         .route("/v1/tasks/:id/cancel", post(cancel_task))
+        .route("/v1/schedules", get(list_schedules))
+        .route("/v1/schedules/:id", get(get_schedule))
+        .route("/v1/schedules/:id", delete(delete_schedule))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(mw, guard))
         .with_state(state)

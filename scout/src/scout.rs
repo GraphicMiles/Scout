@@ -25,6 +25,8 @@ pub struct Scout {
     pub sessions: Arc<SessionManager>,
     pub tasks: Arc<TaskManager>,
     pub workers: Arc<WorkerPool>,
+    /// Recurring task schedules and their change history.
+    pub schedules: Arc<crate::schedules::Scheduler>,
     pub client: reqwest::Client,
     /// Handle on the async runtime, so a blocking in-page request issued from a
     /// page worker can drive the same guarded client everything else uses.
@@ -65,6 +67,8 @@ impl Scout {
             tokio::runtime::Handle::try_current().ok(),
         ));
 
+        let schedules = Arc::new(crate::schedules::Scheduler::new(&cfg));
+
         let scout = Arc::new(Self {
             cfg: cfg.clone(),
             metrics: metrics.clone(),
@@ -72,6 +76,7 @@ impl Scout {
             sessions,
             tasks,
             workers,
+            schedules,
             client,
             handle: tokio::runtime::Handle::try_current().ok(),
             routing: Mutex::new(HashMap::new()),
@@ -1296,13 +1301,57 @@ impl Scout {
         if let Some(sid) = &req.session_id {
             self.sessions.get(owner, sid)?;
         }
+
+        // Recurring: a schedule, not a task. The first run starts now.
+        if let Some(every_ms) = req.every_ms {
+            let view = self.schedules.create(
+                owner,
+                req.to_spec(),
+                every_ms,
+                req.callback_url.clone(),
+                req.callback_secret.clone(),
+            )?;
+            // First run immediately, in the background.
+            let this = self.clone();
+            let spec = req.to_spec();
+            let cb_url = req.callback_url.clone();
+            let cb_secret = req.callback_secret.clone();
+            let id = view["id"].as_str().unwrap_or_default().to_string();
+            let owner = owner.to_string();
+            if !id.is_empty() {
+                tokio::spawn(async move {
+                    this.run_schedule(&owner, &id, &spec, cb_url, cb_secret).await;
+                });
+            }
+            self.metrics.inc(
+                "scout_schedules_created_total",
+                "Recurring schedules created",
+                &[],
+            );
+            return Ok(view);
+        }
+
         let retries = req.retries.unwrap_or(self.cfg.max_retries);
         let timeout = clamp_timeout(req.timeout_ms, self.cfg.task_timeout_ms, self.cfg.max_task_timeout_ms);
         let step_count = req.steps.len();
 
+        // A one-shot task with a callbackUrl hears about its terminal state,
+        // wherever that state came from: completion, failure, cancellation.
+        let hook: Option<Box<dyn FnOnce(Value) + Send>> = req.callback_url.as_ref().map(|url| {
+            let this = self.clone();
+            let url = url.clone();
+            let secret = req.callback_secret.clone();
+            Box::new(move |view: Value| {
+                let payload = json!({ "type": "task", "task": view });
+                tokio::spawn(async move {
+                    crate::schedules::fire_callback(&this.client, &url, secret.as_deref(), &payload).await;
+                });
+            }) as Box<dyn FnOnce(Value) + Send>
+        });
+
         let this = self.clone();
         let owner_owned = owner.to_string();
-        let view = self.tasks.submit(owner.to_string(), Some(timeout), move |abort| async move {
+        let view = self.tasks.submit_with_hook(owner.to_string(), Some(timeout), hook, move |abort| async move {
             this.run_task(&owner_owned, req, retries, abort).await
         })?;
         self.metrics.inc(
@@ -1311,6 +1360,70 @@ impl Scout {
             &[("steps", &step_count.to_string())],
         );
         Ok(view)
+    }
+
+    /// One run of a schedule: validate the spec fresh, run it, hash the
+    /// result, and fire the callback only when the result changed.
+    pub async fn run_schedule(
+        self: &Arc<Self>,
+        owner: &str,
+        id: &str,
+        spec: &Value,
+        callback_url: Option<String>,
+        callback_secret: Option<String>,
+    ) {
+        let req = match crate::validate::task(spec, &self.cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                // A spec that no longer validates (a strategy was removed, a
+                // session was destroyed) is recorded, not silently dropped.
+                self.schedules.record(id, "failed", "-", None);
+                crate::logger::warn(
+                    "schedule run rejected its own spec",
+                    json!({ "schedule": id, "error": e.message }),
+                );
+                return;
+            }
+        };
+        if let Some(sid) = &req.session_id {
+            if self.sessions.get(owner, sid).is_err() {
+                self.schedules.record(id, "failed", "-", None);
+                return;
+            }
+        }
+        let retries = req.retries.unwrap_or(self.cfg.max_retries);
+        let timeout = clamp_timeout(req.timeout_ms, self.cfg.task_timeout_ms, self.cfg.max_task_timeout_ms);
+        let run_id = crate::util::random_id("run_", 12);
+        let this = self.clone();
+        let owner = owner.to_string();
+        let out = self
+            .tasks
+            .run_inline(None, Some(timeout), move |abort| async move {
+                this.run_task(&owner, req, retries, abort).await
+            })
+            .await;
+        match out {
+            Ok(v) => {
+                let hash = crate::schedules::fnv1a64(v.to_string().as_bytes());
+                let changed = self.schedules.record(id, "succeeded", &run_id, Some(hash));
+                if changed == Some(true) {
+                    if let Some(url) = &callback_url {
+                        let payload = json!({
+                            "type": "schedule.run",
+                            "scheduleId": id,
+                            "runId": run_id,
+                            "changed": true,
+                            "result": v,
+                        });
+                        crate::schedules::fire_callback(&self.client, url, callback_secret.as_deref(), &payload).await;
+                    }
+                }
+            }
+            Err(e) => {
+                self.schedules.record(id, "failed", &run_id, None);
+                let _ = e;
+            }
+        }
     }
 
     async fn run_task(self: &Arc<Self>, owner: &str, req: TaskReq, retries: u32, abort: Abort) -> Result<Value> {
