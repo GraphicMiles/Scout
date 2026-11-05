@@ -76,3 +76,7 @@ package.json, postinstall.mjs   npm packaging and binary download
 
 Three workflows run on the repository: `ci.yml` for the build and tests,
 `release.yml` for the binaries and `npm-publish.yml` for the package.
+
+## Licence
+
+MIT, see `LICENSE`.
