@@ -26,6 +26,13 @@ jobs:
       - name: Unit, API and renderer tests
         run: cargo test --locked --workspace
 
+      # Rendering is optional: a scraper-only build must stay buildable and
+      # testable, or the flag silently rots.
+      - name: Scraper-only build (no renderer)
+        run: |
+          cargo build --release --locked --no-default-features
+          cargo test --locked --workspace --no-default-features
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
