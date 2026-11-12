@@ -14,16 +14,22 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends patch \
  && rm -rf /var/lib/apt/lists/*
 
-# Dependency layer: compile the tree once with a stub main so that a source-only
-# change does not re-download and re-compile every crate.
+# Dependency layer: compile the tree once with stub sources so that a source-only
+# change does not re-download and re-compile every crate. The workspace has two
+# members now, and cargo resolves both manifests before it builds anything, so
+# the stub has to exist for the engine as well as the server.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
+COPY render/Cargo.toml ./render/Cargo.toml
+RUN mkdir -p src render/src \
  && printf 'fn main() {}\n' > src/main.rs \
+ && printf '' > render/src/lib.rs \
+ && printf 'fn main() {}\n' > render/src/main.rs \
  && cargo build --release --locked \
- && rm -rf src
+ && rm -rf src render/src
 
 COPY src ./src
 COPY tests ./tests
+COPY render/src ./render/src
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
