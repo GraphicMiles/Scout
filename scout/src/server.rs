@@ -298,6 +298,7 @@ fn route_name(method: &Method, path: &str) -> &'static str {
         ("POST", "/v1/extract") => "extract",
         ("POST", "/v1/interact") => "interact",
         ("POST", "/v1/eval") => "eval",
+        ("POST", "/v1/screenshot") => "screenshot",
         ("POST", "/v1/tasks") => "tasks.create",
         _ if path.starts_with("/v1/sessions/") => "sessions.delete",
         _ if path.starts_with("/v1/tasks/") && path.ends_with("/cancel") => "tasks.cancel",
@@ -480,6 +481,16 @@ async fn openapi(State(state): State<AppState>) -> Response {
                 "delete": op("Delete a schedule", None),
             },
             "/v1/tasks/{id}/cancel": { "post": op("Cancel a queued or running task", None) },
+            "/v1/screenshot": {
+                "post": op(
+                    "PNG of the current page, laid out and painted without a browser. Add ?format=json for base64.",
+                    Some(body_of(json!({
+                        "sessionId": sid,
+                        "width": { "type": "integer", "description": "320-3840, default 1280" },
+                        "height": { "type": "integer", "description": "240-2160, default 800" },
+                        "fullPage": { "type": "boolean" },
+                    }), vec!["sessionId"]))),
+            },
             "/v1/tools": { "get": op("Tool manifest for agents", None) },
             "/v1/tools/call": {
                 "post": op("Call a tool by name", Some(body_of(json!({
@@ -628,6 +639,98 @@ async fn extract(State(state): State<AppState>, req: Request<Body>) -> Result<Re
     Ok(Json(out?).into_response())
 }
 
+/// `POST /v1/screenshot` — the page as PNG bytes.
+///
+/// A separate endpoint rather than a base64 field inside `/v1/tools/call`, so a
+/// caller can pipe the response straight into an image decoder instead of paying
+/// a 33% encoding tax. `?format=json` asks for the inline form when that is
+/// easier; both paths run the same renderer with the same network policy.
+#[cfg(feature = "render")]
+async fn screenshot(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
+    let owner = owner_of(&req);
+    let wants_json = req
+        .uri()
+        .query()
+        .map(|q| q.split('&').any(|kv| kv == "format=json"))
+        .unwrap_or(false);
+    let body = read_json(req, state.cfg.max_body_bytes).await?;
+    let m = body
+        .as_object()
+        .ok_or_else(|| ScoutError::invalid("body must be an object"))?;
+    let session_id = m
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ScoutError::invalid("\"sessionId\" is required and must be a string"))?
+        .to_string();
+    let mut rr = crate::render::Render::new(String::new(), String::new());
+    if let Some(w) = m.get("width").and_then(|v| v.as_f64()) {
+        rr.width = w.clamp(320.0, 3840.0) as f32;
+    }
+    if let Some(h) = m.get("height").and_then(|v| v.as_f64()) {
+        rr.height = h.clamp(240.0, 2160.0) as f32;
+    }
+    rr.full_page = m.get("fullPage").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // The document comes from the session, exactly as `page.layout` reads it.
+    let html = state
+        .scout
+        .eval(
+            &owner,
+            &session_id,
+            "return document.documentElement.outerHTML;".to_string(),
+            &crate::abort::Abort::new(),
+        )
+        .await?
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    rr.html = html;
+    rr.base = state
+        .scout
+        .sessions
+        .get(&owner, &session_id)?
+        .referrer()
+        .unwrap_or_default();
+
+    let st = &state;
+    let out = st
+        .scout
+        .tasks
+        .run_inline(None, None, |_abort| {
+            let owner = owner.clone();
+            let session_id = session_id.clone();
+            let rr = rr.clone();
+            async move {
+                if wants_json {
+                    crate::render::page_screenshot(st.scout.as_ref(), &owner, &session_id, rr).await
+                } else {
+                    // The binary path still travels through the same admission
+                    // control as every other route; only the encoding differs.
+                    let (png, w, h) =
+                        crate::render::png_bytes(st.scout.as_ref(), &owner, &session_id, rr).await?;
+                    Ok(json!({
+                        "png": crate::render::base64_encode(&png),
+                        "width": w,
+                        "height": h,
+                    }))
+                }
+            }
+        })
+        .await?;
+
+    if wants_json {
+        return Ok(Json(out).into_response());
+    }
+    let bytes = crate::render::base64_decode(out["png"].as_str().unwrap_or_default())
+        .ok_or_else(|| ScoutError::new(ErrorCode::Internal, "png re-encode failed"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        bytes,
+    )
+        .into_response())
+}
+
 async fn interact(State(state): State<AppState>, req: Request<Body>) -> Result<Response> {
     let owner = owner_of(&req);
     let body = read_json(req, state.cfg.max_body_bytes).await?;
@@ -762,7 +865,7 @@ async fn not_found(method: Method, uri: axum::http::Uri) -> Response {
 
 pub fn build_router(state: AppState) -> Router {
     let mw = state.clone();
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/openapi.json", get(openapi))
         .route("/metrics", get(metrics))
@@ -783,7 +886,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/schedules", get(list_schedules))
         .route("/v1/schedules/:id", get(get_schedule))
         .route("/v1/schedules/:id", delete(delete_schedule))
-        .fallback(not_found)
+        .fallback(not_found);
+    // Screenshots are a compiled-in feature: without the renderer there is no
+    // route to answer, rather than a route that always fails.
+    #[cfg(feature = "render")]
+    let router = router.route("/v1/screenshot", post(screenshot));
+    router
         .layer(middleware::from_fn_with_state(mw, guard))
         .with_state(state)
 }

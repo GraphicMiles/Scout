@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scout Render — capability sheet</title>
+<style>
+  * { box-sizing: border-box }
+  body {
+    margin: 0; padding: 28px 32px 40px;
+    font: 15px/1.5 "DejaVu Sans", sans-serif;
+    color: #1d2129; background: #f6f7f9;
+  }
+  h1 { font-size: 26px; margin: 0 0 4px }
+  .sub { color: #667; margin: 0 0 24px }
+
+  .grid { display: flex; flex-wrap: wrap; gap: 18px }
+  .card {
+    width: 236px; padding: 16px 18px 18px; background: #fff;
+    border-radius: 14px;
+    box-shadow: 0 2px 4px rgba(20, 30, 60, .08), 0 12px 28px rgba(20, 30, 60, .16);
+    position: relative;
+  }
+  .card h2 { font-size: 14px; letter-spacing: .04em; text-transform: uppercase; color: #7a8496; margin: 0 0 10px }
+  .chip {
+    position: absolute; top: -9px; right: 12px;
+    background: #e5484d; color: #fff; font-size: 11px; font-weight: bold;
+    padding: 3px 9px; border-radius: 999px; z-index: 2;
+  }
+  .behind {
+    position: absolute; inset: 8px -6px -8px 40px;
+    background: #ffe8a3; border-radius: 10px; z-index: -1;
+  }
+  .swatches { display: flex; gap: 8px }
+  .swatch { width: 34px; height: 34px; border-radius: 8px }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; background: #eef2ff; color: #3538cd; font-size: 12px; margin: 2px 4px 2px 0 }
+  .gradient {
+    margin-top: 6px; height: 54px; border-radius: 10px; color: #fff;
+    padding: 8px 12px; font-size: 12px; font-weight: bold;
+    background-image: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
+  }
+  .ring { width: 46px; height: 46px; border-radius: 50%; border: 4px solid #2d6cdf; background: #dbe7ff }
+  .imgrow { display: flex; gap: 10px; align-items: center; margin-top: 6px }
+  .imgrow img { width: 46px; height: 46px; border-radius: 8px }
+  .banner {
+    margin-top: 8px; height: 34px; border-radius: 8px;
+    background-image: url("tile.png");
+  }
+  .shadow-only { height: 22px; border-radius: 6px; background: #fff; box-shadow: 0 8px 14px rgba(0, 0, 0, .35) }
+  .shadow-hard { height: 22px; border-radius: 6px; background: #1d2129; box-shadow: 4px 4px 0 #ffb020 }
+
+  table { border-collapse: separate; border-spacing: 0; width: 100%; margin-top: 6px; font-size: 13px }
+  td, th { text-align: left; padding: 3px 6px; border-bottom: 1px solid #e6e8ec }
+  th { color: #7a8496; font-weight: bold; font-size: 11px; text-transform: uppercase }
+
+  .script { font-size: 17px; line-height: 1.7 }
+  .rtl { direction: rtl; text-align: right }
+
+  .wide { width: 100%; margin-top: 22px }
+  .wide h2 { font-size: 14px; letter-spacing: .04em; text-transform: uppercase; color: #7a8496; margin: 0 0 10px }
+  .panel { background: #fff; border-radius: 14px; padding: 18px 20px; box-shadow: 0 1px 2px rgba(20,30,60,.06), 0 8px 20px rgba(20,30,60,.08) }
+  .columns { display: flex; gap: 18px }
+  .columns > div { flex: 1 1 0 }
+  .bar { height: 8px; border-radius: 999px; background: #e6e8ec; overflow: hidden; margin: 10px 0 2px }
+  .bar > i { display: block; height: 8px; width: 68%; border-radius: 999px; background: linear-gradient(90deg, #12b76a, #32d583) }
+  ul { margin: 8px 0 0 18px; padding: 0 }
+  li { margin: 3px 0 }
+</style>
+</head>
+<body>
+  <h1>Scout Render</h1>
+  <p class="sub">Every box on this page is drawn by the engine: rounded corners, two-layer shadows, gradients, images, stacking order, tables and shaped text.</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="behind"></div>
+      <span class="chip">NEW</span>
+      <h2>Radius &amp; shadow</h2>
+      <p>14 px corners, a tight shadow and a wide soft one, stacked.</p>
+      <div class="shadow-only"></div>
+      <div class="shadow-hard" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Gradient</h2>
+      <div class="gradient">135deg · two stops</div>
+      <div class="bar"><i></i></div>
+      <p style="margin:8px 0 0">A linear gradient clipped to a rounded box, used as a progress bar.</p>
+    </div>
+
+    <div class="card">
+      <h2>Images</h2>
+      <div class="imgrow">
+        <img src="tile.png" alt="tile">
+        <img src="tile.png" alt="tile" style="border-radius:50%">
+        <span class="ring"></span>
+      </div>
+      <div class="banner"></div>
+      <p style="margin:8px 0 0">An <code>&lt;img&gt;</code> sized by CSS, and a <code>background-image</code> tile.</p>
+    </div>
+
+    <div class="card">
+      <h2>Stacking</h2>
+      <p style="margin:0 0 8px">A badge above the card, a panel behind it — <code>z-index: 2</code> and <code>-1</code>.</p>
+      <div class="swatches">
+        <div class="swatch" style="background:#0ba5ec"></div>
+        <div class="swatch" style="background:#12b76a"></div>
+        <div class="swatch" style="background:#f79009"></div>
+        <div class="swatch" style="background:#f04438"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Table</h2>
+      <table>
+        <tr><th>prop</th><th>value</th></tr>
+        <tr><td>radius</td><td>14 px</td></tr>
+        <tr><td>shadow</td><td>2 layers</td></tr>
+        <tr><td>gradient</td><td>135 deg</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Inline flow</h2>
+      <p style="margin:0 0 8px">
+        <span class="pill">inline-block</span><span class="pill">pill</span><span class="pill">boxes</span>
+        sit on one baseline with text, and wrap when the line runs out of room.
+      </p>
+      <p style="margin:0">Text runs through <strong>bold</strong>, <em>italic</em> and <a href="#">links</a>.</p>
+    </div>
+  </div>
+
+  <div class="wide panel">
+    <div class="columns">
+      <div>
+        <h2>Shaped text</h2>
+        <div class="script">Здравствуйте — <b>кириллица</b></div>
+        <div class="script rtl">مرحبا بالعالم</div>
+        <div class="script">नमस्ते दुनिया</div>
+        <div class="script">こんにちは世界</div>
+      </div>
+      <div>
+        <h2>Flex columns</h2>
+        <p style="margin:0">Two equal columns, each a flex item with <code>flex: 1 1 0</code>, separated by a gap.</p>
+        <ul>
+          <li>block, inline and inline-block</li>
+          <li>floats with text wrapped around</li>
+          <li>absolute and fixed positioning</li>
+        </ul>
+      </div>
+      <div>
+        <h2>What it refuses</h2>
+        <p style="margin:0">Scripts, grid, transforms and web fonts are reported as unsupported rather than guessed at, so a snapshot never lies about a box it could not place.</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

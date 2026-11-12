@@ -8,6 +8,9 @@ It is not a Chromium replacement. It is one small binary that starts in
 milliseconds and idles around five megabytes, where a real browser idles in the
 hundreds.
 
+It also lays pages out and screenshots them: the renderer is part of the same
+binary, so a crawler that only needed geometry never pays for a browser.
+
 ## Why it exists
 
 Automation gets expensive at the edges. A full browser per worker costs memory
@@ -25,7 +28,10 @@ back. Scout keeps the useful part of a browser and drops the rest.
   actually for.
 - **Call it over HTTP** with a bearer key, so a service can use it from any
   language.
-- **Run it on a small machine.** One binary, no browser download.
+- **Lay a page out and screenshot it** — boxes, computed styles and a PNG, with
+  no browser involved.
+- **Run it on a small machine.** One binary, no browser download; 5.8 MB without
+  the renderer, 7.9 MB with it.
 
 ## Install
 
@@ -54,10 +60,40 @@ cargo build --release
 SCOUT_BIN=./target/release/scout npm install github:GraphicMiles/Scout
 ```
 
+## Rendering
+
+`page.layout()` returns every element's box, tag, text and computed styles;
+`page.screenshot()` returns a PNG. Both run the engine in `scout/render`, a CSS
+layout and paint implementation with no browser, no downloads and no GPU.
+
+```js
+const layout = await page.layout();          // { elements, document, viewport }
+const png = await page.screenshot();         // PNG bytes, or { encoding: 'base64' }
+```
+
+Over HTTP: `POST /v1/tools/call` with `{"name": "page.layout", "arguments":
+{sessionId}}`, and `POST /v1/screenshot` with `{ sessionId, width, height,
+fullPage }`, which answers with a PNG (`?format=json` for base64).
+
+What it agrees with Chromium on, measured on 20 live sites and 11,935 matched
+boxes (see `scout/render/bench/results.md`): 0.3% of boxes land within 2 px of
+Chromium's page-absolute position, 12.2% when measured against their parent,
+and screenshots score a mean SSIM of 0.682 against Chromium's. On the 16-page
+fixture gate, where Chromium's own screenshots are the reference, the median is
+0.993.
+
+It draws block, inline, flex and table layout, the CSS 2.1 box model, floats,
+positioning, gradients, shadows, background images, SVG, `@font-face`, and text
+shaped by HarfBuzz — Latin, Arabic, Hebrew, Devanagari and CJK. Memory stays
+flat: laying out example.com peaks at 7 MB of RSS and a 1280×800 screenshot at
+15 MB; a 23,000-pixel-tall Stripe page costs 14 MB to lay out and 23 MB to
+screenshot, and Wikipedia's front page, the heaviest in the benchmark, 45 and
+49 MB. It renders the DOM the session holds, so it sees what page scripts
+changed in the document, but it does not run canvas, video or WebGL, and a
+`display: grid` container lays its children out as blocks rather than columns.
+
 ## What is not here
 
-- No rendering and no screenshots. If a site needs a real layout engine to work,
-  this is the wrong tool.
 - No video, canvas or WebGL support.
 - The sandbox runs the page's JavaScript, not a full browser security model.
   Treat the content it returns as untrusted input.
@@ -67,8 +103,9 @@ SCOUT_BIN=./target/release/scout npm install github:GraphicMiles/Scout
 ## How it is built
 
 ```
-scout/       the Rust runtime: HTTP API, DOM, sandbox, extraction
-driver/      the JavaScript client published to npm
+scout/          the Rust runtime: HTTP API, DOM, sandbox, extraction
+scout/render/   the layout and paint engine, and its benchmark
+driver/         the JavaScript client published to npm
 package.json, postinstall.mjs   npm packaging and binary download
 ```
 

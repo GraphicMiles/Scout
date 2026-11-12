@@ -19,6 +19,27 @@ export interface InteractResult {
   warnings?: Warning[];
 }
 
+export interface Box { x: number; y: number; width: number; height: number }
+export interface LayoutElement {
+  /** CSS-like path from the root, e.g. "html > body > div:nth-of-type(2) > h1". */
+  path: string;
+  tag: string;
+  rect: Box;
+  text?: string;
+  styles?: Record<string, string>;
+}
+export interface LayoutResult {
+  elements: LayoutElement[];
+  document: { height: number };
+  viewport: { width: number; height: number };
+  elapsed_ms?: number;
+  /** Present when the page had more boxes than `maxElements`. */
+  truncated?: { shown: number; total: number };
+  /** Assets the engine could not load, with the reason (a blocked host, a 404). */
+  failed?: { url: string; reason: string }[];
+}
+export interface ScreenshotOptions { width?: number; height?: number; fullPage?: boolean; encoding?: 'buffer' | 'base64'; signal?: AbortSignal }
+
 export interface EvalResult {
   /** The script's return value, as JSON. Null when the script returned nothing. */
   value: unknown;
@@ -93,6 +114,15 @@ export class ScoutClient {
 
   /** A request with the session's cookies, returned unparsed, under the SSRF policy. */
   request(p: RequestParams, o?: { signal?: AbortSignal }): Promise<RequestResult>;
+  /**
+   * Geometry of the current page from Scout's in-process layout engine.
+   * No browser is started. Boxes are exact where the CSS is simple and drift by
+   * a few pixels where the page relies on features the engine lacks.
+   */
+  layout(sessionId: string, o?: { width?: number; height?: number; maxElements?: number; signal?: AbortSignal }): Promise<LayoutResult>;
+  /** A PNG of the current page, drawn in-process rather than by a browser. */
+  screenshot(sessionId: string, o?: ScreenshotOptions & { encoding?: 'buffer' }): Promise<Uint8Array>;
+  screenshot(sessionId: string, o: ScreenshotOptions & { encoding: 'base64' }): Promise<string>;
   /** Discover the agent-facing tool layer. */
   tools(): Promise<ToolDef[]>;
   callTool(name: string, args?: Record<string, unknown>, o?: { signal?: AbortSignal }): Promise<unknown>;

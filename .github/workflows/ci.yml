@@ -23,8 +23,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Unit and API tests
-        run: cargo test --locked
+      - name: Unit, API and renderer tests
+        run: cargo test --locked --workspace
 
       - uses: actions/setup-node@v4
         with:

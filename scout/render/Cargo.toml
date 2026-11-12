@@ -1,0 +1,35 @@
+[package]
+name = "scout-render"
+version = "0.1.0"
+edition = "2021"
+description = "Scout's layout and paint engine: HTML + CSS to geometry and pixels, without a browser"
+license = "MIT"
+repository = "https://github.com/GraphicMiles/Scout"
+
+[lib]
+name = "scout_render"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scout-render"
+path = "src/main.rs"
+
+[dependencies]
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+taffy = { version = "0.15", default-features = false, features = ["flexbox", "taffy_tree", "std"] }
+tiny-skia = "0.11"
+png = "0.17"
+rustybuzz = "0.14"
+ttf-parser = "0.21"
+zune-jpeg = "0.4"
+# Vector SVG only. The text and raster-image features pull a second font stack
+# and a WebP/GIF decoder into a binary that already shapes its own text and
+# decodes its own bitmaps. SVG icons are paths, which is all that survives.
+resvg = { version = "0.44", default-features = false }
+usvg = { version = "0.44", default-features = false }
+flate2 = "1"
+woff2-patched = "0.4"
+
+[dev-dependencies]
+serde_json = "1"

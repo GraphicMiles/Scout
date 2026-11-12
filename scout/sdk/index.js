@@ -50,6 +50,21 @@ export class ScoutClient {
     }
   }
 
+  async #requestRaw(path, body, signal) {
+    const timeout = AbortSignal.timeout(this.#timeout);
+    const res = await this.#fetch(this.#base + path, {
+      method: 'POST',
+      headers: { ...(this.#key ? { authorization: `Bearer ${this.#key}` } : {}), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+    if (res.ok) return res;
+    const raw = await res.text();
+    let json = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch { /* non-JSON body from a proxy */ }
+    throw new ScoutApiError(res.status, json, Number(res.headers.get('retry-after')) || undefined);
+  }
+
   health() { return this.#request('GET', '/health'); }
   strategies() { return this.#request('GET', '/v1/strategies').then((r) => r.strategies); }
   createSession() { return this.#request('POST', '/v1/sessions', {}); }
@@ -70,6 +85,29 @@ export class ScoutClient {
    * for reading and writing an API as an authenticated user.
    */
   request(params, opts) { return this.#request('POST', '/v1/request', params, opts?.signal); }
+
+  /**
+   * Geometry of the current page, from Scout's own layout engine.
+   * Returns { elements: [{ path, tag, rect, text, styles }], document, viewport }.
+   */
+  layout(sessionId, opts = {}) {
+    const { width, height, maxElements, signal } = opts;
+    return this.callTool('page.layout', { sessionId, width, height, maxElements }, { signal });
+  }
+
+  /**
+   * A PNG of the current page, drawn in-process. Resolves to a Buffer (Node) or
+   * Uint8Array; pass `{ encoding: 'base64' }` for a string. This is not Chromium:
+   * pages that need CSS Grid or multi-column layout will not look right, and
+   * `layout()` is the ground truth for what the engine actually placed.
+   */
+  async screenshot(sessionId, opts = {}) {
+    const { width, height, fullPage, encoding = 'buffer', signal } = opts;
+    const res = await this.#requestRaw('/v1/screenshot', { sessionId, width, height, fullPage }, signal);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (encoding === 'base64') return Buffer.from(bytes).toString('base64');
+    return typeof Buffer !== 'undefined' ? Buffer.from(bytes) : bytes;
+  }
 
   /** Discover the agent-facing tool layer. */
   tools() { return this.#request('GET', '/v1/tools').then((r) => r.tools); }

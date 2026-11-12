@@ -22,6 +22,8 @@ pub mod logger;
 pub mod metrics;
 pub mod mcp;
 pub mod page;
+#[cfg(feature = "render")]
+pub mod render;
 pub mod resources;
 pub mod schedules;
 pub mod scout;

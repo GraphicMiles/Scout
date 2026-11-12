@@ -186,6 +186,19 @@ function makePage(client, sessionId) {
       return r.value;
     },
 
+    /**
+     * Every element's box, from Scout's own layout engine — the Playwright-shaped
+     * way to ask "where is this on the page" without a browser.
+     */
+    layout(opts = {}) {
+      return client.layout(sessionId, opts);
+    },
+
+    /** A PNG of the page, as a Buffer. `opts: { width, height, fullPage }` */
+    screenshot(opts = {}) {
+      return client.screenshot(sessionId, opts);
+    },
+
     click(selector) {
       return client.interact({ sessionId, action: { type: 'click', selector } });
     },

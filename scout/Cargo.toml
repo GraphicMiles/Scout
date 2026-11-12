@@ -30,8 +30,19 @@ bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 serde_urlencoded = "0.7"
 
+scout-render = { path = "render", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+[features]
+# Layout and paint run in-process. On by default: `page.layout` and
+# `page.screenshot` are part of the product surface, not an add-on.
+default = ["render"]
+render = ["dep:scout-render"]
+
+[workspace]
+members = [".", "render"]
 
 [profile.release]
 opt-level = "z"

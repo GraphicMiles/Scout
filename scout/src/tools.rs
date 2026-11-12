@@ -133,6 +133,18 @@ pub fn manifest() -> Value {
         tool("page.links", "Every link on the page, with absolute URLs.", json!({ "sessionId": sid(), "limit": { "type": "integer", "minimum": 1 } }), &["sessionId"]),
         tool("page.forms", "Every form on the page with its fields, methods and actions.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("page.title", "Document title and current URL.", json!({ "sessionId": sid() }), &["sessionId"]),
+        tool("page.layout", "Geometry of the current page, computed in-process by Scout's own layout engine: every element's border box, its text, and the styles that positioned it. Works on the page the session has loaded; no browser is started. Scores 0.3% exact-box agreement with Chromium page-absolute and 12.3% parent-relative across twenty real sites, so treat small offsets as expected and read boxes relative to their parent when precision matters.", json!({
+            "sessionId": sid(),
+            "width": { "type": "integer", "minimum": 320, "maximum": 3840, "description": "Viewport width in CSS pixels, default 1280" },
+            "height": { "type": "integer", "minimum": 240, "maximum": 2160, "description": "Viewport height in CSS pixels, default 800" },
+            "maxElements": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Cap on returned boxes, default 1500; the response says so when it truncates" }
+        }), &["sessionId"]),
+        tool("page.screenshot", "A PNG of the current page, drawn by Scout's own paint engine rather than a browser, returned base64-encoded with its pixel size. Faster and far smaller than launching Chromium, at the cost of fidelity on pages that need CSS Grid, multi-column layout or transforms.", json!({
+            "sessionId": sid(),
+            "width": { "type": "integer", "minimum": 320, "maximum": 3840 },
+            "height": { "type": "integer", "minimum": 240, "maximum": 2160 },
+            "fullPage": { "type": "boolean", "description": "Capture the whole document instead of the viewport" }
+        }), &["sessionId"]),
         tool("page.digest", "A token-cheap summary of the page: title, top headings, links, forms with their fields, and button labels.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("cookies.get", "List every cookie in the session jar, including HttpOnly ones that page scripts cannot see.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("cookies.set", "Seed the jar with a raw cookie value, for example to resume a signed-in session.", json!({ "sessionId": sid(), "url": { "type": "string" }, "cookie": { "type": "string" } }), &["sessionId", "url", "cookie"]),
@@ -145,6 +157,14 @@ pub fn manifest() -> Value {
         tool("schedule.delete", "Stop and remove a recurring schedule.", json!({ "scheduleId": { "type": "string" } }), &["scheduleId"]),
         tool("strategies", "List extraction strategies and their verification state.", json!({}), &[]),
     ];
+
+    // A build without the renderer serves neither tool, and does not advertise
+    // them: an agent should not plan around a capability the binary lacks.
+    #[cfg(not(feature = "render"))]
+    let tools: Vec<_> = tools
+        .into_iter()
+        .filter(|t| !matches!(t.name, "page.layout" | "page.screenshot"))
+        .collect();
 
     json!({
         "tools": tools.iter().map(|t| json!({
@@ -416,6 +436,52 @@ pub async fn call(
         }
 
         "evaluate" => scout.eval(owner, &str_arg("sessionId")?, str_arg("script")?, abort).await?,
+
+        #[cfg(not(feature = "render"))]
+        "page.layout" | "page.screenshot" => {
+            return Err(invalid(
+                "this build of Scout was compiled without the renderer",
+            ))
+        }
+
+        #[cfg(feature = "render")]
+        "page.layout" | "page.screenshot" => {
+            let sid = str_arg("sessionId")?;
+            // The page the session actually holds: same DOM the other page.*
+            // tools read, so geometry and text cannot disagree.
+            let html = eval_value(
+                scout,
+                owner,
+                &sid,
+                "return document.documentElement.outerHTML;",
+                abort,
+            )
+            .await?;
+            let Some(html) = html.as_str() else {
+                return Err(invalid("the session has no document to render"));
+            };
+            let base = scout
+                .sessions
+                .get(owner, &sid)?
+                .referrer()
+                .unwrap_or_default();
+            let mut req = crate::render::Render::new(html.to_string(), base);
+            if let Some(w) = obj.get("width").and_then(|v| v.as_f64()) {
+                req.width = w.clamp(320.0, 3840.0) as f32;
+            }
+            if let Some(h) = obj.get("height").and_then(|v| v.as_f64()) {
+                req.height = h.clamp(240.0, 2160.0) as f32;
+            }
+            req.full_page = obj.get("fullPage").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(n) = obj.get("maxElements").and_then(|v| v.as_u64()) {
+                req.max_elements = (n as usize).clamp(1, 5000);
+            }
+            if name == "page.layout" {
+                crate::render::page_layout(scout, owner, &sid, req).await?
+            } else {
+                crate::render::page_screenshot(scout, owner, &sid, req).await?
+            }
+        }
 
         "page.digest" => {
             let sid = str_arg("sessionId")?;

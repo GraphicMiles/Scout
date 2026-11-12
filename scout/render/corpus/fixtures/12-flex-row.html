@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>12-flex-row</title><style>
+*{margin:0;padding:0}
+body{font:16px/1.4 'DejaVu Sans';width:800px}
+
+.row{display:flex;width:600px;height:100px}
+.a{width:100px;background:#ddd}
+.b{flex:1;background:#bbb}
+.c{width:80px;background:#999}
+.gap{display:flex;gap:10px;width:300px;margin-top:20px}
+.gap>div{flex:1;height:40px;background:#ccc}
+</style></head><body>
+<div class="row"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="gap"><div></div><div></div><div></div></div>
+</body></html>
