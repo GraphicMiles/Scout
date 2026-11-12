@@ -29,7 +29,9 @@ RUN mkdir -p src render/src \
 
 COPY src ./src
 COPY tests ./tests
-COPY render/src ./render/src
+# Trailing slashes: this copies the engine's sources into ./render/src rather
+# than nesting them at ./render/src/src.
+COPY render/src/ ./render/src/
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
