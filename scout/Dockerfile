@@ -32,7 +32,13 @@ COPY tests ./tests
 # Trailing slashes: this copies the engine's sources into ./render/src rather
 # than nesting them at ./render/src/src.
 COPY render/src/ ./render/src/
-RUN touch src/main.rs && cargo build --release --locked
+# Cargo decides what to rebuild by mtime, and COPY preserves the repository's
+# timestamps. The stub layer is newer than the sources it just replaced, so
+# without this touch cargo reuses the empty stub library and the server fails to
+# link against functions that were never built.
+RUN touch src/main.rs src/lib.rs \
+ && find render/src -name '*.rs' -exec touch {} + \
+ && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 # rustls needs a trust store; the binary itself has no OpenSSL dependency.
