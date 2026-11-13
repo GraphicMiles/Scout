@@ -190,7 +190,7 @@ fn chrono_free_parse(s: &str) -> Result<String, ()> {
     let (y, m, d) = date_part;
 
     // Validate the calendar date.
-    if !(1..=12).contains(&m) || d < 1 || d > 31 || y < 1 {
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return Err(());
     }
     let dim = days_in_month(y, m);
@@ -220,12 +220,12 @@ fn chrono_free_parse(s: &str) -> Result<String, ()> {
                 if tz == "Z" || tz == "z" {
                     offset_minutes = 0;
                 } else if let Some(sign_end) = tz.find(['+', '-']) {
-                    let sign = if tz.as_bytes()[sign_end] == b'-' { -1 } else { 1 };
+                    let sign = if tz.as_bytes()[sign_end] == b'-' { -1i32 } else { 1i32 };
                     let body = &tz[sign_end + 1..];
                     let (oh, om) = match body.split_once(':') {
                         Some((a, b)) => (a, b),
                         None => {
-                            if body.len() == 4 {
+                            if body.len() == 4 && body.is_ascii() {
                                 (&body[..2], &body[2..])
                             } else {
                                 (body, "0")
@@ -234,6 +234,9 @@ fn chrono_free_parse(s: &str) -> Result<String, ()> {
                     };
                     let oh: i32 = oh.parse().map_err(|_| ())?;
                     let om: i32 = om.parse().map_err(|_| ())?;
+                    if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                        return Err(());
+                    }
                     offset_minutes = sign * (oh * 60 + om);
                 }
             }
@@ -242,8 +245,11 @@ fn chrono_free_parse(s: &str) -> Result<String, ()> {
 
     // Convert to UTC and emit a canonical ISO-8601 string. Days-from-civil below
     // is Howard Hinnant's algorithm, matching the logger's formatter.
-    let utc_seconds = days_from_civil(y, m, d) * 86_400 + (hh as i64) * 3600 + (mm as i64) * 60 + ss as i64
-        - (offset_minutes as i64) * 60;
+    let utc_seconds = days_from_civil(y, m, d)
+        .checked_mul(86_400)
+        .and_then(|s| s.checked_add(i64::from(hh) * 3600 + i64::from(mm) * 60 + i64::from(ss)))
+        .and_then(|s| s.checked_sub(i64::from(offset_minutes) * 60))
+        .ok_or(())?;
     Ok(format_iso(utc_seconds))
 }
 
@@ -795,6 +801,11 @@ mod tests {
         assert!(parse_date("not a date").is_none());
         assert!(parse_date("2024-13-01").is_none());
         assert!(parse_date("2023-02-29").is_none());
+        // Pathological years and timezone offsets must reject cleanly without overflow.
+        assert!(parse_date("9999-12-31T23:59:59+999999999:00").is_none());
+        assert!(parse_date("99999999-01-01").is_none());
+        assert!(parse_date("2024-03-05T14:30:00+25:00").is_none());
+        assert!(parse_date("2024-03-05T14:30:00-00:99").is_none());
     }
 
     #[test]

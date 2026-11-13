@@ -1191,9 +1191,14 @@ mod tools_api {
             assert_eq!(t["inputSchema"]["type"], json!("object"));
         }
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "tool manifest must not list duplicate tool names");
         for expected in ["navigate", "extract", "page.forms", "cookies.get", "fill", "submit"] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+        let nav = tools.iter().find(|t| t["name"] == "navigate").unwrap();
+        assert!(nav["inputSchema"]["properties"].get("method").is_none());
+        assert!(nav["inputSchema"]["properties"].get("body").is_none());
     }
 
     #[tokio::test]
@@ -2481,5 +2486,282 @@ mod page_network_api {
         assert_eq!(body["origin"], json!(h.fixture), "{body}");
         assert_eq!(body["referer"], json!(format!("{}/", h.fixture)), "{body}");
         assert_eq!(body["sec-fetch-site"], json!("same-origin"), "{body}");
+    }
+}
+
+mod security_and_reliability_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn proxy_ssrf_is_blocked_and_allowed_proxy_credentials_are_redacted() {
+        let h = harness().await;
+        // Metadata IP in proxyUrl must be refused by SSRF validation.
+        let (status, bad) = h
+            .post(
+                "/v1/sessions",
+                json!({ "proxyUrl": "http://169.254.169.254:8080" }),
+            )
+            .await;
+        assert_eq!(status, 403, "expected SSRF block on metadata proxy: {bad}");
+        assert_eq!(bad["error"]["code"], json!("blocked_destination"));
+
+        // Loopback is allowlisted on this harness; credentials in proxyUrl must never leak in GET /v1/sessions.
+        let (status, created) = h
+            .post(
+                "/v1/sessions",
+                json!({ "proxyUrl": "http://alice:supersecret@127.0.0.1:8888" }),
+            )
+            .await;
+        assert_eq!(status, 201, "expected allowed loopback proxy: {created}");
+        let sid = created["id"].as_str().unwrap();
+        let (_, list) = h.get("/v1/sessions").await;
+        let dumped = serde_json::to_string(&list).unwrap();
+        assert!(
+            !dumped.contains("supersecret") && !dumped.contains("alice"),
+            "proxy credentials leaked in session list: {dumped}"
+        );
+        assert!(dumped.contains("***@127.0.0.1:8888"), "got: {dumped}");
+        let _ = h.reqwest_delete(&format!("/v1/sessions/{sid}")).await;
+    }
+
+    #[tokio::test]
+    async fn cross_origin_fetch_cors_samesite_and_iframe_isolation_hold_end_to_end() {
+        let h = harness().await;
+
+        // Spin up a second loopback origin on a distinct port (different origin!).
+        let other_app = Router::new()
+            .route(
+                "/set-strict",
+                get(|| async {
+                    (
+                        [(
+                            "set-cookie",
+                            "strict_tok=topsecret; Path=/; SameSite=Strict; HttpOnly",
+                        )],
+                        Html("<html><body>strict set</body></html>"),
+                    )
+                }),
+            )
+            .route(
+                "/no-cors-secret",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let c = headers
+                        .get("cookie")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    Html(format!("secret-body:{c}"))
+                }),
+            )
+            .route(
+                "/wildcard-cors",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let c = headers
+                        .get("cookie")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    (
+                        [("access-control-allow-origin", "*")],
+                        format!("public:{c}"),
+                    )
+                }),
+            )
+            .route(
+                "/private-frame",
+                get(|| async { Html("<html><body><p id='xframe'>cross-origin-secret</p></body></html>") }),
+            );
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let origin_b = format!("http://127.0.0.1:{}", addr_b.port());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener_b, other_app).await;
+        });
+
+        // Also spin up a third origin serving a page that embeds `origin_b/private-frame` cross-origin
+        // plus a same-origin frame with X-Frame-Options: DENY.
+        let origin_b_for_embed = origin_b.clone();
+        let host_app = Router::new()
+            .route(
+                "/host",
+                get(move || {
+                    let ob = origin_b_for_embed.clone();
+                    async move {
+                        Html(format!(
+                            "<html><body><h1>Host</h1>\
+                             <iframe src=\"{ob}/private-frame\"></iframe>\
+                             <iframe src=\"/denied-frame\"></iframe>\
+                             <iframe src=\"/allowed-frame\"></iframe>\
+                             </body></html>"
+                        ))
+                    }
+                }),
+            )
+            .route(
+                "/denied-frame",
+                get(|| async {
+                    (
+                        [("x-frame-options", "DENY")],
+                        Html("<html><body><p class='denied'>must-not-fold</p></body></html>"),
+                    )
+                }),
+            )
+            .route(
+                "/allowed-frame",
+                get(|| async {
+                    Html("<html><body><p class='allowed'>same-origin-folded</p></body></html>")
+                }),
+            );
+        let listener_c = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_c = listener_c.local_addr().unwrap();
+        let origin_c = format!("http://127.0.0.1:{}", addr_c.port());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener_c, host_app).await;
+        });
+
+        let (_, created) = h.post("/v1/sessions", json!({})).await;
+        let sid = created["id"].as_str().unwrap();
+
+        // 1. Visit origin_b to store a SameSite=Strict cookie in the session jar.
+        let (st, _) = h
+            .post(
+                "/v1/navigate",
+                json!({ "sessionId": sid, "url": format!("{origin_b}/set-strict") }),
+            )
+            .await;
+        assert_eq!(st, 200);
+
+        // 2. Navigate to origin_c/host: cross-origin iframe and X-Frame-Options: DENY iframe
+        // must NOT fold into the DOM, while same-origin allowed-frame DOES fold.
+        let (st, _) = h
+            .post(
+                "/v1/navigate",
+                json!({ "sessionId": sid, "url": format!("{origin_c}/host") }),
+            )
+            .await;
+        assert_eq!(st, 200);
+        let (st_text, page_text) = h
+            .post(
+                "/v1/tools/call",
+                json!({ "name": "page.text", "arguments": { "sessionId": sid } }),
+            )
+            .await;
+        assert_eq!(st_text, 200);
+        let text = page_text["text"].as_str().unwrap_or("");
+        assert!(text.contains("same-origin-folded"), "same-origin frame should fold: {text}");
+        assert!(!text.contains("cross-origin-secret"), "cross-origin iframe UXSS must be blocked: {text}");
+        assert!(!text.contains("must-not-fold"), "X-Frame-Options DENY must be respected: {text}");
+
+        // 3. From origin_c, JS fetch to origin_b/no-cors-secret (no ACAO header) must reject!
+        let (_, eval_sop) = h
+            .post(
+                "/v1/eval",
+                json!({
+                    "sessionId": sid,
+                    "script": format!(
+                        "return fetch('{origin_b}/no-cors-secret').then(r => r.text()).catch(e => 'BLOCKED:' + e.message);"
+                    )
+                }),
+            )
+            .await;
+        let sop_val = eval_sop["value"].as_str().unwrap_or("");
+        assert!(sop_val.starts_with("BLOCKED:"), "expected SOP/CORS rejection, got: {sop_val}");
+
+        // 4. Wildcard ACAO (`*`) allows reading public response with default `same-origin` credentials
+        // (so `strict_tok` is NOT sent!), and rejects `credentials: 'include'`.
+        let (_, eval_pub) = h
+            .post(
+                "/v1/eval",
+                json!({
+                    "sessionId": sid,
+                    "script": format!("return fetch('{origin_b}/wildcard-cors').then(r => r.text());")
+                }),
+            )
+            .await;
+        assert_eq!(eval_pub["value"], json!("public:none"));
+
+        let (_, eval_inc) = h
+            .post(
+                "/v1/eval",
+                json!({
+                    "sessionId": sid,
+                    "script": format!(
+                        "return fetch('{origin_b}/wildcard-cors', {{ credentials: 'include' }}).then(r => r.text()).catch(e => 'BLOCKED:' + e.message);"
+                    )
+                }),
+            )
+            .await;
+        let inc_val = eval_inc["value"].as_str().unwrap_or("");
+        assert!(inc_val.starts_with("BLOCKED:"), "wildcard ACAO must reject include credentials: {inc_val}");
+    }
+
+    #[tokio::test]
+    async fn deep_dom_is_rejected_cleanly_and_task_extract_step_url_navigates() {
+        let h = harness().await;
+
+        let deep_html = format!("<html><body>{}leaf{}</body></html>", "<div>".repeat(600), "</div>".repeat(600));
+        let deep_app = Router::new().route("/too-deep", get(move || {
+            let body = deep_html.clone();
+            async move { Html(body) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, deep_app).await;
+        });
+
+        let (_, created) = h.post("/v1/sessions", json!({})).await;
+        let sid = created["id"].as_str().unwrap();
+
+        let (st, err_body) = h
+            .post(
+                "/v1/navigate",
+                json!({ "sessionId": sid, "url": format!("http://127.0.0.1:{}/too-deep", addr.port()) }),
+            )
+            .await;
+        assert_eq!(st, 502, "expected 502 response_too_large on 600-deep DOM: {err_body}");
+        assert_eq!(err_body["error"]["code"], json!("response_too_large"));
+
+        // Worker thread and session remain healthy afterwards.
+        let (st_ok, _) = h
+            .post(
+                "/v1/navigate",
+                json!({ "sessionId": sid, "url": format!("{}/", h.fixture) }),
+            )
+            .await;
+        assert_eq!(st_ok, 200);
+
+        // Task `extract` step with an explicit `url` (and no prior navigate step) must navigate first!
+        let (task_st, created_task) = h
+            .post(
+                "/v1/tasks",
+                json!({
+                    "steps": [
+                        {
+                            "op": "extract",
+                            "url": format!("{}/", h.fixture),
+                            "strategy": "generic-page"
+                        }
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(task_st, 202, "task submit failed: {created_task}");
+        let tid = created_task["id"].as_str().unwrap();
+        let mut final_view = Value::Null;
+        for _ in 0..100 {
+            let (_, v) = h.get(&format!("/v1/tasks/{tid}")).await;
+            if v["status"] == "succeeded" || v["status"] == "failed" {
+                final_view = v;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(final_view["status"], json!("succeeded"), "{final_view}");
+        assert_eq!(
+            final_view["result"]["steps"][0]["result"]["data"]["title"],
+            json!("Fixture Page"),
+            "extract step with url must navigate before extracting: {final_view}"
+        );
     }
 }

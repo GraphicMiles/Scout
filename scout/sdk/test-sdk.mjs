@@ -255,6 +255,37 @@ await check('request() returns the response unparsed', async () => {
   });
 });
 
+await check('createSession forwards options and screenshot base64 works without Buffer', async () => {
+  const s = await scout.createSession({ label: 'sdk-opts', locale: 'fr-FR' });
+  try {
+    assert(s.label === 'sdk-opts', `label was ${s.label}`);
+    assert(s.locale === 'fr-FR', `locale was ${s.locale}`);
+    await scout.navigate({ sessionId: s.id, url: 'https://example.com/' });
+    const savedBuffer = globalThis.Buffer;
+    const browserFetch = async (url, init) => {
+      const res = await fetch(url, init);
+      const ab = await res.arrayBuffer();
+      globalThis.Buffer = undefined;
+      return {
+        ok: res.ok,
+        status: res.status,
+        headers: res.headers,
+        arrayBuffer: async () => ab,
+        text: async () => new TextDecoder().decode(ab),
+      };
+    };
+    const browserClient = new ScoutClient({ baseUrl, apiKey, fetch: browserFetch });
+    try {
+      const b64 = await browserClient.screenshot(s.id, { width: 320, height: 200, encoding: 'base64' });
+      assert(typeof b64 === 'string' && b64.startsWith('iVBORw0KGgo'), 'expected base64 PNG header');
+    } finally {
+      globalThis.Buffer = savedBuffer;
+    }
+  } finally {
+    await scout.destroySession(s.id).catch(() => {});
+  }
+});
+
 // Signing in is only exercised against a fixture the operator points at: a
 // public site's login form is not ours to test against.
 const fixture = process.env.SCOUT_FIXTURE_URL;

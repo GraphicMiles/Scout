@@ -2,13 +2,20 @@ export interface ScoutClientOptions { baseUrl: string; apiKey?: string; timeoutM
 export interface Warning { code: string; message: string; [k: string]: unknown }
 export interface FieldSpec { selector?: string; attr?: string; type?: 'string' | 'url' | 'number' | 'price' | 'date'; multiple?: boolean }
 export interface Schema { item?: string; fields: Record<string, string | FieldSpec> }
-export interface ExtractParams {
-  sessionId?: string; url?: string; strategy?: string; schema?: Schema; limit?: number; timeoutMs?: number;
+export interface SessionOptions {
+  label?: string;
+  locale?: string;
+  timezone?: string;
+  humanize?: boolean;
+  proxyUrl?: string;
 }
-export interface ExtractResult<T = unknown> { data: T; warnings: Warning[]; meta: { strategy: string; url: string; status: number; durationMs: number } }
+export interface ExtractParams {
+  sessionId?: string; url?: string; strategy?: string; schema?: Schema; limit?: number; timeoutMs?: number; nextSelector?: string; maxPages?: number;
+}
+export interface ExtractResult<T = unknown> { data: T; warnings: Warning[]; meta: { strategy: string; url: string; status: number; durationMs: number; pages?: number } }
 export interface NavigateResult { url: string; status: number; contentType: string; bytes: number; title: string | null; redirects: { from: string; to: string; status: number }[]; warnings: Warning[]; durationMs: number }
-export type ActionType = 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'press' | 'submit' | 'scroll';
-export interface Action { type: ActionType; selector?: string; index?: number; value?: string | string[]; key?: string; timeoutMs?: number }
+export type ActionType = 'click' | 'fill' | 'select' | 'check' | 'uncheck' | 'press' | 'submit' | 'scroll' | 'upload' | 'wait' | 'back' | 'forward';
+export interface Action { type: ActionType; selector?: string; index?: number; value?: string | string[]; key?: string; contentBase64?: string; ms?: number; timeoutMs?: number }
 export interface InteractResult {
   /** "none" when the action only changed local state; "navigate" when it caused a request. */
   effect: 'none' | 'navigate';
@@ -97,13 +104,13 @@ export interface LoginResult {
   steps: unknown[];
 }
 export interface ToolDef { name: string; description: string; inputSchema: Record<string, unknown> }
-export interface Strategy { name: string; description: string; status: 'verified-fixtures' | 'fixture-verified-only' | 'not_implemented'; reason?: string }
+export interface Strategy { name: string; description: string; status: 'verified-live' | 'verified-fixtures' | 'fixture-verified-only' | 'not_implemented'; reason?: string }
 export class ScoutApiError extends Error { status: number; code: string; retryable: boolean; details?: unknown; retryAfterSec?: number }
 export class ScoutClient {
   constructor(opts: ScoutClientOptions);
   health(): Promise<{ status: string; version: string; uptimeSec: number }>;
   strategies(): Promise<Strategy[]>;
-  createSession(): Promise<{ id: string; createdAt: string; expiresInMs: number }>;
+  createSession(opts?: SessionOptions): Promise<{ id: string; createdAt: string; expiresInMs: number; label?: string | null; locale?: string; timezone?: string | null; humanize?: boolean; proxyUrl?: string | null }>;
   destroySession(id: string): Promise<void>;
   navigate(p: { sessionId: string; url: string; timeoutMs?: number }, o?: { signal?: AbortSignal }): Promise<NavigateResult>;
   extract<T = unknown>(p: ExtractParams, o?: { signal?: AbortSignal }): Promise<ExtractResult<T>>;
@@ -130,10 +137,10 @@ export class ScoutClient {
   login(p: LoginParams, o?: { signal?: AbortSignal }): Promise<LoginResult>;
   exportSession(sessionId: string): Promise<{ sessionId: string; referrer: string | null; cookies: unknown[] }>;
   importSession(sessionId: string, url: string, cookies: unknown[]): Promise<{ ok: true; imported: number; cookies: number }>;
-  submitTask(spec: TaskSpec): Promise<Task>;
-  getTask(id: string): Promise<Task>;
-  cancelTask(id: string): Promise<Task>;
-  withSession<T>(fn: (sessionId: string) => Promise<T>): Promise<T>;
+  submitTask(spec: TaskSpec, o?: { signal?: AbortSignal }): Promise<Task>;
+  getTask(id: string, o?: { signal?: AbortSignal }): Promise<Task>;
+  cancelTask(id: string, o?: { signal?: AbortSignal }): Promise<Task>;
+  withSession<T>(fn: (sessionId: string) => Promise<T>, sessionOpts?: SessionOptions): Promise<T>;
   waitForTask(id: string, o?: { pollMs?: number; timeoutMs?: number; signal?: AbortSignal }): Promise<Task>;
-  runTask(spec: TaskSpec, o?: { pollMs?: number; timeoutMs?: number }): Promise<Task>;
+  runTask(spec: TaskSpec, o?: { pollMs?: number; timeoutMs?: number; signal?: AbortSignal }): Promise<Task>;
 }

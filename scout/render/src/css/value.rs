@@ -186,6 +186,9 @@ pub fn parse_color(input: &str) -> Option<Color> {
         return None;
     }
     if let Some(hex) = s.strip_prefix('#') {
+        if !hex.is_ascii() {
+            return None;
+        }
         return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
@@ -219,7 +222,7 @@ pub fn parse_color(input: &str) -> Option<Color> {
     if s.starts_with("rgb") {
         let open = s.find('(')?;
         let close = s.rfind(')')?;
-        let inner = &s[open + 1..close];
+        let inner = s.get(open + 1..close)?;
         let parts: Vec<&str> = inner.split(&[',', '/'][..]).collect();
         let channel = |p: &str| -> Option<u8> {
             let p = p.trim();
@@ -559,7 +562,7 @@ impl BackgroundImage {
         if lower.starts_with("linear-gradient(") || lower.starts_with("-webkit-linear-gradient(") {
             let start = trimmed.find('(')? + 1;
             let end = trimmed.rfind(')')?;
-            let body = &trimmed[start..end];
+            let body = trimmed.get(start..end)?;
             // An optional leading angle, then colour stops.
             let mut angle = 180.0; // `to bottom`
             let mut stops: Vec<(f32, Color)> = Vec::new();

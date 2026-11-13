@@ -48,16 +48,14 @@ fn sid() -> Value {
 /// Machine-readable manifest: name, description and JSON Schema per tool.
 pub fn manifest() -> Value {
     let tools = vec![
-        tool("session.create", "Create an isolated browsing session with its own cookie jar. Sessions never share cookies or credentials.", json!({}), &[]),
-        tool("session.destroy", "Destroy a session and release its DOM, jar and worker slot.", json!({ "sessionId": sid() }), &["sessionId"]),
-
-        tool("session.create", "Create a session with options: a label, a locale sent as Accept-Language and shown to page scripts, a timezone name, human-feeling interaction pacing, or an http/https proxy.", json!({
+        tool("session.create", "Create an isolated browsing session with its own cookie jar and optional label, locale, timezone, human-feeling pacing, or http/https proxy. Sessions never share cookies or credentials.", json!({
             "label": { "type": "string", "maxLength": 64 },
             "locale": { "type": "string", "description": "Language tag like en-GB" },
             "timezone": { "type": "string", "description": "IANA name like Europe/Lagos; stored and reported, Date objects stay UTC" },
             "humanize": { "type": "boolean" },
             "proxyUrl": { "type": "string" }
         }), &[]),
+        tool("session.destroy", "Destroy a session and release its DOM, jar and worker slot.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("session.list", "List this key's sessions with labels and referrers.", json!({}), &[]),
         tool("session.clone", "Fork a session: the same cookies, storage and current page under a new id.", json!({ "sessionId": sid() }), &["sessionId"]),        tool("session.export", "Export the session's cookies and current document, so a signed-in session can be saved and resumed later.", json!({ "sessionId": sid() }), &["sessionId"]),
         tool("session.import", "Restore cookies exported by session.export into a session, so an existing signed-in session can be resumed without replaying a login.", json!({
@@ -86,11 +84,9 @@ pub fn manifest() -> Value {
             "contentType": { "type": "string" },
             "timeoutMs": { "type": "integer", "minimum": 1 }
         }), &["url"]),
-        tool("navigate", "Navigate a session to a URL. Page scripts run and the DOM is rebuilt before this returns.", json!({
+        tool("navigate", "Navigate a session to a URL via GET. Page scripts run and the DOM is rebuilt before this returns; use `request` for arbitrary HTTP methods or bodies.", json!({
             "sessionId": sid(),
             "url": { "type": "string", "format": "uri" },
-            "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] },
-            "body": { "type": "string" },
             "timeoutMs": { "type": "integer", "minimum": 1 },
         }), &["sessionId", "url"]),
         tool("extract", "Extract structured data using CSS selectors or a named strategy. With nextSelector, walk to the next page and keep extracting, up to maxPages.", json!({

@@ -180,9 +180,12 @@ impl Scheduler {
             .collect();
         let text = json!({ "schedules": list }).to_string();
         drop(map);
-        // Atomic write: a crash mid-save cannot leave a half-written store.
+        // Atomic write with 0600 permissions so persisted `callbackSecret` values
+        // are readable only by the Scout process owner.
         let tmp = format!("{path}.tmp");
-        if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        let write_res = write_private_file(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, path));
+        if write_res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
             crate::logger::warn("could not persist the schedule store", json!({ "path": path }));
         }
     }
@@ -317,30 +320,68 @@ impl Scheduler {
     }
 }
 
-/// Fire a signed webhook: one POST, JSON body, HMAC-SHA256 signature header.
-/// Best effort by design: a webhook that is down must not take the scheduler
-/// with it. The outcome is logged, not propagated.
-pub async fn fire_callback(client: &reqwest::Client, url: &str, secret: Option<&str>, payload: &Value) {
-    let body = serde_json::to_vec(payload).unwrap_or_default();
-    let mut req = client
-        .post(url)
-        .timeout(std::time::Duration::from_secs(10))
-        .header("content-type", "application/json")
-        .header("user-agent", "Scout-Webhook");
-    if let Some(s) = secret {
-        req = req.header("x-scout-signature", format!("sha256={}", hmac_sha256_hex(s, &body)));
+fn write_private_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    match req.body(body).send().await {
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Fire a signed webhook: one POST, JSON body, HMAC-SHA256 signature header,
+/// routed through `guarded_fetch` so SSRF, redirect validation, and byte caps apply.
+pub async fn fire_callback(
+    cfg: &Config,
+    client: &reqwest::Client,
+    url: &str,
+    secret: Option<&str>,
+    payload: &Value,
+) {
+    let body = serde_json::to_vec(payload).unwrap_or_default();
+    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+    if let Some(s) = secret {
+        headers.push((
+            "x-scout-signature".to_string(),
+            format!("sha256={}", hmac_sha256_hex(s, &body)),
+        ));
+    }
+    match crate::security::guarded_fetch(
+        cfg,
+        client,
+        crate::security::FetchRequest {
+            url,
+            method: "POST",
+            headers,
+            body: Some(body),
+            jar: None,
+            cookie_mode: crate::security::CookieMode::Omit,
+            kind: crate::security::FetchKind::Xhr,
+            referer: None,
+            timeout_ms: 10_000,
+            max_bytes: 64 * 1024,
+        },
+    )
+    .await
+    {
         Ok(r) => {
-            if !r.status().is_success() {
+            if !(200..300).contains(&r.status) {
                 crate::logger::warn(
                     "webhook returned an error status",
-                    json!({ "url": url, "status": r.status().as_u16() }),
+                    json!({ "url": url, "status": r.status }),
                 );
             }
         }
         Err(e) => {
-            crate::logger::warn("webhook request failed", json!({ "url": url, "error": e.to_string() }));
+            crate::logger::warn(
+                "webhook request failed",
+                json!({ "url": url, "error": e.message }),
+            );
         }
     }
 }

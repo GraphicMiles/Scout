@@ -186,7 +186,8 @@ pub fn parse_selector(input: &str) -> Result<Selector, String> {
             }
         }
         if simples.is_empty() {
-            return Err(format!("unexpected input at {:?}", &rest[..rest.len().min(16)]));
+            let preview: String = rest.chars().take(16).collect();
+            return Err(format!("unexpected input at {:?}", preview));
         }
         parts.push((pending, Compound { simples }));
 

@@ -57,23 +57,32 @@ pub fn resolve(base: &str, href: &str) -> String {
 
 /// Resolve `href` against an absolute URL, including `../` segments.
 fn resolve_url(base: &str, href: &str) -> String {
+    // Strip fragment and query before splitting path segments so a `/` inside
+    // `?next=/a/b` or `#/route` never masquerades as a path separator.
+    let without_frag = base.split('#').next().unwrap_or(base);
+    let clean_base = without_frag.split('?').next().unwrap_or(without_frag);
+
     if href.starts_with('/') {
-        let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
-        let host_end = base[scheme_end..]
+        let scheme_end = clean_base.find("://").map(|i| i + 3).unwrap_or(0);
+        let host_end = clean_base[scheme_end..]
             .find('/')
             .map(|i| i + scheme_end)
-            .unwrap_or(base.len());
-        return format!("{}{}", &base[..host_end], href);
+            .unwrap_or(clean_base.len());
+        return format!("{}{}", &clean_base[..host_end], href);
     }
     // A bare host ("https://example.com") has no path: its base directory is "/".
-    let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
-    let cut = match base.rfind('/') {
+    let scheme_end = clean_base.find("://").map(|i| i + 3).unwrap_or(0);
+    let cut = match clean_base.rfind('/') {
         Some(i) if i >= scheme_end => i + 1,
-        _ => base.len() + 1,
+        _ => clean_base.len() + 1,
     };
-    let base = if cut > base.len() { format!("{}/", base) } else { base.to_string() };
-    let base = base.as_str();
-    let mut segments: Vec<&str> = base[..cut].trim_end_matches('/').split('/').collect();
+    let normalized = if cut > clean_base.len() {
+        format!("{}/", clean_base)
+    } else {
+        clean_base.to_string()
+    };
+    let normalized = normalized.as_str();
+    let mut segments: Vec<&str> = normalized[..cut].trim_end_matches('/').split('/').collect();
     for part in href.split('/') {
         match part {
             "." | "" => {}
@@ -186,5 +195,17 @@ mod tests {
     #[test]
     fn protocol_relative_borrows_the_scheme() {
         assert_eq!(resolve("https://a.test/x.html", "//cdn.test/a.css"), "https://cdn.test/a.css");
+    }
+
+    #[test]
+    fn query_and_fragment_slashes_do_not_corrupt_base_path() {
+        assert_eq!(
+            resolve("https://a.test/docs/page.html?next=/foo/bar#sec/1", "style.css"),
+            "https://a.test/docs/style.css"
+        );
+        assert_eq!(
+            resolve("https://a.test?next=/foo/bar", "/root.css"),
+            "https://a.test/root.css"
+        );
     }
 }

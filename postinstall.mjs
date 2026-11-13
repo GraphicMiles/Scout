@@ -9,7 +9,7 @@
  * Downloaded to node_modules/@graphicmiles/scout/bin/, next to this file.
  */
 
-import { createWriteStream, existsSync, mkdirSync, chmodSync, renameSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, chmodSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -58,12 +58,17 @@ async function main() {
     return;
   }
 
-  // Allow a pinned version: SCOUT_VERSION=v0.1.0
-  const tag = process.env.SCOUT_VERSION ?? 'latest';
+  // Allow a pinned version: SCOUT_VERSION=v0.1.0 (reject path-traversal characters)
+  const rawTag = process.env.SCOUT_VERSION ?? 'latest';
+  if (!/^[A-Za-z0-9._-]+$/.test(rawTag)) {
+    console.warn(`[scout] Ignoring invalid SCOUT_VERSION "${rawTag}".`);
+    return;
+  }
+  const tag = rawTag;
   const url =
     tag === 'latest'
       ? `https://github.com/${REPO}/releases/latest/download/${asset}`
-      : `https://github.com/${REPO}/releases/download/${tag}/${asset}`;
+      : `https://github.com/${REPO}/releases/download/${encodeURIComponent(tag)}/${asset}`;
 
   mkdirSync(binDir, { recursive: true });
   log(`Downloading ${url} ...`);
@@ -78,6 +83,7 @@ async function main() {
     renameSync(tmp, dest);
     log(`Installed ${dest}`);
   } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* ignore cleanup failure */ }
     // A failed download must not break npm install: the package still works
     // with a binary from SCOUT_BIN or PATH.
     console.warn(

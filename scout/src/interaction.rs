@@ -522,10 +522,13 @@ fn select(page: &mut Page, action: &Action, sel: &str) -> Result<Effect> {
     // option would silently submit a choice the caller never made.
     let option_sel = selector::compile("option")?;
     let options: Vec<ElementRef> = el.select(&option_sel).collect();
-    let have: Vec<String> = options
-        .iter()
-        .map(|o| o.value().attr("value").unwrap_or(&html::raw_text(&**o)).to_string())
-        .collect();
+    let option_value = |o: &ElementRef| {
+        o.value()
+            .attr("value")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| html::text(o))
+    };
+    let have: Vec<String> = options.iter().map(option_value).collect();
     let missing: Vec<String> = want.iter().filter(|v| !have.contains(v)).cloned().collect();
     if want.is_empty() || !missing.is_empty() {
         let shown = if missing.is_empty() { want.clone() } else { missing };
@@ -565,9 +568,36 @@ fn set_checked(page: &mut Page, action: &Action, sel: &str, checked: bool) -> Re
         return Err(ScoutError::unsupported("Radio buttons cannot be unchecked")
             .with_details(json!({ "selector": sel })));
     }
+    let target_key = element_selector(&el);
+    // Checking one radio button unchecks every other radio in the same group.
+    let mut sibling_keys = Vec::new();
+    if checked && ty == "radio" {
+        if let Some(group_name) = el.value().attr("name").filter(|n| !n.is_empty()) {
+            let scope = closest_form(&el);
+            if let Ok(radio_sel) = selector::compile("input") {
+                let iter: Vec<ElementRef> = match &scope {
+                    Some(form) => form.select(&radio_sel).collect(),
+                    None => doc(page)?.select(&radio_sel).collect(),
+                };
+                for r in iter {
+                    if r.value().attr("type").unwrap_or("").eq_ignore_ascii_case("radio")
+                        && r.value().attr("name") == Some(group_name)
+                    {
+                        let k = element_selector(&r);
+                        if k != target_key {
+                            sibling_keys.push(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for k in sibling_keys {
+        record(page, &k, String::new());
+    }
     record(
         page,
-        &element_selector(&el),
+        &target_key,
         if checked { "on".into() } else { String::new() },
     );
     Ok(Effect::None {
@@ -868,22 +898,24 @@ fn build_submission(
         let boundary = multipart_boundary();
         let mut body: Vec<u8> = Vec::new();
         for (k, v) in &pairs {
+            let safe_k = escape_multipart_param(k);
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             body.extend_from_slice(
-                format!("content-disposition: form-data; name=\"{k}\"\r\n\r\n").as_bytes(),
+                format!("content-disposition: form-data; name=\"{safe_k}\"\r\n\r\n").as_bytes(),
             );
             body.extend_from_slice(v.as_bytes());
             body.extend_from_slice(b"\r\n");
         }
         for (field, staged_file) in &staged {
             let (name, _) = field;
+            let safe_name = escape_multipart_param(name);
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             match staged_file {
                 Some(file) => {
+                    let safe_filename = escape_multipart_param(&file.filename);
                     body.extend_from_slice(
                         format!(
-                            "content-disposition: form-data; name=\"{name}\"; filename=\"{}\"\r\n",
-                            file.filename
+                            "content-disposition: form-data; name=\"{safe_name}\"; filename=\"{safe_filename}\"\r\n",
                         )
                         .as_bytes(),
                     );
@@ -896,7 +928,7 @@ fn build_submission(
                 // name: that is what browsers send.
                 None => body.extend_from_slice(
                     format!(
-                        "content-disposition: form-data; name=\"{name}\"; filename=\"\"\r\n\r\n"
+                        "content-disposition: form-data; name=\"{safe_name}\"; filename=\"\"\r\n\r\n"
                     )
                     .as_bytes(),
                 ),
@@ -931,10 +963,16 @@ fn build_submission(
     } else {
         let url = if encoded.is_empty() {
             action_url
-        } else if action_url.contains('?') {
-            format!("{action_url}&{encoded}")
         } else {
-            format!("{action_url}?{encoded}")
+            let (before_hash, frag) = match action_url.split_once('#') {
+                Some((base, f)) => (base, Some(f)),
+                None => (action_url.as_str(), None),
+            };
+            let sep = if before_hash.contains('?') { '&' } else { '?' };
+            match frag {
+                Some(f) => format!("{before_hash}{sep}{encoded}#{f}"),
+                None => format!("{before_hash}{sep}{encoded}"),
+            }
         };
         Ok(Effect::Navigate {
             url,
@@ -946,26 +984,51 @@ fn build_submission(
     }
 }
 
-/// A boundary that cannot appear in any part: random, like a browser's.
+/// Sanitize a multipart `Content-Disposition` parameter per WHATWG HTML / RFC 7578:
+/// strip CR/LF/NUL and percent-encode quotes so header/part injection is impossible.
+fn escape_multipart_param(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' | '\0' => {}
+            '"' => out.push_str("%22"),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Cryptographically unpredictable multipart boundary so field payloads cannot forge parts.
 fn multipart_boundary() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = nanos ^ (SEQ.fetch_add(1, Ordering::Relaxed) << 48);
-    format!("----scout{n:016x}")
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("----scout{hex}")
 }
 
 
 /// A stable key for an element, used to look up recorded form values.
-/// Prefers `name`, then `id`, then a tag+index path.
+/// Disambiguates radio/checkbox groups that share `name` by `id` or `value`.
 fn element_selector(el: &ElementRef) -> String {
+    let ty = el.value().attr("type").unwrap_or("").to_ascii_lowercase();
+    if el.value().name() == "input" && matches!(ty.as_str(), "radio" | "checkbox") {
+        if let Some(id) = el.value().id().filter(|s| !s.is_empty()) {
+            return format!("#{id}");
+        }
+        if let Some(name) = el.value().attr("name").filter(|s| !s.is_empty()) {
+            let esc_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+            if let Some(val) = el.value().attr("value") {
+                let esc_val = val.replace('\\', "\\\\").replace('"', "\\\"");
+                return format!("[name=\"{esc_name}\"][value=\"{esc_val}\"]");
+            }
+            return format!("[name=\"{esc_name}\"]");
+        }
+    }
     if let Some(name) = el.value().attr("name") {
         if !name.is_empty() {
-            return format!("[name=\"{}\"]", name.replace('"', "\\\""));
+            return format!("[name=\"{}\"]", name.replace('\\', "\\\\").replace('"', "\\\""));
         }
     }
     if let Some(id) = el.value().id() {
@@ -973,7 +1036,7 @@ fn element_selector(el: &ElementRef) -> String {
             return format!("#{id}");
         }
     }
-    el.value().name().to_string()
+    format!("{}@{:?}", el.value().name(), el.id())
 }
 
 fn urlencode(s: &str) -> String {
@@ -1434,5 +1497,85 @@ mod tests {
         assert!(Action::from_json(&json!({ "type": "click", "selector": "a", "index": 5000 })).is_err());
         assert!(Action::from_json(&json!({ "type": "click", "selector": "a", "checked": true })).is_err());
         assert!(Action::from_json(&json!({ "type": "click", "selector": "a[href='x" })).is_err());
+    }
+
+    #[test]
+    fn radio_groups_and_checkbox_groups_track_distinct_controls() {
+        let mut p = page_with(
+            "<form action='/f' method='post'>\
+             <input type='radio' name='plan' value='free' checked>\
+             <input type='radio' name='plan' value='pro'>\
+             <input type='checkbox' name='feat' value='a'>\
+             <input type='checkbox' name='feat' value='b'>\
+             <button type='submit'>Go</button></form>",
+        );
+        let pick_pro = Action::from_json(&json!({ "type": "check", "selector": "input[value=pro]" })).unwrap();
+        apply(&mut p, &pick_pro, &cfg()).unwrap();
+        let check_b = Action::from_json(&json!({ "type": "check", "selector": "input[value=b]" })).unwrap();
+        apply(&mut p, &check_b, &cfg()).unwrap();
+        let submit = Action::from_json(&json!({ "type": "submit", "selector": "form" })).unwrap();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { body, .. } => {
+                let s = String::from_utf8(body.unwrap()).unwrap();
+                assert!(s.contains("plan=pro"), "expected plan=pro in {s}");
+                assert!(!s.contains("plan=free"), "radio group must uncheck sibling: {s}");
+                assert!(s.contains("feat=b"), "expected feat=b in {s}");
+                assert!(!s.contains("feat=a"), "unchecked sibling must not submit: {s}");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_submission_places_query_before_fragment_and_select_trims_option_text() {
+        let mut p = page_with(
+            "<form action='/search#results' method='get'>\
+             <select name='ship'><option>  Standard Shipping  </option></select>\
+             </form>",
+        );
+        let sel = Action::from_json(&json!({
+            "type": "select",
+            "selector": "select[name=ship]",
+            "value": "Standard Shipping"
+        }))
+        .unwrap();
+        apply(&mut p, &sel, &cfg()).unwrap();
+        let submit = Action::from_json(&json!({ "type": "submit", "selector": "form" })).unwrap();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { url, .. } => {
+                assert_eq!(url, "https://example.com/search?ship=Standard+Shipping#results");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multipart_escapes_quotes_and_strips_crlf_in_names_and_filenames() {
+        let mut p = page_with(
+            "<form action='/up' method='post' enctype='multipart/form-data'>\
+             <input name='bad\"\r\nX-Injected: 1' value='ok'>\
+             <input type='file' name='doc'>\
+             </form>",
+        );
+        p.files.insert(
+            "[name=\"doc\"]".into(),
+            crate::page::StoredFile {
+                filename: "evil\"\r\nContent-Type: text/html\r\n\r\n<b>x</b>.txt".into(),
+                bytes: b"hello".to_vec(),
+            },
+        );
+        let submit = Action::from_json(&json!({ "type": "submit", "selector": "form" })).unwrap();
+        match apply(&mut p, &submit, &cfg()).unwrap() {
+            Effect::Navigate { body, content_type, .. } => {
+                let ct = content_type.unwrap();
+                let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();
+                assert_eq!(boundary.len(), 9 + 32, "expected 128-bit hex boundary: {boundary}");
+                let text = String::from_utf8(body.unwrap()).unwrap();
+                assert!(!text.contains("\r\nX-Injected:"), "CRLF header injection leaked: {text}");
+                assert!(!text.contains("evil\""), "unescaped quote leaked: {text}");
+                assert!(text.contains("evil%22Content-Type: text/html<b>x</b>.txt"), "got: {text}");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
     }
 }

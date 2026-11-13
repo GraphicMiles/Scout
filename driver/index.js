@@ -17,9 +17,7 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, copyFile, rename } from 'node:fs/promises';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -80,11 +78,14 @@ export async function launch(opts = {}) {
   const executablePath = await resolveBinary(opts.executablePath);
   const apiKey = opts.apiKey ?? crypto.randomBytes(24).toString('hex');
   const port = opts.port ?? (await freePort());
+  const host = opts.host ?? '127.0.0.1';
+  const startupTimeoutMs = opts.startupTimeoutMs ?? 15_000;
 
   const child = spawn(executablePath, [], {
     env: {
       ...process.env,
       ...opts.env,
+      HOST: host,
       PORT: String(port),
       SCOUT_API_KEYS: apiKey,
       SCOUT_LOG_LEVEL: opts.logLevel ?? 'error',
@@ -93,22 +94,42 @@ export async function launch(opts = {}) {
   });
 
   let exited = false;
+  let spawnError = null;
   let earlyExit = '';
+  let logBytes = 0;
+  const MAX_STARTUP_LOG_BYTES = 32 * 1024;
   const logs = [];
-  child.stdout.on('data', (d) => logs.push(String(d)));
-  child.stderr.on('data', (d) => logs.push(String(d)));
-  child.on('exit', (code) => {
+  const onData = (d) => {
+    if (logBytes >= MAX_STARTUP_LOG_BYTES) return;
+    const chunk = String(d);
+    const remaining = MAX_STARTUP_LOG_BYTES - logBytes;
+    logs.push(chunk.slice(0, remaining));
+    logBytes += Math.min(chunk.length, remaining);
+  };
+  child.stdout?.on('data', onData);
+  child.stderr?.on('data', onData);
+  // Drain pipes without retaining output after startup completes so child stdio never blocks or leaks memory.
+  const noopDrain = () => {};
+  child.on('error', (err) => {
+    spawnError = err;
+    exited = true;
+  });
+  child.on('exit', (code, signal) => {
     exited = true;
     earlyExit = logs.join('').trim();
     if (code) earlyExit += `\n(exit code ${code})`;
+    else if (signal) earlyExit += `\n(signal ${signal})`;
   });
 
-  const baseUrl = `http://127.0.0.1:${port}`;
+  const baseUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;
   const client = new ScoutClient({ baseUrl, apiKey, timeoutMs: opts.timeoutMs ?? 60_000 });
 
-  // Wait for the server to answer. A fast exit means the binary never came up.
-  const deadline = Date.now() + (opts.startupTimeoutMs ?? 15_000);
+  // Wait for the server to answer. A fast exit or spawn error means the binary never came up.
+  const deadline = Date.now() + startupTimeoutMs;
   for (;;) {
+    if (spawnError) {
+      throw new Error(`failed to spawn scout (${executablePath}): ${spawnError.message}`);
+    }
     if (exited) {
       throw new Error(`scout exited during startup: ${earlyExit || 'no output'}`);
     }
@@ -117,12 +138,19 @@ export async function launch(opts = {}) {
       break;
     } catch {
       if (Date.now() > deadline) {
-        child.kill('SIGKILL');
-        throw new Error(`scout did not answer at ${baseUrl} within ${opts.startupTimeoutMs}ms`);
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        throw new Error(`scout did not answer at ${baseUrl} within ${startupTimeoutMs}ms`);
       }
       await new Promise((r) => setTimeout(r, 100));
     }
   }
+
+  // Stop buffering logs in memory once startup succeeds while keeping pipes drained.
+  child.stdout?.off('data', onData);
+  child.stderr?.off('data', onData);
+  child.stdout?.on('data', noopDrain);
+  child.stderr?.on('data', noopDrain);
+  logs.length = 0;
 
   return {
     client,
@@ -130,21 +158,27 @@ export async function launch(opts = {}) {
     baseUrl,
 
     /** A fresh page: its own Scout session. */
-    async newPage() {
-      const session = await client.createSession();
+    async newPage(sessionOpts = {}) {
+      const session = await client.createSession(sessionOpts);
       return makePage(client, session.id);
     },
 
     /** Stop the server. Safe to call twice. */
     async close() {
       if (exited) return;
-      child.kill('SIGTERM');
+      try { child.kill('SIGTERM'); } catch { return; }
       await new Promise((resolve) => {
-        child.once('exit', resolve);
-        setTimeout(() => {
-          if (!exited) child.kill('SIGKILL');
+        const timer = setTimeout(() => {
+          if (!exited) {
+            try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          }
           resolve();
-        }, 3000).unref?.();
+        }, 3000);
+        timer.unref?.();
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
       });
     },
   };
@@ -216,7 +250,9 @@ function makePage(client, sessionId) {
     },
 
     scroll(px) {
-      return client.interact({ sessionId, action: { type: 'scroll', value: px } });
+      const action = { type: 'scroll' };
+      if (px !== undefined && px !== null) action.value = String(px);
+      return client.interact({ sessionId, action });
     },
 
     /** Stage a file on an input[type=file]; submit sends it as multipart. */

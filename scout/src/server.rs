@@ -53,11 +53,24 @@ impl RateLimiter {
 
     /// Record a hit. Returns `Err(retry_after_secs)` when over the limit.
     pub fn check(&self, key: &str) -> std::result::Result<(), u64> {
+        const MAX_KEYS: usize = 4_096;
         let now = Instant::now();
         let mut map = self.hits.lock().unwrap();
-        // Opportunistic cleanup keeps the map from growing without bound.
-        if map.len() > 4_096 {
-            map.retain(|_, v| v.iter().any(|t| now.duration_since(*t) < self.window));
+        if !map.contains_key(key) && map.len() >= MAX_KEYS {
+            map.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < self.window);
+                !v.is_empty()
+            });
+            if map.len() >= MAX_KEYS {
+                // Evict the entry with the oldest most-recent hit so spoofed keys cannot grow RAM.
+                if let Some(oldest_key) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.last().copied().unwrap_or(now))
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest_key);
+                }
+            }
         }
         let entry = map.entry(key.to_string()).or_default();
         entry.retain(|t| now.duration_since(*t) < self.window);
@@ -70,13 +83,18 @@ impl RateLimiter {
         Ok(())
     }
 
-    /// Whether the key is currently blocked, without recording a hit.
+    /// Whether the key is currently allowed, without recording a hit or allocating a map entry.
     pub fn peek(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut map = self.hits.lock().unwrap();
-        let entry = map.entry(key.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-        (entry.len() as u64) < self.limit
+        let map = self.hits.lock().unwrap();
+        let Some(entry) = map.get(key) else {
+            return self.limit > 0;
+        };
+        let active = entry
+            .iter()
+            .filter(|&&t| now.duration_since(t) < self.window)
+            .count() as u64;
+        active < self.limit
     }
 }
 
@@ -968,6 +986,19 @@ mod tests {
         rl.check("k").unwrap();
         let retry = rl.check("k").unwrap_err();
         assert!(retry >= 1 && retry <= 60, "retry-after was {retry}");
+    }
+
+    #[test]
+    fn rate_limiter_peek_does_not_allocate_and_check_caps_map_size() {
+        let rl = RateLimiter::new(5);
+        for i in 0..10_000 {
+            assert!(rl.peek(&format!("ip_{i}")));
+        }
+        assert_eq!(rl.hits.lock().unwrap().len(), 0);
+        for i in 0..5_000 {
+            let _ = rl.check(&format!("ip_{i}"));
+        }
+        assert!(rl.hits.lock().unwrap().len() <= 4_096);
     }
 
     #[test]

@@ -7,7 +7,33 @@ use crate::interaction::Effect;
 use crate::js;
 use crate::metrics::Metrics;
 use crate::resources::ResourceManager;
-use crate::security::{guarded_fetch, Fetched, FetchKind, FetchRequest};
+/// Respect `X-Frame-Options` and `Content-Security-Policy: frame-ancestors` when folding iframes.
+fn frame_embedding_blocked(f: &Fetched, is_same_origin: bool) -> bool {
+    for (k, v) in &f.headers {
+        if k.eq_ignore_ascii_case("x-frame-options") {
+            let val = v.trim().to_ascii_uppercase();
+            if val == "DENY" || (val == "SAMEORIGIN" && !is_same_origin) {
+                return true;
+            }
+        } else if k.eq_ignore_ascii_case("content-security-policy") {
+            for directive in v.split(';') {
+                let d = directive.trim().to_ascii_lowercase();
+                if let Some(rest) = d.strip_prefix("frame-ancestors") {
+                    let tokens: Vec<&str> = rest.split_whitespace().collect();
+                    if tokens.contains(&"'none'") {
+                        return true;
+                    }
+                    if !is_same_origin && tokens == ["'self'"] {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+use crate::security::{guarded_fetch, CookieMode, FetchKind, FetchRequest, Fetched};
 use crate::session::{CachedFetch, Session, SessionManager, SessionOpts};
 use crate::tasks::TaskManager;
 use crate::validate::{clamp_timeout, ExtractReq, InteractReq, NavigateReq, TaskReq};
@@ -128,12 +154,7 @@ impl Scout {
         // A proxy URL is checked the moment the session is made, not on the
         // first request: http/https only, and the SSRF policy applies.
         if let Some(p) = &opts.proxy_url {
-            crate::security::validate_url(p, &self.cfg)?;
-            if !p.starts_with("http://") && !p.starts_with("https://") {
-                return Err(ScoutError::invalid(
-                    "\"proxyUrl\" must be an http or https URL",
-                ));
-            }
+            crate::security::validate_proxy_url(p, &self.cfg)?;
             // Fail fast when the proxy client cannot even be built.
             self.client_for_proxy(p)?;
         }
@@ -149,60 +170,7 @@ impl Scout {
     pub async fn clone_session(&self, owner: &str, id: &str) -> Result<Value> {
         let src = self.sessions.get(owner, id)?;
         let worker = self.worker_of(id)?;
-        // Cookies travel by rebuilding the jar from the source's cookie list.
-        // A host-only cookie reports no domain, so the session's own last URL
-        // supplies the host it belongs to.
-        let jar = {
-            let fresh = Arc::new(crate::session::CookieJar::new());
-            let fallback_host = src
-                .referrer()
-                .and_then(|r| url::Url::parse(&r).ok())
-                .map(|u| u.host_str().unwrap_or("localhost").to_string())
-                .unwrap_or_else(|| "localhost".into());
-            for c in src.jar.cookies() {
-                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-                let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                if name.is_empty() {
-                    continue;
-                }
-                let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                let host = c
-                    .get("domain")
-                    .and_then(|v| v.as_str())
-                    .filter(|d| !d.is_empty() && *d != "null")
-                    .map(|d| d.trim_start_matches('.').to_string())
-                    .unwrap_or_else(|| fallback_host.clone());
-                let mut raw = format!("{name}={value}; Path={path}");
-                let mut secure = false;
-                if !host.is_empty() && c.get("domain").and_then(|v| v.as_str()).is_some() {
-                    raw.push_str(&format!("; Domain={host}"));
-                }
-                if c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    raw.push_str("; Secure");
-                    secure = true;
-                }
-                if c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    raw.push_str("; HttpOnly");
-                }
-                let insecure = raw.replace("; Secure", "");
-                // Cookies refuse to land in several picky combinations (https
-                // on a bare IP, Secure over http, Domain on a host-only
-                // name); try the strictest form first and relax in steps.
-                let candidates = [
-                    (format!("https://{host}"), raw.clone()),
-                    (format!("https://{host}"), insecure.clone()),
-                    (format!("http://{host}"), insecure.clone()),
-                    (format!("http://{host}"), format!("{name}={value}; Path={path}")),
-                ];
-                let _ = secure;
-                for (target, line) in candidates {
-                    if fresh.set_cookie(&target, &line) {
-                        break;
-                    }
-                }
-            }
-            fresh
-        };
+        let jar = Arc::new(src.jar.fork());
         let s = self.sessions.create_with(
             owner.to_string(),
             false,
@@ -251,17 +219,17 @@ impl Scout {
             v["humanize"] = json!(true);
         }
         if let Some(p) = &s.opts.proxy_url {
-            v["proxyUrl"] = json!(p);
+            v["proxyUrl"] = json!(crate::security::redact_proxy_url(p));
         }
         v
     }
 
     /// The client a session's requests go through: the shared one, or one
-    /// bound to the session's proxy.
-    fn client_for(&self, session: &Session) -> reqwest::Client {
+    /// bound to the session's proxy. Never fails open to the direct client.
+    pub(crate) fn session_client(&self, session: &Session) -> Result<reqwest::Client> {
         match &session.opts.proxy_url {
-            None => self.client.clone(),
-            Some(p) => self.client_for_proxy(p).unwrap_or_else(|_| self.client.clone()),
+            None => Ok(self.client.clone()),
+            Some(p) => self.client_for_proxy(p),
         }
     }
 
@@ -284,10 +252,11 @@ impl Scout {
             .proxy(p)
             .build()
             .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("client build failed: {e}")))?;
-        self.proxy_clients
-            .lock()
-            .unwrap()
-            .insert(proxy.to_string(), client.clone());
+        let mut map = self.proxy_clients.lock().unwrap();
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(proxy.to_string(), client.clone());
         Ok(client)
     }
 
@@ -302,6 +271,7 @@ impl Scout {
         if let Some(idx) = self.routing.lock().unwrap().remove(id) {
             let _ = self.workers.send(idx, Cmd::Drop { session: id.to_string() });
         }
+        self.resources.maybe_trim();
     }
 
     pub(crate) fn worker_of(&self, session_id: &str) -> Result<usize> {
@@ -391,11 +361,11 @@ impl Scout {
         // too rather than being bypassed by a page that loads its own code.
         let bodies = self
             .fetch_scripts(session, &summary, &loaded.scripts, timeout, abort)
-            .await;
+            .await?;
 
         let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
         let net = if self.cfg.js_network {
-            Some(self.page_net(session, &page_url, net_stats.clone()))
+            Some(self.page_net(session, &page_url, net_stats.clone())?)
         } else {
             None
         };
@@ -498,7 +468,8 @@ impl Scout {
         scripts: &[ScriptSource],
         timeout_ms: u64,
         abort: &Abort,
-    ) -> Vec<crate::js::Script> {
+    ) -> Result<Vec<crate::js::Script>> {
+        let client = self.session_client(session)?;
         let base = summary.get("url").and_then(|u| u.as_str()).unwrap_or("");
         let mut budget = self.cfg.js_max_script_bytes;
         let mut out = Vec::with_capacity(scripts.len());
@@ -521,18 +492,18 @@ impl Scout {
                         out.push(crate::js::Script::classic(""));
                         continue;
                     }
-                    let referer = session.referrer();
                     let fut = guarded_fetch(
                         &self.cfg,
-                        &self.client,
+                        &client,
                         FetchRequest {
                             url: joined.as_str(),
                             method: "GET",
                             headers: Vec::new(),
                             body: None,
                             jar: Some(&session.jar),
+                            cookie_mode: CookieMode::Subresource,
                             kind: FetchKind::Script,
-                            referer: referer.as_deref(),
+                            referer: (!base.is_empty()).then_some(base),
                             timeout_ms,
                             max_bytes: budget.min(self.cfg.max_response_bytes),
                         },
@@ -555,7 +526,7 @@ impl Scout {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Case-insensitive header lookup on a fetched response.
@@ -609,7 +580,7 @@ impl Scout {
             headers.push(("accept-language".into(), accept_language_value(locale)));
         }
 
-        let client = self.client_for(session);
+        let client = self.session_client(session)?;
         let fut = guarded_fetch(
             &self.cfg,
             &client,
@@ -619,6 +590,7 @@ impl Scout {
                 headers,
                 body: nav.body.clone(),
                 jar: Some(&session.jar),
+                cookie_mode: CookieMode::Navigation,
                 kind: FetchKind::Document,
                 referer: referer.as_deref(),
                 timeout_ms,
@@ -696,7 +668,10 @@ impl Scout {
         if tags.is_empty() {
             return Vec::new();
         }
-        let client = self.client_for(session);
+        let Ok(client) = self.session_client(session) else {
+            return Vec::new();
+        };
+        let parent_origin = url::Url::parse(&fetched.url).ok().map(|u| u.origin());
         let mut warnings = Vec::new();
         let mut body = fetched.body.clone();
         // Splice from the last tag to the first so earlier offsets stay valid.
@@ -723,6 +698,23 @@ impl Scout {
                     continue;
                 }
             };
+            let is_same_origin = parent_origin
+                .as_ref()
+                .map(|po| &req_url.origin() == po)
+                .unwrap_or(false);
+            // Cross-origin frames cannot share a DOM with the embedding page without
+            // exposing their content to untrusted parent scripts (UXSS).
+            if !is_same_origin {
+                warnings.push(json!({
+                    "code": "frame_not_fetched",
+                    "message": format!("cross-origin iframe {} is isolated from parent DOM", url),
+                }));
+                continue;
+            }
+            let frame_cookie_mode = match &parent_origin {
+                Some(po) => CookieMode::SameOriginOnly(po.clone()),
+                None => CookieMode::Omit,
+            };
             let fut = guarded_fetch(
                 &self.cfg,
                 &client,
@@ -731,7 +723,8 @@ impl Scout {
                     method: "GET",
                     headers: Vec::new(),
                     body: None,
-                    jar: Some(&session.jar),
+                    jar: Some(session.jar.as_ref()),
+                    cookie_mode: frame_cookie_mode,
                     kind: FetchKind::Script,
                     referer: Some(&fetched.url),
                     timeout_ms,
@@ -745,6 +738,18 @@ impl Scout {
             };
             match res {
                 Ok(f) if f.status < 400 && f.content_type.contains("html") => {
+                    let final_same_origin = url::Url::parse(&f.url)
+                        .ok()
+                        .zip(parent_origin.as_ref())
+                        .map(|(fu, po)| &fu.origin() == po)
+                        .unwrap_or(false);
+                    if !final_same_origin || frame_embedding_blocked(&f, final_same_origin) {
+                        warnings.push(json!({
+                            "code": "frame_not_fetched",
+                            "message": format!("iframe {} refused framing", url),
+                        }));
+                        continue;
+                    }
                     // The HTML parser treats iframe content as raw text, so
                     // the frame document is folded under a scout-frame
                     // element instead: its children parse as real nodes a
@@ -787,7 +792,6 @@ impl Scout {
         }
         warnings
     }
-
     /// The network a page's scripts see.
     ///
     /// Built here, on the async side, because everything that constrains a
@@ -801,8 +805,8 @@ impl Scout {
         session: &Session,
         base_url: &str,
         stats: std::sync::Arc<Mutex<js::NetStats>>,
-    ) -> js::NetFn {
-        let client = self.client_for(session);
+    ) -> Result<js::NetFn> {
+        let client = self.session_client(session)?;
         let cfg = self.cfg.clone();
         let accept_language = session
             .opts
@@ -811,93 +815,196 @@ impl Scout {
             .map(|l| accept_language_value(l));
         let jar = session.jar.clone();
         let base = base_url.to_string();
-        let referer = session.referrer().unwrap_or_else(|| base_url.to_string());
+        let referer = if !base_url.is_empty() {
+            base_url.to_string()
+        } else {
+            session.referrer().unwrap_or_default()
+        };
         let handle = self.handle.clone();
         let max_requests = self.cfg.js_max_fetches;
         let max_bytes = self.cfg.js_max_fetch_bytes.min(self.cfg.max_response_bytes);
         let timeout_ms = self.cfg.js_fetch_timeout_ms;
 
-        std::sync::Arc::new(move |req: js::NetRequest| -> std::result::Result<js::NetResponse, String> {
-            {
-                let mut st = stats.lock().unwrap();
-                if st.requests >= max_requests {
-                    st.blocked += 1;
-                    return Err(format!(
-                        "this page has used its budget of {max_requests} scripted requests"
+        Ok(std::sync::Arc::new(
+            move |req: js::NetRequest| -> std::result::Result<js::NetResponse, String> {
+                {
+                    let mut st = stats.lock().unwrap();
+                    if st.requests >= max_requests {
+                        st.blocked += 1;
+                        return Err(format!(
+                            "this page has used its budget of {max_requests} scripted requests"
+                        ));
+                    }
+                    st.requests += 1;
+                }
+                if !matches!(
+                    req.method.as_str(),
+                    "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+                ) {
+                    return Err(format!("method \"{}\" is not supported", req.method));
+                }
+                let page_url = url::Url::parse(&base).map_err(|_| {
+                    "cannot issue scripted requests without a loaded document origin".to_string()
+                })?;
+                let joined = page_url.join(&req.url).map_err(|_| {
+                    format!("could not resolve \"{}\" against the page URL", req.url)
+                })?;
+                let page_origin = page_url.origin();
+                let page_origin_ascii = page_origin.ascii_serialization();
+                let is_same_origin = joined.origin() == page_origin;
+
+                // Strip Fetch-spec forbidden headers so page scripts can never spoof
+                // `Origin`, `Referer`, `Cookie`, `Host`, `Sec-*`, or `Proxy-*`.
+                let mut user_headers: Vec<(String, String)> = req
+                    .headers
+                    .into_iter()
+                    .filter(|(k, _)| !crate::security::is_forbidden_script_header(k))
+                    .collect();
+
+                let needs_preflight = !is_same_origin
+                    && (!matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
+                        || user_headers
+                            .iter()
+                            .any(|(k, v)| !crate::security::is_cors_safelisted_header(k, v)));
+
+                let Some(h) = &handle else {
+                    return Err("no async runtime is available for scripted requests".into());
+                };
+
+                let include_creds = req.credentials == "include";
+                if needs_preflight {
+                    let mut pre_headers = vec![
+                        ("access-control-request-method".to_string(), req.method.clone()),
+                    ];
+                    let mut non_simple: Vec<String> = user_headers
+                        .iter()
+                        .filter(|(k, v)| !crate::security::is_cors_safelisted_header(k, v))
+                        .map(|(k, _)| k.to_ascii_lowercase())
+                        .collect();
+                    non_simple.sort();
+                    non_simple.dedup();
+                    if !non_simple.is_empty() {
+                        pre_headers.push((
+                            "access-control-request-headers".to_string(),
+                            non_simple.join(", "),
+                        ));
+                    }
+                    let pre = h.block_on(guarded_fetch(
+                        &cfg,
+                        &client,
+                        FetchRequest {
+                            url: joined.as_str(),
+                            method: "OPTIONS",
+                            headers: pre_headers,
+                            body: None,
+                            jar: None,
+                            cookie_mode: CookieMode::Omit,
+                            kind: FetchKind::Xhr,
+                            referer: Some(referer.as_str()),
+                            timeout_ms,
+                            max_bytes: 16 * 1024,
+                        },
                     ));
+                    match pre {
+                        Ok(pf) if (200..300).contains(&pf.status) => {
+                            if let Err(cors_err) = crate::security::enforce_cors_response(
+                                pf,
+                                &page_origin_ascii,
+                                include_creds,
+                            ) {
+                                stats.lock().unwrap().blocked += 1;
+                                return Err(cors_err);
+                            }
+                        }
+                        Ok(_) => {
+                            stats.lock().unwrap().blocked += 1;
+                            return Err("blocked by CORS policy: preflight OPTIONS failed".into());
+                        }
+                        Err(e) => {
+                            stats.lock().unwrap().failed += 1;
+                            return Err(e.message);
+                        }
+                    }
                 }
-                st.requests += 1;
-            }
-            if !matches!(
-                req.method.as_str(),
-                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
-            ) {
-                return Err(format!("method \"{}\" is not supported", req.method));
-            }
-            let joined = match url::Url::parse(&base).and_then(|b| b.join(&req.url)) {
-                Ok(u) => u,
-                Err(_) => {
-                    return Err(format!(
-                        "could not resolve \"{}\" against the page URL",
-                        req.url
-                    ))
+
+                let body = match &req.body {
+                    None => None,
+                    Some(js::NetBody::Text(t)) => Some(t.as_bytes().to_vec()),
+                    Some(js::NetBody::Bytes(b)) => Some(b.clone()),
+                };
+                if let Some(al) = &accept_language {
+                    if !user_headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("accept-language"))
+                    {
+                        user_headers.push(("accept-language".into(), al.clone()));
+                    }
                 }
-            };
-            let body = match &req.body {
-                None => None,
-                Some(js::NetBody::Text(t)) => Some(t.as_bytes().to_vec()),
-                Some(js::NetBody::Bytes(b)) => Some(b.clone()),
-            };
-            let mut headers = req.headers.clone();
-            if let Some(al) = &accept_language {
-                if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept-language")) {
-                    headers.push(("accept-language".into(), al.clone()));
+
+                let (jar_opt, cookie_mode) = match req.credentials.as_str() {
+                    "omit" => (None, CookieMode::Omit),
+                    "include" => (Some(jar.as_ref()), CookieMode::Subresource),
+                    _ => (
+                        Some(jar.as_ref()),
+                        CookieMode::SameOriginOnly(page_origin.clone()),
+                    ),
+                };
+
+                let fut = guarded_fetch(
+                    &cfg,
+                    &client,
+                    FetchRequest {
+                        url: joined.as_str(),
+                        method: &req.method,
+                        headers: user_headers,
+                        body,
+                        jar: jar_opt,
+                        cookie_mode,
+                        kind: FetchKind::Xhr,
+                        referer: Some(referer.as_str()),
+                        timeout_ms,
+                        max_bytes,
+                    },
+                );
+                let result = h.block_on(fut);
+                match result {
+                    Ok(mut f) => {
+                        let final_cross_origin = url::Url::parse(&f.url)
+                            .map(|u| u.origin() != page_origin)
+                            .unwrap_or(!is_same_origin);
+                        if !is_same_origin || final_cross_origin {
+                            match crate::security::enforce_cors_response(
+                                f,
+                                &page_origin_ascii,
+                                include_creds,
+                            ) {
+                                Ok(allowed) => f = allowed,
+                                Err(cors_err) => {
+                                    let mut st = stats.lock().unwrap();
+                                    st.blocked += 1;
+                                    return Err(cors_err);
+                                }
+                            }
+                        }
+                        let mut st = stats.lock().unwrap();
+                        st.bytes += f.bytes;
+                        Ok(js::NetResponse {
+                            status: f.status,
+                            status_text: crate::security::status_text(f.status).to_string(),
+                            url: f.url,
+                            headers: f.headers,
+                            body: f.body,
+                            body_b64: f.body_b64,
+                        })
+                    }
+                    Err(e) => {
+                        let mut st = stats.lock().unwrap();
+                        st.failed += 1;
+                        Err(e.message)
+                    }
                 }
-            }
-            let fut = guarded_fetch(
-                &cfg,
-                &client,
-                FetchRequest {
-                    url: joined.as_str(),
-                    method: &req.method,
-                    headers,
-                    body,
-                    jar: Some(&jar),
-                    kind: FetchKind::Xhr,
-                    referer: Some(referer.as_str()),
-                    timeout_ms,
-                    max_bytes,
-                },
-            );
-            let result = match &handle {
-                // The page worker is a plain thread, never a runtime worker, so
-                // blocking here cannot stall the executor that is running this
-                // very request.
-                Some(h) => h.block_on(fut),
-                None => {
-                    return Err("no async runtime is available for scripted requests".into())
-                }
-            };
-            match result {
-                Ok(f) => {
-                    let mut st = stats.lock().unwrap();
-                    st.bytes += f.bytes;
-                    Ok(js::NetResponse {
-                        status: f.status,
-                        status_text: crate::security::status_text(f.status).to_string(),
-                        url: f.url,
-                        headers: f.headers,
-                        body: f.body,
-                        body_b64: f.body_b64,
-                    })
-                }
-                Err(e) => {
-                    let mut st = stats.lock().unwrap();
-                    st.failed += 1;
-                    Err(e.message)
-                }
-            }
-        })
+            },
+        ))
     }
 
     /// One request through the session's jar and the SSRF policy, with the
@@ -927,7 +1034,7 @@ impl Scout {
             if let Some(locale) = &session.opts.locale {
                 headers.push(("accept-language".into(), accept_language_value(locale)));
             }
-            let client = self.client_for(&session);
+            let client = self.session_client(&session)?;
             let fut = guarded_fetch(
                 &self.cfg,
                 &client,
@@ -937,6 +1044,7 @@ impl Scout {
                     headers,
                     body: req.body.as_ref().map(|b| b.as_bytes().to_vec()),
                     jar: Some(&session.jar),
+                    cookie_mode: CookieMode::Direct,
                     kind: FetchKind::Xhr,
                     referer: referer.as_deref(),
                     timeout_ms: timeout,
@@ -1003,7 +1111,7 @@ impl Scout {
                     .ok_or_else(|| ScoutError::invalid("strategy \"selectors\" requires a \"schema\""))?;
                 StrategySpec::Selectors(schema)
             }
-            "youtube-channel-videos" => StrategySpec::YoutubeChannelVideos,
+            "youtube-channel-videos" => StrategySpec::YoutubeChannelVideos(None),
             _ => StrategySpec::GenericPage,
         };
         // Leak-free: names come from the static registry.
@@ -1024,7 +1132,7 @@ impl Scout {
         url: &str,
     ) -> Result<String> {
         match spec {
-            StrategySpec::YoutubeChannelVideos => {
+            StrategySpec::YoutubeChannelVideos(_) => {
                 crate::adapters::youtube::prepare_url(&self.cfg.youtube_hosts, url)
             }
             _ => Ok(url.to_string()),
@@ -1034,7 +1142,7 @@ impl Scout {
     pub async fn extract(&self, owner: &str, req: ExtractReq, abort: &Abort) -> Result<Value> {
         // Resolve the strategy before any network or queue use, so an unknown
         // strategy fails fast and cheaply.
-        let (spec, strategy_name, embedded) = self.resolve_strategy(&req)?;
+        let (mut spec, strategy_name, embedded) = self.resolve_strategy(&req)?;
         let default_limit = crate::adapters::registry()
             .into_iter()
             .find(|s| s.name == strategy_name)
@@ -1080,6 +1188,9 @@ impl Scout {
                 }
             }
 
+            if matches!(spec, StrategySpec::YoutubeChannelVideos(_)) {
+                spec = StrategySpec::YoutubeChannelVideos(Some(self.session_client(&session)?));
+            }
             let started = std::time::Instant::now();
             let out: Value = self
                 .workers
@@ -1310,7 +1421,7 @@ impl Scout {
                         let url = session.referrer().unwrap_or_default();
                         let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
                         let net = if self.cfg.js_network {
-                            Some(self.page_net(&session, &url, net_stats.clone()))
+                            Some(self.page_net(&session, &url, net_stats.clone())?)
                         } else {
                             None
                         };
@@ -1363,7 +1474,7 @@ impl Scout {
             let url = session.referrer().unwrap_or_default();
             let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
             let net = if self.cfg.js_network {
-                Some(self.page_net(&session, &url, net_stats.clone()))
+                Some(self.page_net(&session, &url, net_stats.clone())?)
             } else {
                 None
             };
@@ -1472,7 +1583,7 @@ impl Scout {
                 let url = session.referrer().unwrap_or_default();
                 let net_stats = std::sync::Arc::new(Mutex::new(js::NetStats::default()));
                 let net = if self.cfg.js_network {
-                    Some(self.page_net(&session, &url, net_stats.clone()))
+                    Some(self.page_net(&session, &url, net_stats.clone())?)
                 } else {
                     None
                 };
@@ -1677,7 +1788,7 @@ impl Scout {
         // cookies resolve against it exactly as they do for a page script.
         let page_url = session.referrer().unwrap_or_default();
         let net = if self.cfg.js_network {
-            Some(self.page_net(&session, &page_url, std::sync::Arc::new(Mutex::new(js::NetStats::default()))))
+            Some(self.page_net(&session, &page_url, std::sync::Arc::new(Mutex::new(js::NetStats::default())))?)
         } else {
             None
         };
@@ -1807,7 +1918,7 @@ impl Scout {
             Box::new(move |view: Value| {
                 let payload = json!({ "type": "task", "task": view });
                 tokio::spawn(async move {
-                    crate::schedules::fire_callback(&this.client, &url, secret.as_deref(), &payload).await;
+                    crate::schedules::fire_callback(&this.cfg, &this.client, &url, secret.as_deref(), &payload).await;
                 });
             }) as Box<dyn FnOnce(Value) + Send>
         });
@@ -1878,7 +1989,7 @@ impl Scout {
                             "changed": true,
                             "result": v,
                         });
-                        crate::schedules::fire_callback(&self.client, url, callback_secret.as_deref(), &payload).await;
+                        crate::schedules::fire_callback(&self.cfg, &self.client, url, callback_secret.as_deref(), &payload).await;
                     }
                 }
             }
@@ -1950,14 +2061,14 @@ impl Scout {
                             }
                             crate::validate::extract(&probe, &self.cfg)?
                         };
-                        // The task's session already holds the page, so an explicit
-                        // url on the step is cleared rather than re-fetched.
+                        // Capture any explicit step URL before binding the step to
+                        // the task's session, then navigate the session there first.
+                        let step_url = er.url.take();
                         er.session_id = Some(session.id.clone());
-                        er.url = None;
                         let (spec, name, embedded) = self.resolve_strategy(&er)?;
                         // Node's `#extract`: a url on the step navigates the session
                         // there first, through the strategy's URL preparation.
-                        if let Some(u) = er.url.clone() {
+                        if let Some(u) = step_url {
                             let target = self.prepare_strategy_url(&spec, &u)?;
                             let nav = NavigateReq {
                                 url: target,
@@ -2153,52 +2264,173 @@ fn _order() -> Ordering {
     Ordering::SeqCst
 }
 
-/// Find the first `max` iframe opening tags with an http(s) src.
-/// Returns (start, end, url) where the range covers `<iframe ...>` inclusive.
+/// Find the first `max` iframe opening tags with a document `src`, ignoring
+/// HTML comments and raw-text containers (`<script>`, `<style>`, `<textarea>`,
+/// `<title>`, `<xmp>`). Returns `(start, end, url)` covering `<iframe ...>`.
 fn iframe_tags(body: &str, max: usize) -> Vec<(usize, usize, String)> {
-    let lower = body.to_ascii_lowercase();
+    fn tag_boundary(b: Option<u8>) -> bool {
+        matches!(b, Some(c) if c == b'>' || c == b'/' || c.is_ascii_whitespace())
+    }
+
+    fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let c = bytes[i];
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None if c == b'"' || c == b'\'' => quote = Some(c),
+                None if c == b'>' => return Some(i + 1),
+                None => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn extract_attr(attrs: &str, target: &str) -> Option<String> {
+        let bytes = attrs.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let name_start = i;
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && bytes[i] != b'='
+                && bytes[i] != b'>'
+                && bytes[i] != b'/'
+            {
+                i += 1;
+            }
+            let name = &attrs[name_start..i];
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let value = if i < bytes.len() && bytes[i] == b'=' {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    String::new()
+                } else if bytes[i] == b'"' || bytes[i] == b'\'' {
+                    let q = bytes[i];
+                    i += 1;
+                    let v_start = i;
+                    while i < bytes.len() && bytes[i] != q {
+                        i += 1;
+                    }
+                    let v = attrs[v_start..i].to_string();
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    v
+                } else {
+                    let v_start = i;
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                        i += 1;
+                    }
+                    attrs[v_start..i].to_string()
+                }
+            } else {
+                String::new()
+            };
+            if name.eq_ignore_ascii_case(target) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    const RAW_CONTAINERS: [&[u8]; 5] = [b"script", b"style", b"textarea", b"title", b"xmp"];
+    let bytes = body.as_bytes();
     let mut out = Vec::new();
     let mut at = 0usize;
-    while out.len() < max {
-        let Some(rel) = lower[at..].find("<iframe") else { break };
+
+    while at < bytes.len() && out.len() < max {
+        let Some(rel) = body[at..].find('<') else {
+            break;
+        };
         let start = at + rel;
-        let Some(rel_end) = lower[start..].find('>') else { break };
-        let end = start + rel_end + 1;
-        let tag = &body[start..end];
-        // src attribute, single or double quoted, or bare.
-        let lower_tag = tag.to_ascii_lowercase();
-        let src = match lower_tag.find("src") {
-            Some(i) => {
-                let after = &tag[i + 3..];
-                let after = after.trim_start();
-                let after = after.strip_prefix('=').unwrap_or(after).trim_start();
-                let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'');
-                match quote {
-                    Some(q) => after[1..]
-                        .split(q)
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                    None => after
-                        .split(|c: char| c.is_whitespace() || c == '>')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
+        let rest = &bytes[start..];
+
+        // Skip HTML comments: <!-- ... -->
+        if rest.starts_with(b"<!--") {
+            match body[start + 4..].find("-->") {
+                Some(end_rel) => {
+                    at = start + 4 + end_rel + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
+
+        // Skip raw-text elements so `<iframe` inside JS strings or CSS never folds.
+        let mut skipped_raw = false;
+        for raw in RAW_CONTAINERS {
+            if rest.len() > 1 + raw.len()
+                && rest[1..1 + raw.len()].eq_ignore_ascii_case(raw)
+                && tag_boundary(rest.get(1 + raw.len()).copied())
+            {
+                let Some(open_end) = find_tag_end(bytes, start + 1 + raw.len()) else {
+                    return out;
+                };
+                let mut search = open_end;
+                let mut closed = None;
+                while search + 2 + raw.len() <= bytes.len() {
+                    if bytes[search] == b'<'
+                        && bytes[search + 1] == b'/'
+                        && bytes[search + 2..search + 2 + raw.len()].eq_ignore_ascii_case(raw)
+                        && tag_boundary(bytes.get(search + 2 + raw.len()).copied())
+                    {
+                        closed = find_tag_end(bytes, search + 2 + raw.len());
+                        break;
+                    }
+                    search += 1;
+                }
+                match closed {
+                    Some(close_end) => {
+                        at = close_end;
+                        skipped_raw = true;
+                        break;
+                    }
+                    None => return out,
                 }
             }
-            None => String::new(),
-        };
-        // javascript:, data:, about:, fragment-only and empty srcs are skipped;
-        // anything else is resolved against the page URL by the caller.
-        let skip = src.is_empty()
-            || src.starts_with("javascript:")
-            || src.starts_with("data:")
-            || src.starts_with("about:")
-            || src.starts_with('#');
-        if !skip {
-            out.push((start, end, src));
         }
-        at = end;
+        if skipped_raw {
+            continue;
+        }
+
+        if rest.len() > 7
+            && rest[1..7].eq_ignore_ascii_case(b"iframe")
+            && tag_boundary(rest.get(7).copied())
+        {
+            let Some(end) = find_tag_end(bytes, start + 7) else {
+                break;
+            };
+            let attrs = &body[start + 7..end - 1];
+            if let Some(raw_src) = extract_attr(attrs, "src") {
+                let src = raw_src.trim().to_string();
+                let lower_src = src.to_ascii_lowercase();
+                let skip = src.is_empty()
+                    || lower_src.starts_with("javascript:")
+                    || lower_src.starts_with("data:")
+                    || lower_src.starts_with("about:")
+                    || src.starts_with('#');
+                if !skip {
+                    out.push((start, end, src));
+                }
+            }
+            at = end;
+        } else {
+            at = start + 1;
+        }
     }
     out
 }
@@ -2304,5 +2536,18 @@ mod fold_tests {
         let tags = iframe_tags(html, 3);
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].2, "/frame-body");
+    }
+
+    #[test]
+    fn iframe_tags_ignores_comments_scripts_data_src_and_gt_in_quotes() {
+        let html = "<!-- <iframe src=\"https://comment.example/x\"></iframe> -->\
+                    <script>var t = '<iframe src=\"https://script.example/x\"></iframe>';</script>\
+                    <style>/* <iframe src=\"https://style.example/x\"> */</style>\
+                    <iframe data-src=\"https://lazy.example/x\"></iframe>\
+                    <iframe title=\"a>b\" src=\"/real-frame\"></iframe>";
+        let tags = iframe_tags(html, 5);
+        assert_eq!(tags.len(), 1, "got: {tags:?}");
+        assert_eq!(tags[0].2, "/real-frame");
+        assert!(html[tags[0].0..tags[0].1].ends_with('>'));
     }
 }

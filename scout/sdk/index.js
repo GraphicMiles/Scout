@@ -15,7 +15,29 @@ export class ScoutApiError extends Error {
 
 // Only errors raised before any work started are retried automatically (never mid-operation failures).
 const SAFE_RETRY = new Set(['rate_limited', 'queue_full', 'overloaded', 'too_many_sessions']);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('Aborted'));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('Aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+
+function bytesToBase64(bytes) {
+  if (typeof Buffer !== 'undefined') return Buffer.from(bytes).toString('base64');
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
 
 export class ScoutClient {
   #base; #key; #fetch; #timeout; #retries;
@@ -45,7 +67,7 @@ export class ScoutClient {
       if (res.ok) return json;
       const retryAfter = Number(res.headers.get('retry-after')) || undefined;
       const err = new ScoutApiError(res.status, json, retryAfter);
-      if (SAFE_RETRY.has(err.code) && attempt < this.#retries) { await sleep(Math.min((retryAfter ?? 1) * 1000, 10000)); continue; }
+      if (SAFE_RETRY.has(err.code) && attempt < this.#retries) { await sleep(Math.min((retryAfter ?? 1) * 1000, 10000), signal); continue; }
       throw err;
     }
   }
@@ -67,17 +89,17 @@ export class ScoutClient {
 
   health() { return this.#request('GET', '/health'); }
   strategies() { return this.#request('GET', '/v1/strategies').then((r) => r.strategies); }
-  createSession() { return this.#request('POST', '/v1/sessions', {}); }
-  async destroySession(id) { await this.#request('DELETE', `/v1/sessions/${id}`); }
+  createSession(opts = {}) { return this.#request('POST', '/v1/sessions', opts ?? {}); }
+  async destroySession(id) { await this.#request('DELETE', `/v1/sessions/${encodeURIComponent(id)}`); }
   navigate(params, opts) { return this.#request('POST', '/v1/navigate', params, opts?.signal); }
   extract(params, opts) { return this.#request('POST', '/v1/extract', params, opts?.signal); }
   interact(params, opts) { return this.#request('POST', '/v1/interact', params, opts?.signal); }
 
   /** Execute JavaScript against the session's loaded page (read-only DOM snapshot). */
   eval(params, opts) { return this.#request('POST', '/v1/eval', params, opts?.signal); }
-  submitTask(spec) { return this.#request('POST', '/v1/tasks', spec); }
-  getTask(id) { return this.#request('GET', `/v1/tasks/${id}`); }
-  cancelTask(id) { return this.#request('POST', `/v1/tasks/${id}/cancel`, {}); }
+  submitTask(spec, opts) { return this.#request('POST', '/v1/tasks', spec, opts?.signal); }
+  getTask(id, opts) { return this.#request('GET', `/v1/tasks/${encodeURIComponent(id)}`, undefined, opts?.signal); }
+  cancelTask(id, opts) { return this.#request('POST', `/v1/tasks/${encodeURIComponent(id)}/cancel`, {}, opts?.signal); }
 
   /**
    * A request that is not a page load: the session's cookies go out, the SSRF
@@ -105,7 +127,7 @@ export class ScoutClient {
     const { width, height, fullPage, encoding = 'buffer', signal } = opts;
     const res = await this.#requestRaw('/v1/screenshot', { sessionId, width, height, fullPage }, signal);
     const bytes = new Uint8Array(await res.arrayBuffer());
-    if (encoding === 'base64') return Buffer.from(bytes).toString('base64');
+    if (encoding === 'base64') return bytesToBase64(bytes);
     return typeof Buffer !== 'undefined' ? Buffer.from(bytes) : bytes;
   }
 
@@ -130,8 +152,8 @@ export class ScoutClient {
   importSession(sessionId, url, cookies) { return this.callTool('session.import', { sessionId, url, cookies }); }
 
   /** Create a session, run fn(sessionId), and always destroy the session afterwards. */
-  async withSession(fn) {
-    const s = await this.createSession();
+  async withSession(fn, sessionOpts = {}) {
+    const s = await this.createSession(sessionOpts);
     try { return await fn(s.id); } finally { await this.destroySession(s.id).catch(() => {}); }
   }
 
@@ -139,13 +161,14 @@ export class ScoutClient {
   async waitForTask(id, { pollMs = 300, timeoutMs = 120000, signal } = {}) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const t = await this.getTask(id);
+      if (signal?.aborted) throw signal.reason ?? new Error(`Aborted waiting for task ${id}`);
+      const t = await this.getTask(id, { signal });
       if (t.status === 'succeeded') return t;
       if (['failed', 'cancelled', 'timed_out'].includes(t.status)) throw new ScoutApiError(200, { error: t.error ?? { code: t.status, message: `Task ${t.status}` } });
-      if (signal?.aborted || Date.now() > deadline) throw new Error(`Timed out waiting for task ${id}`);
-      await sleep(pollMs);
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for task ${id}`);
+      await sleep(pollMs, signal);
     }
   }
 
-  async runTask(spec, opts) { return this.waitForTask((await this.submitTask(spec)).id, opts); }
+  async runTask(spec, opts) { return this.waitForTask((await this.submitTask(spec, opts)).id, opts); }
 }

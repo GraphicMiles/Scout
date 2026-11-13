@@ -26,8 +26,12 @@ pub fn dom_snapshot(doc: &scraper::Html) -> Value {
     use scraper::Node;
     use serde_json::Map;
 
-    fn walk(node: &ego_tree::NodeRef<Node>, budget: &mut usize) -> Value {
-        if *budget == 0 {
+    // Each element emits two JSON nesting levels (`{ "c": [ ... ] }`), so 56
+    // DOM levels stays safely inside serde_json's 128-level recursion ceiling.
+    const MAX_SNAPSHOT_DEPTH: usize = 56;
+
+    fn walk(node: &ego_tree::NodeRef<Node>, budget: &mut usize, depth: usize) -> Value {
+        if *budget == 0 || depth > MAX_SNAPSHOT_DEPTH {
             return Value::Null;
         }
         match node.value() {
@@ -42,10 +46,12 @@ pub fn dom_snapshot(doc: &scraper::Html) -> Value {
                     attrs.insert(k.to_string(), json!(v));
                 }
                 let mut children = Vec::new();
-                for c in node.children() {
-                    let cv = walk(&c, budget);
-                    if !cv.is_null() {
-                        children.push(cv);
+                if depth < MAX_SNAPSHOT_DEPTH {
+                    for c in node.children() {
+                        let cv = walk(&c, budget, depth + 1);
+                        if !cv.is_null() {
+                            children.push(cv);
+                        }
                     }
                 }
                 json!({
@@ -59,7 +65,7 @@ pub fn dom_snapshot(doc: &scraper::Html) -> Value {
                 // Document/fragment: descend, but emit nothing for the node itself.
                 let mut children = Vec::new();
                 for c in node.children() {
-                    let cv = walk(&c, budget);
+                    let cv = walk(&c, budget, depth);
                     if !cv.is_null() {
                         children.push(cv);
                     }
@@ -74,7 +80,7 @@ pub fn dom_snapshot(doc: &scraper::Html) -> Value {
     }
 
     let mut budget = 20_000usize;
-    walk(&doc.tree.root(), &mut budget)
+    walk(&doc.tree.root(), &mut budget, 0)
 }
 
 /// The read-only DOM surface exposed to scripts, implemented in JavaScript on
@@ -469,25 +475,30 @@ const DOM_SHIM: &str = r##"
   }
   function escAttr(t) { return esc(t).replace(/"/g, '&quot;'); }
 
-  function serialize(node) {
+  var RAW_TEXT_TAGS = { script: 1, style: 1 };
+
+  function serialize(node, rawParent) {
     if (!node) return '';
-    if (node.t === 3) return esc(node.v);
+    if (node.t === 3) return rawParent ? String(node.v) : esc(node.v);
     if (node.t !== 1) return '';
     if (node.n === '#root') {
       var o = '';
-      for (var i = 0; i < (node.c || []).length; i++) o += serialize(node.c[i]);
+      for (var i = 0; i < (node.c || []).length; i++) o += serialize(node.c[i], false);
       return o;
     }
-    var s = '<' + node.n, a = node.a || {};
+    var tag = String(node.n || '');
+    var lowerTag = tag.toLowerCase();
+    var s = '<' + tag, a = node.a || {};
     for (var k in a) {
       if (!Object.prototype.hasOwnProperty.call(a, k)) continue;
       if (a[k] === null || a[k] === undefined) continue;
       s += ' ' + k + '="' + escAttr(String(a[k])) + '"';
     }
     s += '>';
-    if (VOID_TAGS[node.n]) return s;
-    for (var j = 0; j < (node.c || []).length; j++) s += serialize(node.c[j]);
-    return s + '</' + node.n + '>';
+    if (VOID_TAGS[lowerTag]) return s;
+    var isRaw = !!RAW_TEXT_TAGS[lowerTag];
+    for (var j = 0; j < (node.c || []).length; j++) s += serialize(node.c[j], isRaw);
+    return s + '</' + tag + '>';
   }
 
   /* `style` is a write-only-ish shim: pages set styles constantly and reading
@@ -544,6 +555,10 @@ const DOM_SHIM: &str = r##"
     if (href.charAt(0) === '#') return href;
     var base = globalThis.__scout_url || '';
     if (!base) return href;
+    if (href.slice(0, 2) === '//') {
+      var scheme = /^([a-z][a-z0-9+.\-]*:)/i.exec(base);
+      return scheme ? scheme[1] + href : 'https:' + href;
+    }
     if (href.charAt(0) === '/') {
       var origin = /^[a-z][a-z0-9+.\-]*:\/\/[^/]+/i.exec(base);
       return origin ? origin[0] + href : href;
@@ -977,6 +992,8 @@ pub struct NetRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<NetBody>,
+    /// Fetch credentials mode: `"omit"`, `"same-origin"` (default), or `"include"`.
+    pub credentials: String,
 }
 
 /// A request body. Text is the common case; binary arrives as base64.
@@ -1529,11 +1546,17 @@ fn parse_net_request(v: &Value) -> std::result::Result<NetRequest, String> {
             }
         }
     };
+    let credentials = match v.get("credentials").and_then(|c| c.as_str()) {
+        Some("omit") => "omit".to_string(),
+        Some("include") => "include".to_string(),
+        _ => "same-origin".to_string(),
+    };
     Ok(NetRequest {
         method,
         url,
         headers,
         body,
+        credentials,
     })
 }
 
@@ -1631,12 +1654,12 @@ pub fn run(
     max_memory: usize,
 ) -> Result<JsOutcome> {
     run_with_locale(
-        script, snapshot, base_url, user_agent, storage, net, timeout, max_memory, "",
+        script, snapshot, base_url, user_agent, storage, net, timeout, max_memory, "", 1_024,
     )
 }
 
-/// `run` with a locale: `navigator.language` reports it, so pages that switch
-/// on it see the language the session asked for.
+/// `run` with a locale and promise-job cap: `navigator.language` reports `locale`,
+/// and recursive `.then()` chains stop at `job_budget`.
 pub fn run_with_locale(
     script: &str,
     snapshot: &Value,
@@ -1647,6 +1670,7 @@ pub fn run_with_locale(
     timeout: Duration,
     max_memory: usize,
     locale: &str,
+    job_budget: u32,
 ) -> Result<JsOutcome> {
     use rquickjs::{Context, Runtime};
 
@@ -1727,17 +1751,18 @@ pub fn run_with_locale(
             .eval::<rquickjs::Value, _>(program.as_str())
             .map_err(|e| js_err(classify(&e, &timed_out)))?;
         let value = match v.as_promise() {
-            Some(promise) => match promise.finish::<rquickjs::Value>() {
-                Ok(rv) if rv.is_undefined() || rv.is_null() => None,
-                Ok(rv) => Some(render_js_value(&rv)),
-                // Rejected, or blocked on something that is not a job (a
-                // timer). The pending exception has to be cleared or every
-                // later eval on this context fails.
-                Err(_) => {
-                    let _ = ctx.catch();
-                    None
+            Some(promise) => {
+                drain_jobs(&ctx, job_budget);
+                match promise.result::<rquickjs::Value>() {
+                    Some(Ok(rv)) if rv.is_undefined() || rv.is_null() => None,
+                    Some(Ok(rv)) => Some(render_js_value(&rv)),
+                    Some(Err(_)) => {
+                        let _ = ctx.catch();
+                        None
+                    }
+                    None => None,
                 }
-            },
+            }
             None if v.is_undefined() || v.is_null() => None,
             None => Some(render_js_value(&v)),
         };
@@ -1939,6 +1964,7 @@ impl rquickjs::loader::Loader for PageLoader {
             url: name.to_string(),
             headers: Vec::new(),
             body: None,
+            credentials: "same-origin".into(),
         })
         .map_err(|_| rquickjs::Error::Unknown)?;
         if resp.status >= 400 {
@@ -3271,5 +3297,78 @@ mod tests {
         let snap = dom_snapshot(&d);
         let s = serde_json::to_string(&snap).unwrap();
         assert!(s.len() < 20_000_000, "snapshot should be bounded");
+
+        // Deep nesting must stay well inside serde_json's 128-level recursion limit.
+        let deep = format!("{}leaf{}", "<div>".repeat(200), "</div>".repeat(200));
+        let d_deep = scraper::Html::parse_document(&deep);
+        let snap_deep = dom_snapshot(&d_deep);
+        let encoded = serde_json::to_string(&snap_deep).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.is_object());
+    }
+
+    #[test]
+    fn dom_shim_preserves_raw_style_script_and_resolves_protocol_relative_urls() {
+        let html = "<html><head><style>.parent > .child { color: red; }</style></head>\
+                    <body><a id='lnk' href='//cdn.example.com/app.js'>x</a>\
+                    <script>var ok = (1 < 2 && 3 > 1); document.body.setAttribute('data-href', document.getElementById('lnk').href);</script>\
+                    </body></html>";
+        let d = doc(html);
+        let scripts = vec![Script::classic(
+            "var s = document.createElement('style'); s.textContent = 'ul > li { margin: 0; }'; document.head.appendChild(s);",
+        )];
+        let out = run_page_with_locale(
+            &scripts,
+            &dom_snapshot(&d),
+            "https://app.example.com/dir/index.html",
+            "TestUA",
+            &json!({}),
+            None,
+            Duration::from_millis(2_000),
+            64 * 1024 * 1024,
+            32,
+            500,
+            "en-US",
+        )
+        .unwrap();
+        let rebuilt = out.html.expect("rebuilt html");
+        assert!(rebuilt.contains(".parent > .child"), "style > must not be escaped: {rebuilt}");
+        assert!(rebuilt.contains("ul > li"), "injected style > must not be escaped: {rebuilt}");
+        assert!(!rebuilt.contains("ul &gt; li"), "found escaped &gt; in style: {rebuilt}");
+
+        let eval_out = run_with_locale(
+            "return document.getElementById('lnk').href;",
+            &dom_snapshot(&d),
+            "https://app.example.com/dir/index.html",
+            "TestUA",
+            &json!({}),
+            None,
+            Duration::from_millis(2_000),
+            64 * 1024 * 1024,
+            "en-US",
+            64,
+        )
+        .unwrap();
+        assert_eq!(eval_out.value, Some(json!("https://cdn.example.com/app.js")));
+    }
+
+    #[test]
+    fn eval_promise_chain_respects_job_budget() {
+        let d = doc("<p>hi</p>");
+        let out = run_with_locale(
+            "function spin(n) { return Promise.resolve(n + 1).then(spin); } return spin(0);",
+            &dom_snapshot(&d),
+            "https://example.com/",
+            "TestUA",
+            &json!({}),
+            None,
+            Duration::from_millis(2_000),
+            64 * 1024 * 1024,
+            "en-US",
+            50,
+        )
+        .unwrap();
+        // Unresolved after 50 microtasks returns None cleanly rather than hanging forever.
+        assert_eq!(out.value, None);
     }
 }

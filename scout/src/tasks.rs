@@ -246,7 +246,7 @@ impl TaskManager {
         F: FnOnce(Abort) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
-        self.admit()?;
+        let admission = self.admit()?;
         let id = random_id("tsk_", 12);
         let abort = Abort::new();
         let record = Arc::new(Mutex::new(TaskRecord {
@@ -273,19 +273,22 @@ impl TaskManager {
         let timeout_ms = timeout_override_ms.unwrap_or(self.cfg.task_timeout_ms);
 
         tokio::spawn(async move {
-            // Acquire capacity; a task cancelled before it starts never runs.
-            let permit = match this.sem.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
+            let _admission = admission;
+            // Acquire capacity; a task cancelled before it starts releases its
+            // queued slot immediately without waiting for a worker permit.
+            let permit = tokio::select! {
+                biased;
+                _ = abort.token().cancelled() => {
                     let mut r = record.lock().unwrap();
                     if !r.status.is_terminal() {
-                        r.status = TaskStatus::Cancelled;
+                        let err = abort.reason();
+                        r.status = if err.code == ErrorCode::TaskTimeout {
+                            TaskStatus::TimedOut
+                        } else {
+                            TaskStatus::Cancelled
+                        };
                         r.finished_at = Some(now_ms());
-                        r.error = Some(
-                            ScoutError::new(ErrorCode::ShuttingDown, "Service is shutting down")
-                                .to_json()["error"]
-                                .clone(),
-                        );
+                        r.error = Some(err.to_json()["error"].clone());
                     }
                     let hook = r.take_hook();
                     drop(r);
@@ -293,6 +296,27 @@ impl TaskManager {
                         h(record.lock().unwrap().view());
                     }
                     return;
+                }
+                acq = this.sem.clone().acquire_owned() => match acq {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let mut r = record.lock().unwrap();
+                        if !r.status.is_terminal() {
+                            r.status = TaskStatus::Cancelled;
+                            r.finished_at = Some(now_ms());
+                            r.error = Some(
+                                ScoutError::new(ErrorCode::ShuttingDown, "Service is shutting down")
+                                    .to_json()["error"]
+                                    .clone(),
+                            );
+                        }
+                        let hook = r.take_hook();
+                        drop(r);
+                        if let Some(h) = hook {
+                            h(record.lock().unwrap().view());
+                        }
+                        return;
+                    }
                 }
             };
 
@@ -657,5 +681,48 @@ mod tests {
         }
         let err = m.cancel("k", &id).unwrap_err();
         assert_eq!(err.code, ErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn async_submit_holds_admission_and_enforces_max_queued() {
+        let m = mgr(1, 2);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let g1 = gate.clone();
+        let _t1 = m
+            .submit("k".into(), None, move |_a| async move {
+                g1.notified().await;
+                Ok(json!(1))
+            })
+            .unwrap();
+        // Allow t1 to grab the single concurrency permit.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let g2 = gate.clone();
+        let _t2 = m
+            .submit("k".into(), None, move |_a| async move {
+                g2.notified().await;
+                Ok(json!(2))
+            })
+            .unwrap();
+        let g3 = gate.clone();
+        let t3 = m
+            .submit("k".into(), None, move |_a| async move {
+                g3.notified().await;
+                Ok(json!(3))
+            })
+            .unwrap();
+
+        assert_eq!(m.stats(), (2, 1));
+        let err = m
+            .submit("k".into(), None, |_a| async { Ok(json!(4)) })
+            .expect_err("4th task must exceed concurrency(1) + max_queued(2)");
+        assert_eq!(err.code, ErrorCode::QueueFull);
+
+        // Cancelling a queued task immediately frees its queue slot.
+        let t3_id = t3["id"].as_str().unwrap();
+        m.cancel("k", t3_id).unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(m.stats(), (1, 1));
+        gate.notify_waiters();
     }
 }

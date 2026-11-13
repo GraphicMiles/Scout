@@ -116,7 +116,7 @@ impl Config {
     /// test reading the environment concurrently, which made `interaction`
     /// tests fail intermittently as the suite grew.
     pub fn dev() -> Self {
-        let mut env: std::collections::HashMap<String, String> = env::vars().collect();
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         env.insert("SCOUT_DEV_MODE".into(), "1".into());
         Self::from_map(env).expect("dev config is always valid")
     }
@@ -133,24 +133,52 @@ impl Config {
             .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
             .unwrap_or_default();
 
-        let allowed_ports = {
-            let raw = env.get("SCOUT_ALLOWED_PORTS").cloned().unwrap_or_else(|| "80,443".into());
-            raw.split(',')
-                .filter_map(|s| s.trim().parse::<u16>().ok())
-                .collect::<Vec<_>>()
+        let allowed_ports = match env.get("SCOUT_ALLOWED_PORTS") {
+            None => vec![80, 443],
+            Some(raw) if raw.trim().is_empty() => vec![80, 443],
+            Some(raw) => {
+                let mut ports = Vec::new();
+                for part in raw.split(',') {
+                    let trimmed = part.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let port = trimmed
+                        .parse::<u16>()
+                        .map_err(|_| format!("SCOUT_ALLOWED_PORTS contains invalid port \"{trimmed}\""))?;
+                    if port == 0 {
+                        return Err("SCOUT_ALLOWED_PORTS must not contain port 0".into());
+                    }
+                    ports.push(port);
+                }
+                if ports.is_empty() {
+                    vec![80, 443]
+                } else {
+                    ports
+                }
+            }
+        };
+
+        let port_raw = num(&env, "PORT", 8080)?;
+        let port = u16::try_from(port_raw)
+            .map_err(|_| format!("PORT out of range (0..=65535): {port_raw}"))?;
+        let mb_bytes = |key: &str, default_mb: u64| -> Result<u64, String> {
+            num(&env, key, default_mb)?
+                .checked_mul(MB)
+                .ok_or_else(|| format!("{key} overflows byte limit"))
         };
 
         let cfg = Config {
-            version: "0.1.0",
+            version: env!("CARGO_PKG_VERSION"),
             host: env.get("HOST").cloned().unwrap_or_else(|| "0.0.0.0".into()),
-            port: num(&env, "PORT", 8080)? as u16,
+            port,
             dev_mode: env.get("SCOUT_DEV_MODE").map(|v| v == "1").unwrap_or(false),
             api_keys,
             metrics_token: env.get("SCOUT_METRICS_TOKEN").cloned().unwrap_or_default(),
 
             private_allowlist: list(&env, "SCOUT_PRIVATE_ALLOWLIST"),
             allowed_domains: list(&env, "SCOUT_ALLOWED_DOMAINS"),
-            allowed_ports: if allowed_ports.is_empty() { vec![80, 443] } else { allowed_ports },
+            allowed_ports,
 
             max_body_bytes: num(&env, "SCOUT_MAX_BODY_BYTES", 6 * 1024 * 1024)? as usize,
             max_upload_bytes: num(&env, "SCOUT_MAX_UPLOAD_BYTES", 4 * 1024 * 1024)? as usize,
@@ -174,9 +202,9 @@ impl Config {
             max_retries: num(&env, "SCOUT_MAX_RETRIES", 2)? as u32,
             rate_limit_per_min: num(&env, "SCOUT_RATE_LIMIT_PER_MIN", 120)?,
 
-            memory_soft_limit_bytes: num(&env, "SCOUT_MEM_SOFT_MB", 300)? * MB,
-            memory_hard_limit_bytes: num(&env, "SCOUT_MEM_HARD_MB", 400)? * MB,
-            gc_above_bytes: num(&env, "SCOUT_GC_ABOVE_MB", 100)? * MB,
+            memory_soft_limit_bytes: mb_bytes("SCOUT_MEM_SOFT_MB", 300)?,
+            memory_hard_limit_bytes: mb_bytes("SCOUT_MEM_HARD_MB", 400)?,
+            gc_above_bytes: mb_bytes("SCOUT_GC_ABOVE_MB", 100)?,
 
             shutdown_grace_ms: num(&env, "SCOUT_SHUTDOWN_GRACE_MS", 10_000)?,
             log_level: env.get("SCOUT_LOG_LEVEL").cloned().unwrap_or_else(|| "info".into()),
@@ -207,7 +235,7 @@ impl Config {
                     ]
                 }),
             js_timeout_ms: num(&env, "SCOUT_JS_TIMEOUT_MS", 5_000)?,
-            js_max_memory_bytes: num(&env, "SCOUT_JS_MAX_MEMORY_MB", 256)? * MB,
+            js_max_memory_bytes: mb_bytes("SCOUT_JS_MAX_MEMORY_MB", 256)?,
             js_enabled: env
                 .get("SCOUT_JS_ENABLED")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))

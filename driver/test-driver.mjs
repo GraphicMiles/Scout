@@ -62,10 +62,23 @@ try {
     assert.equal(r.value, 1);
   });
 
-  await check('second page is independent', async () => {
-    const other = await scout.newPage();
+  await check('scroll(number) serializes pixel distance as string', async () => {
+    const r = await page.scroll(240);
+    assert.equal(r.ok, true);
+    assert.equal(r.type, 'scroll');
+  });
+
+  await check('second page is independent and forwards session options', async () => {
+    const other = await scout.newPage({ label: 'driver-test', locale: 'en-GB' });
     assert.notEqual(other.id, page.id);
     await other.close();
+  });
+
+  await check('launch() with missing executablePath rejects cleanly without unhandled error', async () => {
+    await assert.rejects(
+      () => launch({ executablePath: '/nonexistent/scout-binary-xyz' }),
+      /failed to spawn scout/
+    );
   });
 
   await check('page.close() destroys the session', async () => {

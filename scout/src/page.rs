@@ -253,82 +253,68 @@ impl Page {
 /// `content="N"` (reload the same page) is ignored: reloading buys a caller
 /// nothing and risks a loop.
 pub fn meta_refresh(html: &str, base: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut at = 0usize;
-    while let Some(start) = lower[at..].find("<meta") {
-        let start = at + start;
-        let end = lower[start..].find('>').map(|e| start + e)?;
-        let tag = &html[start..end];
-        at = end;
-        let attrs = parse_attrs(tag);
-        let equiv = attrs
-            .iter()
-            .find(|(k, _)| k == "http-equiv")
-            .map(|(_, v)| v.to_ascii_lowercase())?;
-        if equiv != "refresh" {
+    let doc = scraper::Html::parse_document(html);
+    let sel = crate::selector::compile("meta[http-equiv]").ok()?;
+    for el in doc.select(&sel) {
+        if el.ancestors().any(|a| {
+            a.value()
+                .as_element()
+                .map(|e| matches!(e.name(), "template" | "noscript"))
+                .unwrap_or(false)
+        }) {
             continue;
         }
-        let content = attrs
-            .iter()
-            .find(|(k, _)| k == "content")
-            .map(|(_, v)| v.clone())?;
-        // content = delay [ ";" [ url= ] target ]
-        let after_delay = content.split(';').nth(1)?;
-        let target = after_delay.trim();
-        let target = target
-            .strip_prefix("url=")
-            .or_else(|| target.strip_prefix("URL="))
-            .unwrap_or(target)
-            .trim()
-            .trim_matches(|c| c == '\'' || c == '"');
-        if target.is_empty() {
-            return None;
-        }
-        return url::Url::parse(base)
-            .and_then(|b| b.join(target))
-            .ok()
-            .map(|u| u.to_string());
-    }
-    None
-}
-
-/// Split `<meta a="b" c='d' e>` into (key, value) pairs, keys lowercased,
-/// values unquoted. Values without quotes are kept verbatim.
-fn parse_attrs(tag: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut fields = tag.split_ascii_whitespace().skip(1); // skip "<meta"
-    while let Some(field) = fields.next() {
-        let Some(eq) = field.find('=') else {
-            out.push((field.to_ascii_lowercase(), String::new()));
+        let Some(equiv) = el.value().attr("http-equiv") else {
             continue;
         };
-        let key = field[..eq].to_ascii_lowercase();
-        let mut value = field[eq + 1..].to_string();
-        if (value.starts_with('"') && !value.ends_with('"'))
-            || (value.starts_with('\'') && !value.ends_with('\''))
+        if !equiv.trim().eq_ignore_ascii_case("refresh") {
+            continue;
+        }
+        let Some(content) = el.value().attr("content") else {
+            continue;
+        };
+        // content = delay ";" [ "url=" ] target — use split_once so ';' in target URLs survives.
+        let Some((delay_part, after_delay)) = content.split_once(';') else {
+            continue;
+        };
+        let delay_trim = delay_part.trim();
+        if delay_trim.is_empty()
+            || !delay_trim
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.')
         {
-            // The value contains a space and was split: glue it back.
-            if let Some((quote, _)) = value.chars().enumerate().find(|(i, c)| {
-                *i == 0 && (*c == '"' || *c == '\'')
-            }) {
-                let close = value.chars().nth(quote).unwrap();
-                let mut glued = value.clone();
-                for field in fields.by_ref() {
-                    glued.push(' ');
-                    glued.push_str(field);
-                    if field.ends_with(close) {
-                        break;
-                    }
-                }
-                value = glued;
+            continue;
+        }
+        let trimmed = after_delay.trim();
+        let without_key = if trimmed.len() >= 4
+            && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"url=")
+        {
+            trimmed[4..].trim()
+        } else {
+            trimmed
+        };
+        let target = match without_key.as_bytes().first().copied() {
+            Some(b'"') => without_key[1..]
+                .split_once('"')
+                .map(|(v, _)| v)
+                .unwrap_or(&without_key[1..]),
+            Some(b'\'') => without_key[1..]
+                .split_once('\'')
+                .map(|(v, _)| v)
+                .unwrap_or(&without_key[1..]),
+            _ => without_key,
+        }
+        .trim();
+        if target.is_empty() {
+            continue;
+        }
+        if let Ok(resolved) = url::Url::parse(base).and_then(|b| b.join(target)) {
+            if matches!(resolved.scheme(), "http" | "https") {
+                return Some(resolved.to_string());
             }
         }
-        let value = value
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_string();
-        out.push((key, value));
     }
-    out
+    None
 }
 
 
@@ -413,5 +399,23 @@ mod meta_refresh_tests {
     fn other_meta_tags_are_ignored() {
         let html = r#"<meta charset="utf-8"><meta http-equiv="content-type" content="text/html">"#;
         assert_eq!(meta_refresh(html, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn refresh_after_charset_preserves_semicolons_and_ignores_comments_and_javascript() {
+        let html = r#"<html><head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width">
+            <!-- <meta http-equiv="refresh" content="0; url=https://evil.example/"> -->
+            <script>var s = '<meta http-equiv="refresh" content="0; url=https://evil.example/">';</script>
+            <meta http-equiv="refresh" content="0; url=/landing?a=1;b=2">
+        </head></html>"#;
+        assert_eq!(
+            meta_refresh(html, "https://example.com/"),
+            Some("https://example.com/landing?a=1;b=2".to_string())
+        );
+
+        let js_html = r#"<meta http-equiv="refresh" content="0; url=javascript:alert(1)">"#;
+        assert_eq!(meta_refresh(js_html, "https://example.com/"), None);
     }
 }

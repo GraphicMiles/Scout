@@ -48,7 +48,11 @@ fn load_face_uncached(path: &str, family: String, weight: u16) -> Option<Face> {
     // HarfBuzz's defaults are a browser's defaults: kerning and standard ligatures
     // are on, and no features need to be requested explicitly.
     let shaper = rustybuzz::Face::from_slice(owned, 0)?;
-    Some(Face { shaper, family, weight })
+    Some(Face {
+        data: FaceData::Static(shaper),
+        family,
+        weight,
+    })
 }
 
 /// Which loaded face a CSS family name means. The engine ships three real faces
@@ -133,49 +137,57 @@ pub struct WebFont {
     pub italic: bool,
 }
 
-static WEB_FONTS: std::sync::OnceLock<std::sync::Mutex<Vec<WebFont>>> = std::sync::OnceLock::new();
-
-fn web_fonts() -> &'static std::sync::Mutex<Vec<WebFont>> {
-    WEB_FONTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+thread_local! {
+    static PENDING_WEB_FONTS: std::cell::RefCell<Vec<WebFont>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Record the page's `@font-face` rules. Called once per document, before styles
-/// are computed; later calls replace the previous document's faces.
+/// Record `@font-face` rules on the current thread for legacy callers; prefer
+/// [`FontContext::set_web_fonts`] so faces stay scoped to a single context.
 pub fn register_web_fonts(fonts: Vec<WebFont>) {
-    if let Ok(mut list) = web_fonts().lock() {
+    PENDING_WEB_FONTS.with(|slot| {
+        let mut list = slot.borrow_mut();
         list.clear();
         list.extend(fonts);
-    }
+    });
 }
 
-/// Loaded web faces, keyed by family and weight, shared across documents.
-fn web_cache() -> &'static std::sync::Mutex<HashMap<String, Option<Arc<Face>>>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Arc<Face>>>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
+const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WOFF_TABLES: usize = 128;
+const MAX_SFNT_BYTES: usize = 32 * 1024 * 1024;
 
-/// Turn a font file into a face. WOFF2 is brotli-compressed inside a wrapper;
-/// WOFF and raw TTF/OTF are handled by the same entry point once decompressed.
+/// Turn a font file into a face without leaking heap memory (`Box::leak`).
 fn face_from_bytes(bytes: Vec<u8>, family: &str, weight: u16) -> Option<Face> {
+    if bytes.len() > MAX_FONT_BYTES {
+        return None;
+    }
     let bytes = if bytes.starts_with(b"wOF2") {
-        woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(bytes)).ok()?
+        let decoded = woff2_patched::convert_woff2_to_ttf(&mut std::io::Cursor::new(bytes)).ok()?;
+        if decoded.len() > MAX_SFNT_BYTES {
+            return None;
+        }
+        decoded
     } else if bytes.starts_with(b"wOFF") {
         decode_woff(&bytes)?
     } else {
         bytes
     };
-    let owned: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-    let shaper = rustybuzz::Face::from_slice(owned, 0)?;
-    Some(Face { shaper, family: family.to_string(), weight })
+    if bytes.len() > MAX_SFNT_BYTES {
+        return None;
+    }
+    // Validate once up front that HarfBuzz/ttf-parser accepts the table directory.
+    let _ = rustybuzz::Face::from_slice(&bytes, 0)?;
+    Some(Face {
+        data: FaceData::Owned(bytes),
+        family: family.to_string(),
+        weight,
+    })
 }
 
-/// Rebuild the sfnt table directory of a WOFF 1.0 file. Each table is stored
-/// zlib-compressed (or plain when compression did not help), so the container is
-/// simple enough to unpack without a dependency on the format.
+/// Rebuild the sfnt table directory of a WOFF 1.0 file with strict bounds so
+/// untrusted `orig_len` headers can never trigger an allocator abort (`SIGABRT`).
 fn decode_woff(bytes: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
-    if bytes.len() < 44 {
+    if bytes.len() < 44 || bytes.len() > MAX_FONT_BYTES {
         return None;
     }
     let u16_at = |i: usize| u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
@@ -184,23 +196,37 @@ fn decode_woff(bytes: &[u8]) -> Option<Vec<u8>> {
     };
     let flavor = u32_at(4);
     let num_tables = u16_at(12);
-    let mut tables: Vec<(u32, Vec<u8>)> = Vec::new();
+    if num_tables == 0 || num_tables > MAX_WOFF_TABLES {
+        return None;
+    }
+    let dir_end = 44usize.checked_add(num_tables.checked_mul(20)?)?;
+    if dir_end > bytes.len() {
+        return None;
+    }
+    let mut total_orig = 0usize;
+    let mut tables: Vec<(u32, Vec<u8>)> = Vec::with_capacity(num_tables);
     for i in 0..num_tables {
         let rec = 44 + i * 20;
-        if rec + 20 > bytes.len() {
-            return None;
-        }
         let tag = u32_at(rec) as u32;
         let offset = u32_at(rec + 4);
         let comp_len = u32_at(rec + 8);
         let orig_len = u32_at(rec + 12);
-        if offset + comp_len > bytes.len() {
+        let end = offset.checked_add(comp_len)?;
+        if end > bytes.len() || comp_len > orig_len || orig_len > MAX_FONT_BYTES {
             return None;
         }
-        let raw = &bytes[offset..offset + comp_len];
+        total_orig = total_orig.checked_add(orig_len)?;
+        if total_orig > MAX_SFNT_BYTES {
+            return None;
+        }
+        let raw = &bytes[offset..end];
         let data = if comp_len < orig_len {
-            let mut out = Vec::with_capacity(orig_len);
-            flate2::read::ZlibDecoder::new(raw).read_to_end(&mut out).ok()?;
+            let mut out = Vec::with_capacity(orig_len.min(64 * 1024));
+            let limit = (orig_len as u64).saturating_add(1);
+            flate2::read::ZlibDecoder::new(raw)
+                .take(limit)
+                .read_to_end(&mut out)
+                .ok()?;
             if out.len() != orig_len {
                 return None;
             }
@@ -222,7 +248,7 @@ fn decode_woff(bytes: &[u8]) -> Option<Vec<u8>> {
     let search_range = (1usize << entry_selector) * search;
     out.extend_from_slice(&(search_range as u16).to_be_bytes());
     out.extend_from_slice(&(entry_selector as u16).to_be_bytes());
-    out.extend_from_slice(&((num_tables * 16 - search_range) as u16).to_be_bytes());
+    out.extend_from_slice(&((num_tables * 16).saturating_sub(search_range) as u16).to_be_bytes());
     let mut offset = 12 + num_tables * 16;
     let mut body = Vec::new();
     for (tag, data) in &tables {
@@ -255,21 +281,24 @@ pub struct FontContext {
     root_font_size: f32,
     missing: Vec<String>,
     loaded_from: Option<String>,
-    /// Faces used for characters the CSS family cannot draw. Loaded on first
-    /// use, not at startup: a CJK collection is 18 MB of file and expands to
-    /// far more once parsed, which a page of English text never needs to pay.
+    /// Faces used for characters the CSS family cannot draw.
     fallbacks: Vec<Arc<Face>>,
     /// Scripts whose faces exist on disk but are not loaded yet, in order.
     pending: Vec<&'static str>,
     /// Rasterised glyphs, keyed by face index, glyph id and size in 1/64 px.
     raster_cache: HashMap<(usize, u16, u32), Arc<(GlyphMetrics, Vec<u8>)>>,
+    /// `@font-face` declarations and loaded faces scoped strictly to this render.
+    web_fonts: Vec<WebFont>,
+    web_cache: HashMap<String, Option<Arc<Face>>>,
+}
+
+enum FaceData {
+    Static(rustybuzz::Face<'static>),
+    Owned(Vec<u8>),
 }
 
 pub struct Face {
-    /// The font file, viewed by HarfBuzz: shaping, kerning, ligatures and
-    /// complex-script reordering all come from here, so measurement matches what a
-    /// browser lays out rather than a per-character sum.
-    shaper: rustybuzz::Face<'static>,
+    data: FaceData,
     #[allow(dead_code)]
     family: String,
     #[allow(dead_code)]
@@ -277,26 +306,47 @@ pub struct Face {
 }
 
 impl Face {
-    /// Vertical metrics from `hhea`, scaled from font units.
-    fn metrics_at(&self, px: f32) -> FontMetrics {
-        let upem = self.shaper.units_per_em();
-        if upem <= 0 {
-            return FontMetrics { ascent: px * 0.93, descent: -px * 0.24, line_gap: 0.0 };
-        }
-        let scale = px / upem as f32;
-        FontMetrics {
-            ascent: self.shaper.ascender() as f32 * scale,
-            descent: self.shaper.descender() as f32 * scale,
-            line_gap: self.shaper.line_gap() as f32 * scale,
+    fn with_shaper<R>(&self, f: impl FnOnce(&rustybuzz::Face<'_>) -> R) -> Option<R> {
+        match &self.data {
+            FaceData::Static(shaper) => Some(f(shaper)),
+              FaceData::Owned(bytes) => {
+                let shaper = rustybuzz::Face::from_slice(bytes, 0)?;
+                Some(f(&shaper))
+            }
         }
     }
 
+    fn has_glyph(&self, ch: char) -> bool {
+        self.with_shaper(|s| s.glyph_index(ch).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Vertical metrics from `hhea`, scaled from font units.
+    fn metrics_at(&self, px: f32) -> FontMetrics {
+        self.with_shaper(|shaper| {
+            let upem = shaper.units_per_em();
+            if upem <= 0 {
+                return FontMetrics { ascent: px * 0.93, descent: -px * 0.24, line_gap: 0.0 };
+            }
+            let scale = px / upem as f32;
+            FontMetrics {
+                ascent: shaper.ascender() as f32 * scale,
+                descent: shaper.descender() as f32 * scale,
+                line_gap: shaper.line_gap() as f32 * scale,
+            }
+        })
+        .unwrap_or(FontMetrics { ascent: px * 0.93, descent: -px * 0.24, line_gap: 0.0 })
+    }
+
     fn advance_of(&self, ch: char, px: f32) -> f32 {
-        let upem = self.shaper.units_per_em().max(1) as f32;
-        match self.shaper.glyph_index(ch).and_then(|id| self.shaper.glyph_hor_advance(id)) {
-            Some(units) => units as f32 * px / upem,
-            None => 0.0,
-        }
+        self.with_shaper(|shaper| {
+            let upem = shaper.units_per_em().max(1) as f32;
+            match shaper.glyph_index(ch).and_then(|id| shaper.glyph_hor_advance(id)) {
+                Some(units) => units as f32 * px / upem,
+                None => 0.0,
+            }
+        })
+        .unwrap_or(0.0)
     }
 }
 
@@ -317,6 +367,8 @@ impl FontContext {
             fallbacks: Vec::new(),
             pending: Vec::new(),
             raster_cache: HashMap::new(),
+            web_fonts: Vec::new(),
+            web_cache: HashMap::new(),
         };
         let candidates: Vec<String> = std::env::var("SCOUT_RENDER_FONT")
             .ok()
@@ -452,15 +504,32 @@ impl FontContext {
         false
     }
 
+    /// Register `@font-face` declarations strictly on this context, avoiding
+    /// cross-session global font caches or leaked memory.
+    pub fn set_web_fonts(&mut self, fonts: Vec<WebFont>) {
+        self.web_fonts = fonts;
+        self.web_cache.clear();
+    }
+
     /// A face the page declared through `@font-face`, loaded on first use.
     ///
     /// Weight matching mirrors the browser's: an exact face wins, then 400, then
     /// the nearest declared weight in the same direction.
     fn web_face(&mut self, family: &str, weight: u16) -> Option<Arc<Face>> {
-        let decls: Vec<WebFont> = {
-            let list = web_fonts().lock().ok()?;
-            list.iter().filter(|f| f.family.to_ascii_lowercase() == family).cloned().collect()
-        };
+        if self.web_fonts.is_empty() {
+            PENDING_WEB_FONTS.with(|slot| {
+                let list = slot.borrow();
+                if !list.is_empty() {
+                    self.web_fonts = list.clone();
+                }
+            });
+        }
+        let decls: Vec<WebFont> = self
+            .web_fonts
+            .iter()
+            .filter(|f| f.family.eq_ignore_ascii_case(family))
+            .cloned()
+            .collect();
         if decls.is_empty() {
             return None;
         }
@@ -471,38 +540,38 @@ impl FontContext {
             .or_else(|| decls.iter().min_by_key(|f| (f.weight as i32 - weight as i32).abs()));
         let decl = pick?;
         let key = format!("{}|{}|{}", decl.family.to_ascii_lowercase(), decl.weight, decl.italic);
-        if let Ok(cache) = web_cache().lock() {
-            if let Some(hit) = cache.get(&key) {
-                return hit.clone();
-            }
+        if let Some(hit) = self.web_cache.get(&key) {
+            return hit.clone();
         }
         let mut loaded = None;
         for url in &decl.urls {
             let Some(bytes) = crate::image::bytes_at(url) else { continue };
             if let Some(face) = face_from_bytes(bytes, &decl.family, decl.weight) {
-                loaded = Some(Arc::new(face));
+                let arc = Arc::new(face);
+                if !self.fallbacks.iter().any(|f| Arc::ptr_eq(f, &arc)) {
+                    self.fallbacks.push(arc.clone());
+                }
+                loaded = Some(arc);
                 break;
             }
         }
-        if let Ok(mut cache) = web_cache().lock() {
-            cache.insert(key, loaded.clone());
-        }
+        self.web_cache.insert(key, loaded.clone());
         loaded
     }
 
     /// The first face that can draw `ch`, after the one CSS asked for.
     fn face_for(&mut self, primary: &Arc<Face>, ch: char) -> Option<Arc<Face>> {
-        if primary.shaper.glyph_index(ch).is_some() {
+        if primary.has_glyph(ch) {
             return Some(primary.clone());
         }
-        if let Some(face) = self.fallbacks.iter().find(|f| f.shaper.glyph_index(ch).is_some()) {
+        if let Some(face) = self.fallbacks.iter().find(|f| f.has_glyph(ch)) {
             return Some(face.clone());
         }
         // Not covered by anything loaded: open the remaining script faces one at
         // a time until one can draw this character, and cache the miss by leaving
         // loaded faces at the front of the search for every later call.
         while self.load_next_pending() {
-            if let Some(face) = self.fallbacks.iter().find(|f| f.shaper.glyph_index(ch).is_some()) {
+            if let Some(face) = self.fallbacks.iter().find(|f| f.has_glyph(ch)) {
                 return Some(face.clone());
             }
         }
@@ -628,8 +697,8 @@ impl FontContext {
         if let Some(hit) = self.raster_cache.get(&key) {
             return Some(hit.as_ref().clone());
         }
-        let target = self.fallbacks.get(face)?;
-        let drawn = raster::glyph(&target.shaper, index, px);
+        let target = self.fallbacks.get(face)?.clone();
+        let drawn = target.with_shaper(|s| raster::glyph(s, index, px)).flatten();
         if let Some(drawn) = &drawn {
             self.raster_cache.insert(key, Arc::new(drawn.clone()));
         }
@@ -645,7 +714,7 @@ impl FontContext {
         px: f32,
     ) -> Option<(GlyphMetrics, Vec<u8>)> {
         let face = self.resolve(family, weight)?;
-        raster::glyph(&face.shaper, index, px)
+        face.with_shaper(|s| raster::glyph(s, index, px)).flatten()
     }
 
     pub fn missing_families(&self) -> &[String] {
@@ -703,35 +772,37 @@ impl FontContext {
         let mut out: Vec<ShapedGlyph> = Vec::new();
         let mut pen = 0.0f32;
         for (face, run) in segments {
-            let mut buffer = rustybuzz::UnicodeBuffer::new();
-            buffer.push_str(&run);
-            // Right-to-left scripts need the direction set: it is what turns
-            // Arabic's contextual forms and reordering on.
-            let direction = if is_rtl(&run) {
-                rustybuzz::Direction::RightToLeft
-            } else {
-                rustybuzz::Direction::LeftToRight
-            };
-            buffer.set_direction(direction);
-            buffer.guess_segment_properties();
-            let scale = px / face.shaper.units_per_em() as f32;
-            let output = rustybuzz::shape(&face.shaper, &[], buffer);
-
             let face_index = self
                 .fallbacks
                 .iter()
                 .position(|f| Arc::ptr_eq(f, &face))
                 .unwrap_or(usize::MAX);
-            for (info, pos) in output.glyph_infos().iter().zip(output.glyph_positions().iter()) {
-                out.push(ShapedGlyph {
-                    glyph_index: info.glyph_id as u16,
-                    face: face_index,
-                    x: pen + pos.x_offset as f32 * scale,
-                    y: -(pos.y_offset as f32) * scale,
-                    advance: pos.x_advance as f32 * scale,
-                });
-                pen += pos.x_advance as f32 * scale;
-            }
+            face.with_shaper(|shaper| {
+                let mut buffer = rustybuzz::UnicodeBuffer::new();
+                buffer.push_str(&run);
+                // Right-to-left scripts need the direction set: it is what turns
+                // Arabic's contextual forms and reordering on.
+                let direction = if is_rtl(&run) {
+                    rustybuzz::Direction::RightToLeft
+                } else {
+                    rustybuzz::Direction::LeftToRight
+                };
+                buffer.set_direction(direction);
+                buffer.guess_segment_properties();
+                let scale = px / shaper.units_per_em().max(1) as f32;
+                let output = rustybuzz::shape(shaper, &[], buffer);
+
+                for (info, pos) in output.glyph_infos().iter().zip(output.glyph_positions().iter()) {
+                    out.push(ShapedGlyph {
+                        glyph_index: info.glyph_id as u16,
+                        face: face_index,
+                        x: pen + pos.x_offset as f32 * scale,
+                        y: -(pos.y_offset as f32) * scale,
+                        advance: pos.x_advance as f32 * scale,
+                    });
+                    pen += pos.x_advance as f32 * scale;
+                }
+            });
         }
         out
     }

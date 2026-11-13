@@ -448,7 +448,7 @@ pub fn compute_styles(
     }
 
     let mut styles: HashMap<NodeId, Style> = HashMap::new();
-    walk(doc, doc.root, None, &flat, fonts, viewport_width, root_font_size, &mut styles, &mut out);
+    walk(doc, doc.root, None, &flat, fonts, viewport_width, root_font_size, &mut styles, &mut out, 0);
 
     out.styles = styles;
     out
@@ -465,13 +465,17 @@ fn walk(
     root_font_size: f32,
     out: &mut HashMap<NodeId, Style>,
     report: &mut ComputedStyles,
+    depth: usize,
 ) {
+    if depth > Document::MAX_DOM_DEPTH + 4 {
+        return;
+    }
     let el = &doc.nodes[node];
     if el.kind != crate::dom::Kind::Element {
         // The document node (and stray text/comments at the top) only route the walk
         // down into real elements.
         for child in el.children.clone() {
-            walk(doc, child, parent, flat, fonts, viewport_width, root_font_size, out, report);
+            walk(doc, child, parent, flat, fonts, viewport_width, root_font_size, out, report, depth + 1);
         }
         return;
     }
@@ -656,7 +660,25 @@ fn walk(
             .then(a.order.cmp(&b.order))
     });
 
+    // Collect custom properties (`--*`) in cascade order before standard
+    // properties so forward references within the same rule (`color: var(--c);
+    // --c: red`) resolve per CSS Variables, and store raw token values without
+    // eager expansion (preventing exponential custom-property memory bombs).
+    const MAX_CUSTOM_PROP_LEN: usize = 4_096;
     for candidate in &candidates {
+        let prop = candidate.property.trim().to_ascii_lowercase();
+        if prop.starts_with("--") {
+            let trimmed = candidate.value.trim();
+            if trimmed.len() <= MAX_CUSTOM_PROP_LEN {
+                style.custom_mut().insert(prop, trimmed.to_string());
+            }
+        }
+    }
+
+    for candidate in &candidates {
+        if candidate.property.trim().starts_with("--") {
+            continue;
+        }
         apply(
             &mut style,
             &candidate.property,
@@ -682,7 +704,7 @@ fn walk(
 
     out.insert(node, style.clone());
     for child in el.children.clone() {
-        walk(doc, child, Some(node), flat, fonts, viewport_width, root_font_size, out, report);
+        walk(doc, child, Some(node), flat, fonts, viewport_width, root_font_size, out, report, depth + 1);
     }
 }
 
@@ -697,14 +719,18 @@ fn apply(
     root_font_size: f32,
     parent_font_hint: f32,
 ) {
-    let value = resolve_vars(raw_value, style.custom.as_ref());
     let property = property.trim().to_ascii_lowercase();
-    let value = value.trim();
-
     if property.starts_with("--") {
-        style.custom_mut().insert(property.clone(), value.to_string());
+        let trimmed = raw_value.trim();
+        if trimmed.len() <= 4_096 {
+            style.custom_mut().insert(property, trimmed.to_string());
+        }
         return;
     }
+    let Some(resolved) = resolve_vars_checked(raw_value, style.custom.as_ref()) else {
+        return;
+    };
+    let value = resolved.trim();
 
     let font_size = if style.font_size > 0.0 { style.font_size } else { 16.0 };
     let px = |v: &str| length_px(v, font_size, root_font_size);
@@ -763,7 +789,11 @@ fn apply(
                     _ => style.font_size,
                 },
             };
-            style.font_size = resolved.max(0.0);
+            style.font_size = if resolved.is_finite() {
+                resolved.clamp(0.0, 1024.0)
+            } else {
+                style.font_size
+            };
         }
         "font-weight" => {
             style.font_weight = match value.to_ascii_lowercase().as_str() {
@@ -1220,40 +1250,131 @@ fn background_color_from_shorthand(value: &str) -> Option<Color> {
     None
 }
 
-/// Substitute `var(--name)` with the cascade's custom property values.
-fn resolve_vars(value: &str, custom: &HashMap<String, String>) -> String {
+/// Substitute `var(--name)` with the cascade's custom property values, bounded
+/// in recursion depth, cycle-checked, and capped in total output size.
+const MAX_VAR_DEPTH: usize = 16;
+const MAX_VAR_OUTPUT_BYTES: usize = 8_192;
+
+fn resolve_vars_checked(value: &str, custom: &HashMap<String, String>) -> Option<String> {
     if !value.contains("var(") {
-        return value.to_string();
+        return (value.len() <= MAX_VAR_OUTPUT_BYTES).then(|| value.to_string());
     }
     let mut out = String::new();
-    let mut rest = value;
-    while let Some(pos) = rest.find("var(") {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + 4..];
-        let close = match after.find(')') {
-            Some(c) => c,
-            None => {
-                out.push_str(&rest[pos..]);
-                return out;
+    let mut visiting = Vec::new();
+    if expand_vars_into(value, custom, &mut visiting, 0, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn resolve_vars(value: &str, custom: &HashMap<String, String>) -> String {
+    resolve_vars_checked(value, custom).unwrap_or_default()
+}
+
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    for (i, ch) in s.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
             }
-        };
-        let inner = &after[..close];
-        let (name, fallback) = match inner.split_once(',') {
-            Some((n, f)) => (n.trim(), Some(f.trim().to_string())),
-            None => (inner.trim(), None),
-        };
-        match custom.get(name) {
-            Some(v) => out.push_str(v),
-            None => {
-                if let Some(f) = fallback {
-                    out.push_str(&f);
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
                 }
             }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_comma(s: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, ch) in s.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return (&s[..i], Some(&s[i + 1..])),
+            _ => {}
+        }
+    }
+    (s, None)
+}
+
+fn expand_vars_into(
+    value: &str,
+    custom: &HashMap<String, String>,
+    visiting: &mut Vec<String>,
+    depth: usize,
+    out: &mut String,
+) -> bool {
+    if depth > MAX_VAR_DEPTH {
+        return false;
+    }
+    let mut rest = value;
+    while let Some(pos) = rest.find("var(") {
+        let prefix = &rest[..pos];
+        if out.len() + prefix.len() > MAX_VAR_OUTPUT_BYTES {
+            return false;
+        }
+        out.push_str(prefix);
+        let after = &rest[pos + 4..];
+        let Some(close) = find_matching_paren(after) else {
+            return false;
+        };
+        let inner = &after[..close];
+        let (raw_name, fallback) = split_top_level_comma(inner);
+        let name = raw_name.trim().to_ascii_lowercase();
+        if visiting.contains(&name) {
+            // Cyclic custom property reference: CSS Variables marks it invalid;
+            // fall back if a fallback is given, otherwise fail the declaration.
+            match fallback {
+                Some(fb) => {
+                    if !expand_vars_into(fb.trim(), custom, visiting, depth + 1, out) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        } else if let Some(val) = custom.get(&name) {
+            visiting.push(name);
+            let ok = expand_vars_into(val, custom, visiting, depth + 1, out);
+            visiting.pop();
+            if !ok {
+                return false;
+            }
+        } else if let Some(fb) = fallback {
+            if !expand_vars_into(fb.trim(), custom, visiting, depth + 1, out) {
+                return false;
+            }
+        } else {
+            return false;
         }
         rest = &after[close + 1..];
     }
+    if out.len() + rest.len() > MAX_VAR_OUTPUT_BYTES {
+        return false;
+    }
     out.push_str(rest);
-    out
+    true
 }
 
 #[cfg(test)]

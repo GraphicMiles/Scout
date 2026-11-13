@@ -21,6 +21,19 @@ impl Default for CookieJar {
     }
 }
 
+/// How `SameSite` rules should evaluate a cookie lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSiteContext {
+    /// Same-site request, or direct API tool call: `Strict`, `Lax`, and `None` all match.
+    SameSite,
+    /// Cross-site top-level safe navigation (`GET`/`HEAD`): `Lax` (and unspecified,
+    /// which defaults to `Lax` per RFC 6265bis) and `None; Secure` match; `Strict` does not.
+    CrossSiteTopLevelSafe,
+    /// Cross-site subresource, `POST` navigation, or `fetch`/`XHR` with `credentials: 'include'`:
+    /// only `SameSite=None` paired with `Secure` over HTTPS may be sent.
+    CrossSiteSubrequest,
+}
+
 impl CookieJar {
     pub fn new() -> Self {
         Self {
@@ -28,13 +41,50 @@ impl CookieJar {
         }
     }
 
-    /// `Cookie` header value for a request, or `None` when nothing applies.
+    /// Deep-copy all cookies (preserving host-only vs domain-scoped, `Secure`,
+    /// `HttpOnly`, `SameSite`, and expiry) without lossy string round-tripping.
+    pub fn fork(&self) -> Self {
+        let cloned = self.store.lock().unwrap().clone();
+        Self {
+            store: Mutex::new(cloned),
+        }
+    }
+
+    /// `Cookie` header value for a same-site or direct API request, or `None`.
     pub fn header_for(&self, url: &str) -> Option<String> {
+        self.header_for_context(url, SameSiteContext::SameSite)
+    }
+
+    /// `Cookie` header value filtered by browser `SameSite` rules.
+    pub fn header_for_context(&self, url: &str, ctx: SameSiteContext) -> Option<String> {
         let parsed = url::Url::parse(url).ok()?;
+        let is_https = parsed.scheme() == "https";
         let store = self.store.lock().unwrap();
         let pairs: Vec<String> = store
-            .get_request_values(&parsed)
-            .map(|(k, v)| format!("{k}={v}"))
+            .matches(&parsed)
+            .into_iter()
+            .filter(|c| {
+                let ss = c.same_site().map(|s| s.to_string());
+                match ctx {
+                    SameSiteContext::SameSite => {
+                        if ss.as_deref() == Some("None") {
+                            c.secure().unwrap_or(false) && is_https
+                        } else {
+                            true
+                        }
+                    }
+                    SameSiteContext::CrossSiteTopLevelSafe => match ss.as_deref() {
+                        Some("Strict") => false,
+                        Some("None") => c.secure().unwrap_or(false) && is_https,
+                        // `Lax` and omitted `SameSite` (Lax-by-default) travel on safe top-level navigations.
+                        _ => true,
+                    },
+                    SameSiteContext::CrossSiteSubrequest => {
+                        ss.as_deref() == Some("None") && c.secure().unwrap_or(false) && is_https
+                    }
+                }
+            })
+            .map(|c| format!("{}={}", c.name(), c.value()))
             .collect();
         if pairs.is_empty() {
             None
@@ -50,15 +100,29 @@ impl CookieJar {
     /// to *every* `.com` host the same session later visits — a real leak for an
     /// agent that browses several sites in one session.
     pub fn store_set_cookies(&self, url: &str, headers: &[(String, String)]) {
+        self.store_set_cookies_with_context(url, headers, SameSiteContext::SameSite);
+    }
+
+    /// Record `Set-Cookie` headers while enforcing cross-site `SameSite` acceptance rules.
+    pub fn store_set_cookies_with_context(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        ctx: SameSiteContext,
+    ) {
         let Ok(parsed) = url::Url::parse(url) else {
             return;
         };
+        let is_https = parsed.scheme() == "https";
         let mut store = self.store.lock().unwrap();
         for (value, _) in headers {
             if let Some(domain) = domain_attribute(value) {
                 if is_public_suffix(&domain) {
                     continue;
                 }
+            }
+            if ctx == SameSiteContext::CrossSiteSubrequest && !has_same_site_none_secure(value, is_https) {
+                continue;
             }
             // Remaining errors are malformed cookies or domain mismatches, which
             // the jar already rejects; neither should fail a navigation.
@@ -81,6 +145,7 @@ impl CookieJar {
                     "path": c.path(),
                     "secure": c.secure().unwrap_or(false),
                     "httpOnly": c.http_only().unwrap_or(false),
+                    "sameSite": c.same_site().map(|s| s.to_string()),
                     "expires": c.expires().and_then(|e| e.datetime()).map(|d| {
                         format!(
                             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -103,6 +168,11 @@ impl CookieJar {
         let Ok(parsed) = url::Url::parse(url) else {
             return false;
         };
+        if let Some(domain) = domain_attribute(value) {
+            if is_public_suffix(&domain) {
+                return false;
+            }
+        }
         let mut store = self.store.lock().unwrap();
         store.parse(value, &parsed).is_ok()
     }
@@ -119,6 +189,24 @@ impl CookieJar {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// True when a `Set-Cookie` header explicitly carries `SameSite=None` and `Secure` on HTTPS.
+fn has_same_site_none_secure(set_cookie: &str, is_https: bool) -> bool {
+    if !is_https {
+        return false;
+    }
+    let mut ss_none = false;
+    let mut secure = false;
+    for part in set_cookie.split(';').skip(1) {
+        let p = part.trim().to_ascii_lowercase();
+        if p == "secure" {
+            secure = true;
+        } else if let Some(v) = p.strip_prefix("samesite=") {
+            ss_none = v.trim() == "none";
+        }
+    }
+    ss_none && secure
 }
 
 /// Extract and normalize the `Domain=` attribute from a `Set-Cookie` value.
@@ -597,6 +685,29 @@ mod tests {
         assert!(jar.header_for("https://example.com/").is_some());
         // Still must not escape to an unrelated domain.
         assert!(jar.header_for("https://notexample.com/").is_none());
+    }
+
+    #[test]
+    fn set_cookie_screens_public_suffixes_and_fork_preserves_secure() {
+        let jar = CookieJar::new();
+        assert!(!jar.set_cookie("https://shop.example.co.uk/", "x=1; Domain=co.uk"));
+        assert!(!jar.set_cookie("https://me.github.io/", "x=1; Domain=github.io"));
+        assert!(jar.set_cookie(
+            "https://bank.example/",
+            "sid=secret; Secure; HttpOnly; SameSite=Strict"
+        ));
+        let forked = jar.fork();
+        assert!(forked.header_for("https://bank.example/").is_some());
+        assert!(
+            forked.header_for("http://bank.example/").is_none(),
+            "fork must never downgrade Secure cookies to plain HTTP"
+        );
+        assert!(
+            forked
+                .header_for_context("https://bank.example/", SameSiteContext::CrossSiteSubrequest)
+                .is_none(),
+            "Strict cookies must not travel on cross-site subrequests"
+        );
     }
 
     #[test]

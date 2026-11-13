@@ -10,16 +10,66 @@ use crate::error::{ErrorCode, ScoutError};
 use crate::server;
 use serde_json::{json, Value};
 use std::io::Write;
+use tokio::io::AsyncBufReadExt;
+
+const MAX_MCP_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read one newline-delimited frame from `reader`, capping memory at `max_bytes`.
+/// Returns `Ok(None)` on clean EOF, `Ok(Some(Ok(line)))` for a normal frame, or
+/// `Ok(Some(Err(())))` after draining an oversized frame to its terminating `\n`.
+pub(crate) async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<std::result::Result<String, ()>>> {
+    let mut buf = Vec::new();
+    let mut over = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() && !over {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !over {
+                if buf.len() + pos + 1 <= max_bytes {
+                    buf.extend_from_slice(&available[..=pos]);
+                } else {
+                    over = true;
+                }
+            }
+            reader.consume(pos + 1);
+            break;
+        } else {
+            let len = available.len();
+            if !over {
+                if buf.len() + len <= max_bytes {
+                    buf.extend_from_slice(available);
+                } else {
+                    over = true;
+                    buf.clear();
+                }
+            }
+            reader.consume(len);
+        }
+    }
+    if over {
+        return Ok(Some(Err(())));
+    }
+    String::from_utf8(buf)
+        .map(|s| Some(Ok(s)))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
 
 /// Run the MCP stdio bridge until stdin closes.
 pub async fn run() -> Result<(), ScoutError> {
     // Loopback only, port assigned by the OS, one ephemeral key held in
-    // memory: the server is private to this process. The key is planted in the
-    // environment before config parsing so the "keys required" check passes
-    // without the operator supplying any.
+    // memory: build from an owned map rather than mutating process env vars.
     let key = crate::util::random_id("mcp_", 24);
-    std::env::set_var("SCOUT_API_KEYS", &key);
-    let mut cfg = crate::config::Config::from_env()
+    let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+    env_map.insert("SCOUT_API_KEYS".to_string(), key.clone());
+    let mut cfg = crate::config::Config::from_map(env_map)
         .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("config error: {e}")))?;
     cfg.host = "127.0.0.1".to_string();
     cfg.port = 0;
@@ -38,18 +88,27 @@ pub async fn run() -> Result<(), ScoutError> {
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = std::io::stdout();
-    let mut line = String::new();
     loop {
-        line.clear();
-        let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
+        let frame = read_bounded_line(&mut stdin, MAX_MCP_LINE_BYTES)
             .await
             .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("stdin read failed: {e}")))?;
-        if n == 0 {
-            // EOF: the client went away. Shut down.
-            server_task.abort();
-            let _ = scout;
-            return Ok(());
-        }
+        let line = match frame {
+            None => {
+                // EOF: the client went away. Shut down.
+                server_task.abort();
+                let _ = scout;
+                return Ok(());
+            }
+            Some(Ok(s)) => s,
+            Some(Err(())) => {
+                let _ = writeln!(stdout, "{}", json!({
+                    "jsonrpc": "2.0", "id": Value::Null,
+                    "error": { "code": -32600, "message": "Invalid Request: frame exceeds maximum length" }
+                }));
+                let _ = stdout.flush();
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -170,4 +229,21 @@ async fn http(
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_oversized_frame_and_recovers() {
+        let payload = format!("{}\n{{\"id\":1}}\n", "x".repeat(256));
+        let mut reader = tokio::io::BufReader::new(payload.as_bytes());
+        let first = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert!(matches!(first, Some(Err(()))));
+        let second = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert_eq!(second.unwrap().unwrap(), "{\"id\":1}\n");
+        let eof = read_bounded_line(&mut reader, 64).await.unwrap();
+        assert!(eof.is_none());
+    }
 }

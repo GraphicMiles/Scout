@@ -19,9 +19,14 @@ const BLOCK: &[&str] = &[
     "tfoot", "th", "thead", "tr", "ul",
 ];
 
+/// Maximum element nesting depth accepted in a document. Iterative DOM walkers
+/// stay O(depth) in heap rather than stack, and capping depth prevents pathological
+/// markup from degrading selector matching or downstream JSON serialization.
+pub const MAX_DOM_DEPTH: usize = 512;
+
 pub fn parse_html(src: &str, max_nodes: usize) -> Result<Html> {
     let doc = Html::parse_document(src);
-    let count = element_count(&doc);
+    let (count, max_depth) = inspect_tree(&doc);
     if count > max_nodes {
         return Err(ScoutError::new(
             ErrorCode::ResponseTooLarge,
@@ -29,7 +34,35 @@ pub fn parse_html(src: &str, max_nodes: usize) -> Result<Html> {
         )
         .with_retryable(false));
     }
+    if max_depth > MAX_DOM_DEPTH {
+        return Err(ScoutError::new(
+            ErrorCode::ResponseTooLarge,
+            format!("Document exceeds the {MAX_DOM_DEPTH} nesting depth limit"),
+        )
+        .with_retryable(false));
+    }
     Ok(doc)
+}
+
+fn inspect_tree(doc: &Html) -> (usize, usize) {
+    let mut elements = 0usize;
+    let mut max_depth = 0usize;
+    let mut stack = vec![(doc.tree.root(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > max_depth {
+            max_depth = depth;
+        }
+        let next_depth = if node.value().is_element() {
+            elements += 1;
+            depth + 1
+        } else {
+            depth
+        };
+        for child in node.children() {
+            stack.push((child, next_depth));
+        }
+    }
+    (elements, max_depth)
 }
 
 pub fn element_count(doc: &Html) -> usize {

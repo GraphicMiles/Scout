@@ -137,7 +137,7 @@ pub fn style_document_with(
             });
         }
     }
-    text::register_web_fonts(web_fonts);
+    fonts.set_web_fonts(web_fonts);
 
     let computed = compute_styles(&doc, &sheets, fonts, viewport.width, text::root_font_size());
     failures.retain(|(href, _)| !linked.contains_key(href));
@@ -165,6 +165,10 @@ pub fn render(html: &str, viewport: Viewport, fonts: &mut text::FontContext) -> 
     (doc, computed, tree)
 }
 
+fn finite(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
 pub fn snapshot_json(
     doc: &Document,
     styles: &ComputedStyles,
@@ -182,11 +186,12 @@ pub fn snapshot_json(
     ));
     out.push_str(&format!(
         "{ind}\"viewport\": {{\"width\": {}, \"height\": {}}},{nl}",
-        viewport.width, viewport.height
+        finite(viewport.width),
+        finite(viewport.height)
     ));
     out.push_str(&format!(
         "{ind}\"document\": {{\"height\": {:.2}}},{nl}",
-        tree.document_height
+        finite(tree.document_height)
     ));
     // The engine's own clock, not the shell's: this is how long parse, style,
     // layout and (for a screenshot) paint actually took.
@@ -197,19 +202,26 @@ pub fn snapshot_json(
     ));
     out.push_str(&format!("{ind}\"elements\": ["));
     let elements = doc.elements();
-    for (n, id) in elements.iter().enumerate() {
+    let mut emitted = 0usize;
+    for id in &elements {
         let Some(rect) = tree.rect(*id) else { continue };
         let node = &doc.nodes[*id];
         let style = styles.styles.get(id);
         let text = visible_text(doc, *id);
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let display = style.map(|s| s.display).unwrap_or(Display::Block);
-        if display == Display::None || rect.width <= 0.0 || rect.height <= 0.0 {
+        if display == Display::None
+            || !rect.width.is_finite()
+            || !rect.height.is_finite()
+            || rect.width <= 0.0
+            || rect.height <= 0.0
+        {
             continue;
         }
-        if n > 0 {
+        if emitted > 0 {
             out.push_str(&format!(",{nl}"));
         }
+        emitted += 1;
         out.push_str(&format!("{ind}{ind}{{"));
         out.push_str(&format!("\"path\": \"{}\",", escape(&doc.css_path(*id))));
         out.push_str(&format!("\"tag\": \"{}\",", escape(&node.name)));
@@ -221,7 +233,10 @@ pub fn snapshot_json(
         }
         out.push_str(&format!(
             "\"rect\": {{\"x\": {:.2}, \"y\": {:.2}, \"width\": {:.2}, \"height\": {:.2}}},",
-            rect.x, rect.y, rect.width, rect.height
+            finite(rect.x),
+            finite(rect.y),
+            finite(rect.width),
+            finite(rect.height)
         ));
         if !text.is_empty() {
             out.push_str(&format!("\"text\": \"{}\",", escape(&truncate(&text, 120))));
@@ -298,7 +313,7 @@ pub fn truncate(s: &str, limit: usize) -> &str {
 }
 
 fn style_props(style: &Style) -> Vec<(&'static str, String)> {
-    let px = |v: f32| format!("{:.2}", v);
+    let px = |v: f32| format!("{:.2}", finite(v));
     let mut out = vec![
         (
             "display",

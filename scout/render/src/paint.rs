@@ -67,6 +67,18 @@ impl Canvas {
     }
 }
 
+/// Maximum canvas dimension and pixel budget to prevent multi-gigabyte OOMs on
+/// pathological `fullPage` heights or huge viewport parameters.
+pub const MAX_CANVAS_DIM: u32 = 8_192;
+pub const MAX_CANVAS_PIXELS: u64 = 16_777_216;
+
+pub fn clamp_canvas_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let w = width.clamp(1, MAX_CANVAS_DIM);
+    let max_h = (MAX_CANVAS_PIXELS / u64::from(w)).min(u64::from(MAX_CANVAS_DIM)) as u32;
+    let h = height.clamp(1, max_h.max(1));
+    (w, h)
+}
+
 /// Paint a laid-out document.
 pub fn paint(
     doc: &Document,
@@ -75,7 +87,8 @@ pub fn paint(
     fonts: &mut FontContext,
     options: Options,
 ) -> Canvas {
-    let mut pixmap = Pixmap::new(options.width.max(1), options.height.max(1))
+    let (cw, ch) = clamp_canvas_dimensions(options.width, options.height);
+    let mut pixmap = Pixmap::new(cw, ch)
         .unwrap_or_else(|| Pixmap::new(1, 1).unwrap());
     pixmap.fill(SkColor::from_rgba8(
         options.background.r,
@@ -92,7 +105,7 @@ pub fn paint(
         painter.paint_backgrounds(root, true);
     }
     if let Some(body) = Some(doc.body()) {
-        painter.paint_box(body, true);
+        painter.paint_box(body, true, 0);
     }
     painter.paint_text();
     painter.paint_markers();
@@ -131,7 +144,10 @@ impl<'a> Painter<'a> {
         }
     }
 
-    fn paint_box(&mut self, id: NodeId, is_body: bool) {
+    fn paint_box(&mut self, id: NodeId, is_body: bool, depth: usize) {
+        if depth > Document::MAX_DOM_DEPTH {
+            return;
+        }
         let Some(rect) = self.layout.rect(id) else {
             return;
         };
@@ -158,7 +174,7 @@ impl<'a> Painter<'a> {
         }
         behind.sort_by_key(|(z, _)| *z);
         for (_, child) in behind {
-            self.paint_box(child, false);
+            self.paint_box(child, false, depth + 1);
         }
 
         self.box_background(rect, &style, is_body);
@@ -190,11 +206,11 @@ impl<'a> Painter<'a> {
         // and backdrop patterns pages actually use.)
         positioned.sort_by_key(|(z, _)| *z);
         for child in flow {
-            self.paint_box(child, false);
+            self.paint_box(child, false, depth + 1);
         }
         for (z, child) in positioned.iter().filter(|(z, _)| *z >= 0) {
             let _ = z;
-            self.paint_box(*child, false);
+            self.paint_box(*child, false, depth + 1);
         }
     }
 
@@ -331,6 +347,9 @@ impl<'a> Painter<'a> {
             bottom_left: grow(radius.bottom_left),
         };
 
+        if !shadow.blur.is_finite() || !shadow.x.is_finite() || !shadow.y.is_finite() || !shadow.spread.is_finite() {
+            return;
+        }
         if shadow.blur <= 0.5 {
             self.fill_rounded(shadow_rect, shadow_radius, shadow.color);
             return;
@@ -338,15 +357,18 @@ impl<'a> Painter<'a> {
 
         // Draw the outline into an offscreen mask and blur it. Three box passes
         // approximate a Gaussian closely enough at the radii pages actually use.
-        let pad = shadow.blur.ceil() as i64 + 2;
-        let w = (shadow_rect.width.ceil() as i64 + pad * 2).clamp(1, 4096) as u32;
-        let h = (shadow_rect.height.ceil() as i64 + pad * 2).clamp(1, 4096) as u32;
+        let clamped_blur = shadow.blur.clamp(0.0, 256.0);
+        let pad = clamped_blur.ceil() as i64 + 2;
+        let sw = shadow_rect.width.clamp(0.0, 8192.0).ceil() as i64;
+        let sh = shadow_rect.height.clamp(0.0, 8192.0).ceil() as i64;
+        let w = (sw.saturating_add(pad * 2)).clamp(1, 4096) as u32;
+        let h = (sh.saturating_add(pad * 2)).clamp(1, 4096) as u32;
         let Some(mut mask) = Pixmap::new(w, h) else { return };
         let local = Rect::new(
             shadow_rect.x - shadow_rect.x.floor() + pad as f32,
             shadow_rect.y - shadow_rect.y.floor() + pad as f32,
-            shadow_rect.width,
-            shadow_rect.height,
+            shadow_rect.width.clamp(0.0, 8192.0),
+            shadow_rect.height.clamp(0.0, 8192.0),
         );
         let Some(path) = Self::rounded_path(local, shadow_radius) else { return };
         let mut paint = Paint::default();
@@ -354,10 +376,10 @@ impl<'a> Painter<'a> {
         paint.anti_alias = true;
         mask.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
-        blur_alpha(&mut mask, (shadow.blur / 2.0).round() as usize);
+        blur_alpha(&mut mask, ((clamped_blur / 2.0).round() as usize).min(256));
 
-        let origin_x = (shadow_rect.x.floor() - pad as f32).round() as i64;
-        let origin_y = (shadow_rect.y.floor() - pad as f32).round() as i64;
+        let origin_x = (shadow_rect.x.clamp(-1_000_000.0, 1_000_000.0).floor() - pad as f32).round() as i64;
+        let origin_y = (shadow_rect.y.clamp(-1_000_000.0, 1_000_000.0).floor() - pad as f32).round() as i64;
         self.composite(&mask, origin_x, origin_y, shadow.color);
     }
 

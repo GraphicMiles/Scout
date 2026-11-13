@@ -137,7 +137,7 @@ impl Flattener {
 /// `None` when the glyph has no outline (a space) or the font cannot draw it.
 pub fn glyph(face: &Face, glyph: u16, px: f32) -> Option<(GlyphMetrics, Vec<u8>)> {
     let upem = face.units_per_em() as f32;
-    if upem <= 0.0 || px <= 0.0 {
+    if !upem.is_finite() || upem <= 0.0 || !px.is_finite() || px <= 0.0 || px > 1024.0 {
         return None;
     }
     let scale = px / upem;
@@ -161,18 +161,29 @@ pub fn glyph(face: &Face, glyph: u16, px: f32) -> Option<(GlyphMetrics, Vec<u8>)
             max_y = max_y.max(y);
         }
     }
-    if min_x > max_x {
+    if min_x > max_x
+        || !min_x.is_finite()
+        || !max_x.is_finite()
+        || !min_y.is_finite()
+        || !max_y.is_finite()
+    {
         return None;
     }
     let (x0, y0) = (min_x.floor(), min_y.floor());
     let (x1, y1) = (max_x.ceil(), max_y.ceil());
-    let width = (x1 - x0) as i32;
-    let height = (y1 - y0) as i32;
-    if width <= 0 || height <= 0 {
+    let span_w = x1 - x0;
+    let span_h = y1 - y0;
+    // Cap per-glyph rasterisation buffers so extreme CSS font-size values can
+    // neither saturate float-to-int casts nor trigger multi-gigabyte OOM aborts.
+    if !(1.0..=2048.0).contains(&span_w) || !(1.0..=2048.0).contains(&span_h) {
         return None;
     }
-    let (w, h) = (width as usize, height as usize);
-    let mut coverage = vec![0f32; w * h];
+    let (w, h) = (span_w as usize, span_h as usize);
+    let total = w.checked_mul(h).filter(|&n| n > 0 && n <= 4_194_304)?;
+    if x0 < i32::MIN as f32 || x0 > i32::MAX as f32 || y0 < i32::MIN as f32 || y0 > i32::MAX as f32 {
+        return None;
+    }
+    let mut coverage = vec![0f32; total];
 
     // Each sub-scanline contributes 1/SUB_ROWS of the row it lands in.
     let weight = 1.0 / SUB_ROWS as f32;

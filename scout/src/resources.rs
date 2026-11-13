@@ -27,6 +27,15 @@ impl ResourceManager {
         rss_bytes()
     }
 
+    /// Return unused allocator pages to the OS when RSS sits above `gc_above_bytes`.
+    /// On glibc Linux, multi-threaded DOM/JS/render workloads fragment per-thread
+    /// arenas and inflate `VmRSS` unless trimmed periodically.
+    pub fn maybe_trim(&self) {
+        if self.rss_bytes() > self.cfg.gc_above_bytes {
+            trim_allocator_heap();
+        }
+    }
+
     /// Refuse new work while the process sits above its soft memory budget.
     pub fn admit(&self) -> Result<(), ScoutError> {
         let soft = self.cfg.memory_soft_limit_bytes;
@@ -81,6 +90,21 @@ impl Drop for WatchGuard {
         self.handle.abort();
     }
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator_heap() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: `malloc_trim` is a thread-safe glibc maintenance call that releases
+    // free top-of-heap/arena pages back to the kernel without invalidating live pointers.
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_allocator_heap() {}
 
 #[cfg(test)]
 mod tests {

@@ -38,7 +38,7 @@ use tokio::sync::oneshot;
 pub enum StrategySpec {
     GenericPage,
     Selectors(Schema),
-    YoutubeChannelVideos,
+    YoutubeChannelVideos(Option<reqwest::Client>),
 }
 
 /// A script the page asked for, in document order.
@@ -351,7 +351,9 @@ impl WorkerState {
         let (data, warnings) = match spec {
             StrategySpec::GenericPage => extract::generic_page(page, limit),
             StrategySpec::Selectors(schema) => extract::extract_by_schema(page, schema, limit),
-            StrategySpec::YoutubeChannelVideos => self.youtube_extract(page, limit)?,
+            StrategySpec::YoutubeChannelVideos(client) => {
+                self.youtube_extract(page, limit, client.as_ref())?
+            }
         };
         // Page-level warnings travel with the extraction too. A caller that
         // only ever calls /v1/extract must still be told when the page is a
@@ -380,6 +382,7 @@ impl WorkerState {
         &self,
         page: &Page,
         limit: usize,
+        session_client: Option<&reqwest::Client>,
     ) -> Result<(Value, Vec<Value>)> {
         use crate::adapters::youtube;
 
@@ -410,15 +413,17 @@ impl WorkerState {
         while items.len() < limit && pages < MAX_CONTINUATION_PAGES {
             let Some(c) = next.clone() else { break };
             let body = youtube::browse_body(&c);
+            let http_client = session_client.unwrap_or(&self.client);
             let fetched = rt.block_on(crate::security::guarded_fetch(
                 &self.cfg,
-                &self.client,
+                http_client,
                 crate::security::FetchRequest {
                     url: &c.url,
                     method: "POST",
                     headers: youtube::browse_headers(&c),
                     body: Some(body),
                     jar: None,
+                    cookie_mode: crate::security::CookieMode::Omit,
                     kind: crate::security::FetchKind::Xhr,
                     referer: Some(page.url.as_str()),
                     timeout_ms: self.cfg.nav_timeout_ms,
@@ -700,6 +705,7 @@ impl WorkerState {
             Duration::from_millis(self.cfg.js_timeout_ms),
             self.cfg.js_max_memory_bytes as usize,
             &locale,
+            self.cfg.js_job_budget,
         )?;
         // Persist Web Storage mutations the script made.
         if let Some(st) = out.storage {
@@ -845,8 +851,19 @@ impl WorkerPool {
                     let mut state = WorkerState::new(cfg, client, rt);
                     // Blocking receive: this thread is dedicated to CPU-bound
                     // DOM and JS work and must not run on the async executor.
+                    // Isolate unexpected panics per command so one bad input
+                    // never kills a worker thread or bricks sessions pinned to it.
                     while let Ok(cmd) = rx.recv() {
-                        state.handle(cmd);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            state.handle(cmd);
+                        }))
+                        .is_err()
+                        {
+                            crate::logger::error(
+                                "page worker caught a panic and recovered",
+                                json!({ "worker": i }),
+                            );
+                        }
                     }
                 })
                 .expect("page worker thread");
@@ -886,7 +903,7 @@ impl WorkerPool {
         let (tx, rx) = oneshot::channel();
         self.send(idx, build(tx))?;
         rx.await
-            .map_err(|_| ScoutError::new(ErrorCode::ShuttingDown, "Page worker dropped the request"))?
+            .map_err(|_| ScoutError::new(ErrorCode::Internal, "Page worker failed to complete the request"))?
     }
 
     pub fn shutdown(&self) {

@@ -69,18 +69,25 @@ const fn v6(segs: [u16; 8]) -> u128 {
 }
 
 const V6_BLOCKED: &[V6Range] = &[
-    V6Range(v6([0x2001, 0, 0, 0, 0, 0, 0, 0]), 32), // Teredo
+    V6Range(v6([0, 0, 0, 0, 0, 0, 0, 0]), 96),           // deprecated IPv4-compatible (::/96, incl. ::, ::1, ::127.0.0.1)
+    V6Range(v6([0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0]), 48), // local-use NAT64 (RFC 8215)
+    V6Range(v6([0x0100, 0, 0, 0, 0, 0, 0, 0]), 64),      // discard-only (RFC 6666)
+    V6Range(v6([0x2001, 0, 0, 0, 0, 0, 0, 0]), 32),      // Teredo
+    V6Range(v6([0x2001, 0x0002, 0, 0, 0, 0, 0, 0]), 48), // BMWG benchmarking (RFC 5180)
+    V6Range(v6([0x2001, 0x0010, 0, 0, 0, 0, 0, 0]), 28), // ORCHID (RFC 4843)
+    V6Range(v6([0x2001, 0x0020, 0, 0, 0, 0, 0, 0]), 28), // ORCHIDv2 (RFC 7343)
     V6Range(v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 0]), 32), // documentation
-    V6Range(v6([0x2002, 0, 0, 0, 0, 0, 0, 0]), 16), // 6to4
-    V6Range(v6([0xfc00, 0, 0, 0, 0, 0, 0, 0]), 7),  // unique local
-    V6Range(v6([0xfe80, 0, 0, 0, 0, 0, 0, 0]), 10), // link-local
-    V6Range(v6([0xfec0, 0, 0, 0, 0, 0, 0, 0]), 10), // deprecated site-local
-    V6Range(v6([0xff00, 0, 0, 0, 0, 0, 0, 0]), 8),  // multicast
-    V6Range(v6([0x0100, 0, 0, 0, 0, 0, 0, 0]), 64), // discard-only
+    V6Range(v6([0x2002, 0, 0, 0, 0, 0, 0, 0]), 16),      // 6to4
+    V6Range(v6([0x5f00, 0, 0, 0, 0, 0, 0, 0]), 16),      // SRv6 SIDs (RFC 9602)
+    V6Range(v6([0xfc00, 0, 0, 0, 0, 0, 0, 0]), 7),       // unique local
+    V6Range(v6([0xfe80, 0, 0, 0, 0, 0, 0, 0]), 10),      // link-local
+    V6Range(v6([0xfec0, 0, 0, 0, 0, 0, 0, 0]), 10),      // deprecated site-local
+    V6Range(v6([0xff00, 0, 0, 0, 0, 0, 0, 0]), 8),       // multicast
 ];
 
-/// `::ffff:0:0/96` and `64:ff9b::/96`, the two prefixes carrying an embedded IPv4.
+/// `::ffff:0:0/96`, `::ffff:0:0:0/96` (SIIT), and `64:ff9b::/96` (NAT64).
 const MAPPED_PREFIX: u128 = v6([0, 0, 0, 0, 0, 0xffff, 0, 0]) >> 32;
+const SIIT_PREFIX: u128 = v6([0, 0, 0, 0, 0xffff, 0, 0, 0]) >> 32;
 const NAT64_PREFIX: u128 = v6([0x0064, 0xff9b, 0, 0, 0, 0, 0, 0]) >> 32;
 
 fn in_v6_range(ip: Ipv6Addr, ranges: &[V6Range]) -> bool {
@@ -91,12 +98,12 @@ fn in_v6_range(ip: Ipv6Addr, ranges: &[V6Range]) -> bool {
     })
 }
 
-/// Extract the IPv4 address embedded in an IPv4-mapped (`::ffff:a.b.c.d`) or
-/// NAT64 (`64:ff9b::/96`) prefix.
+/// Extract the IPv4 address embedded in IPv4-mapped (`::ffff:a.b.c.d`),
+/// SIIT IPv4-translated (`::ffff:0:a.b.c.d`), or well-known NAT64 (`64:ff9b::/96`).
 fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let n = u128::from(ip);
     let top = n >> 32;
-    if top == MAPPED_PREFIX || top == NAT64_PREFIX {
+    if top == MAPPED_PREFIX || top == SIIT_PREFIX || top == NAT64_PREFIX {
         return Some(Ipv4Addr::from((n & 0xFFFF_FFFF) as u32));
     }
     None
@@ -201,6 +208,62 @@ pub fn validate_url(raw: &str, cfg: &Config) -> Result<url::Url> {
     }
 
     Ok(u)
+}
+
+/// Validate a session `proxyUrl`. Unlike target page URLs, HTTP proxies may
+/// carry `user:pass@` authentication and listen on non-80/443 ports (e.g. 3128,
+/// 8080), while still enforcing the SSRF blocklist on the proxy host itself.
+pub fn validate_proxy_url(raw: &str, cfg: &Config) -> Result<url::Url> {
+    let u = url::Url::parse(raw).map_err(|_| {
+        ScoutError::invalid("Proxy URL is not valid")
+            .with_details(serde_json::json!({ "field": "proxyUrl" }))
+    })?;
+    match u.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(ScoutError::invalid(
+                "\"proxyUrl\" must be an http or https URL; SOCKS is not supported",
+            )
+            .with_details(serde_json::json!({ "field": "proxyUrl" })));
+        }
+    }
+    let host = u
+        .host_str()
+        .ok_or_else(|| ScoutError::invalid("Proxy URL has no host"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    let allow_private = cfg.private_allowlist.iter().any(|h| h == &host);
+    if !allow_private {
+        if host == "localhost" || host == "metadata.google.internal" {
+            return Err(ScoutError::blocked("Proxy host is not permitted"));
+        }
+        if INTERNAL_SUFFIXES.iter().any(|s| host.ends_with(s)) {
+            return Err(ScoutError::blocked("Proxy host is not permitted"));
+        }
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_blocked_ip(ip) {
+                return Err(ScoutError::blocked("Proxy address is in a blocked range"));
+            }
+        } else if !host.contains('.') {
+            return Err(ScoutError::blocked("Single-label proxy hostnames are not permitted"));
+        }
+    }
+    Ok(u)
+}
+
+/// Strip credentials from a `proxyUrl` before returning it in API views or logs.
+pub fn redact_proxy_url(raw: &str) -> String {
+    let Ok(mut u) = url::Url::parse(raw) else {
+        return "[redacted]".to_string();
+    };
+    if !u.username().is_empty() || u.password().is_some() {
+        let _ = u.set_password(None);
+        let _ = u.set_username("***");
+    }
+    u.to_string()
 }
 
 // ------------------------------------------------------- connect-time DNS
@@ -359,10 +422,30 @@ fn map_net_error(e: reqwest::Error) -> ScoutError {
 pub enum FetchKind {
     /// A top-level document load.
     Document,
-    /// A `<script src>` the document pulled in.
+    /// A `<script src>` or folded `<iframe>` the document pulled in.
     Script,
+    /// A stylesheet, image, or web font loaded by the renderer (may be binary).
+    Subresource,
     /// `fetch` or `XMLHttpRequest`, from the page or from the request tool.
     Xhr,
+}
+
+/// How the session cookie jar should participate in a request and its redirects.
+#[derive(Debug, Clone, Default)]
+pub enum CookieMode {
+    /// Never attach `Cookie` or accept `Set-Cookie`.
+    Omit,
+    /// Trusted caller (`/v1/request`): attach domain/path/Secure cookies directly.
+    #[default]
+    Direct,
+    /// Top-level document navigation: enforce `SameSite` (`Lax` on safe GET/HEAD).
+    Navigation,
+    /// Subresource or `credentials: "include"` script call: enforce `SameSite`
+    /// (`SameSite=None; Secure` required when cross-site from `referer`).
+    Subresource,
+    /// Scripted `fetch`/`XHR` with `credentials: "same-origin"` (the Fetch default):
+    /// attach/store cookies only while the hop's origin equals `0`.
+    SameOriginOnly(url::Origin),
 }
 
 pub struct FetchRequest<'a> {
@@ -375,6 +458,7 @@ pub struct FetchRequest<'a> {
     /// that follows it. Applying cookies only at the end of the chain is the
     /// difference between being able to sign in and landing back on the form.
     pub jar: Option<&'a crate::session::CookieJar>,
+    pub cookie_mode: CookieMode,
     pub kind: FetchKind,
     /// The document this request is issued from, when there is one. Drives
     /// `Referer`, `Origin` and `Sec-Fetch-Site` under the browser's default
@@ -382,6 +466,138 @@ pub struct FetchRequest<'a> {
     pub referer: Option<&'a str>,
     pub timeout_ms: u64,
     pub max_bytes: usize,
+}
+
+/// True when `name` is a Fetch-spec forbidden request header that untrusted
+/// page JavaScript must never set or override.
+pub fn is_forbidden_script_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.starts_with("sec-") || lower.starts_with("proxy-") {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "accept-charset"
+            | "accept-encoding"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+            | "connection"
+            | "content-length"
+            | "cookie"
+            | "cookie2"
+            | "date"
+            | "dnt"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "origin"
+            | "referer"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "via"
+    )
+}
+
+/// True when `(name, value)` is a CORS-safelisted request header that does not
+/// require a preflight `OPTIONS` check.
+pub fn is_cors_safelisted_header(name: &str, value: &str) -> bool {
+    if value.len() > 128 {
+        return false;
+    }
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "accept" | "accept-language" | "content-language" => true,
+        "content-type" => {
+            let essence = value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            matches!(
+                essence.as_str(),
+                "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Validate CORS response headers for a cross-origin scripted request, and
+/// filter exposed response headers to CORS-safelisted + `Access-Control-Expose-Headers`.
+pub fn enforce_cors_response(
+    mut fetched: Fetched,
+    page_origin: &str,
+    include_credentials: bool,
+) -> std::result::Result<Fetched, String> {
+    let acao = fetched
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"))
+        .map(|(_, v)| v.trim())
+        .unwrap_or("");
+    if acao.is_empty() {
+        return Err(format!(
+            "blocked by CORS policy: no Access-Control-Allow-Origin header on {}",
+            fetched.url
+        ));
+    }
+    if include_credentials {
+        if acao != page_origin {
+            return Err(format!(
+                "blocked by CORS policy: Access-Control-Allow-Origin {:?} does not match origin {} when credentials are included",
+                acao, page_origin
+            ));
+        }
+        let acac = fetched
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-credentials"))
+            .map(|(_, v)| v.trim())
+            .unwrap_or("");
+        if acac != "true" {
+            return Err(
+                "blocked by CORS policy: Access-Control-Allow-Credentials is not true".into(),
+            );
+        }
+    } else if acao != "*" && acao != page_origin {
+        return Err(format!(
+            "blocked by CORS policy: Access-Control-Allow-Origin {:?} does not permit {}",
+            acao, page_origin
+        ));
+    }
+
+    let mut exposed_allow: Vec<String> = vec![
+        "cache-control".into(),
+        "content-language".into(),
+        "content-length".into(),
+        "content-type".into(),
+        "expires".into(),
+        "last-modified".into(),
+        "pragma".into(),
+    ];
+    let mut wildcard_expose = false;
+    for (k, v) in &fetched.headers {
+        if k.eq_ignore_ascii_case("access-control-expose-headers") {
+            for item in v.split(',') {
+                let name = item.trim().to_ascii_lowercase();
+                if name == "*" && !include_credentials {
+                    wildcard_expose = true;
+                } else if !name.is_empty() {
+                    exposed_allow.push(name);
+                }
+            }
+        }
+    }
+    if !wildcard_expose {
+        fetched
+            .headers
+            .retain(|(k, _)| exposed_allow.iter().any(|a| a == &k.to_ascii_lowercase()));
+    }
+    Ok(fetched)
 }
 
 /// The header set a browser sends with a request of this kind.
@@ -410,6 +626,7 @@ fn browser_headers(
             "navigate",
         ),
         FetchKind::Script => ("*/*", "script", "no-cors"),
+        FetchKind::Subresource => ("*/*", "empty", "no-cors"),
         FetchKind::Xhr => ("*/*", "empty", "cors"),
     };
     out.push(("accept".into(), accept.into()));
@@ -533,9 +750,46 @@ pub async fn guarded_fetch(
     let mut headers = req.headers.clone();
     let mut redirects = Vec::new();
 
+    let initiator_url = req.referer.and_then(|r| url::Url::parse(r).ok());
+    let mut cookie_mode = req.cookie_mode.clone();
+
     for hop in 0..=cfg.max_redirects {
-        // Recomputed per hop: a cookie set by hop N belongs on hop N+1.
-        let cookie_header = req.jar.and_then(|j| j.header_for(current.as_str()));
+        // Compute SameSite context & whether cookies apply on this hop.
+        let ss_ctx = match &cookie_mode {
+            CookieMode::Omit => None,
+            CookieMode::Direct => Some(crate::session::SameSiteContext::SameSite),
+            CookieMode::SameOriginOnly(ref origin) => {
+                if &current.origin() == origin {
+                    Some(crate::session::SameSiteContext::SameSite)
+                } else {
+                    None
+                }
+            }
+            CookieMode::Navigation => match &initiator_url {
+                None => Some(crate::session::SameSiteContext::SameSite),
+                Some(init) if same_site(init, &current) => {
+                    Some(crate::session::SameSiteContext::SameSite)
+                }
+                Some(_) if matches!(method.as_str(), "GET" | "HEAD") => {
+                    Some(crate::session::SameSiteContext::CrossSiteTopLevelSafe)
+                }
+                Some(_) => Some(crate::session::SameSiteContext::CrossSiteSubrequest),
+            },
+            CookieMode::Subresource => match &initiator_url {
+                None => Some(crate::session::SameSiteContext::SameSite),
+                Some(init) if same_site(init, &current) => {
+                    Some(crate::session::SameSiteContext::SameSite)
+                }
+                Some(_) => Some(crate::session::SameSiteContext::CrossSiteSubrequest),
+            },
+        };
+
+        // Recomputed per hop: a cookie set by hop N belongs on hop N+1,
+        // unless a redirect crossed out of a SameOriginOnly scope.
+        let cookie_header = match (req.jar, ss_ctx) {
+            (Some(j), Some(ctx)) => j.header_for_context(current.as_str(), ctx),
+            _ => None,
+        };
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -593,8 +847,8 @@ pub async fn guarded_fetch(
                 exposed.push((name, s.to_string()));
             }
         }
-        if let Some(jar) = req.jar {
-            jar.store_set_cookies(current.as_str(), &set_cookies);
+        if let (Some(jar), Some(ctx)) = (req.jar, ss_ctx) {
+            jar.store_set_cookies_with_context(current.as_str(), &set_cookies, ctx);
         }
 
         let location = res
@@ -636,8 +890,14 @@ pub async fn guarded_fetch(
 
             if validated.origin() != current.origin() {
                 headers.retain(|(k, _)| {
-                    !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("referer")
+                    !k.eq_ignore_ascii_case("authorization")
+                        && !k.eq_ignore_ascii_case("referer")
+                        && !k.eq_ignore_ascii_case("cookie")
                 });
+                // Once a `same-origin` request redirects cross-origin, it never regains credentials.
+                if matches!(cookie_mode, CookieMode::SameOriginOnly(_)) {
+                    cookie_mode = CookieMode::Omit;
+                }
             }
             if status == 303 || ((status == 301 || status == 302) && method == "POST") {
                 method = "GET".into();
@@ -659,11 +919,10 @@ pub async fn guarded_fetch(
             .trim()
             .to_ascii_lowercase();
 
-        // Documents and scripts must be textual; an XHR/fetch from a page
-        // script (or the /v1/request tool) may fetch binary data, which comes
-        // back as base64 instead of a corrupted string.
+        // Documents and scripts must be textual; subresources (images/fonts) and
+        // XHR/fetch may carry binary data, returned as base64 instead of corrupted UTF-8.
         let binary = !is_textual(&content_type);
-        if binary && req.kind != FetchKind::Xhr {
+        if binary && !matches!(req.kind, FetchKind::Xhr | FetchKind::Subresource) {
             return Err(ScoutError::new(
                 ErrorCode::UnsupportedContent,
                 format!("\"{content_type}\" is not downloaded (documents and data only)"),
@@ -892,5 +1151,74 @@ mod tests {
         assert!(validate_url("https://sub.example.com/a", &cfg).is_ok());
         assert!(validate_url("https://notexample.com/a", &cfg).is_err());
         assert!(validate_url("https://example.com.evil.com/a", &cfg).is_err());
+    }
+
+    #[test]
+    fn blocks_special_and_transitional_ipv6_ssrf_ranges() {
+        for blocked in [
+            "::127.0.0.1",
+            "::169.254.169.254",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "64:ff9b:1::10.0.0.1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "5f00::1",
+            "100::1",
+        ] {
+            let ip: IpAddr = blocked.parse().expect(blocked);
+            assert!(is_blocked_ip(ip), "{blocked} must be blocked");
+        }
+        // SIIT-translated public IPv4 stays reachable.
+        let public_siit: IpAddr = "::ffff:0:93.184.216.34".parse().unwrap();
+        assert!(!is_blocked_ip(public_siit));
+    }
+
+    #[test]
+    fn proxy_validation_redacts_credentials_and_blocks_private_hosts() {
+        let cfg = crate::config::Config::dev();
+        assert!(validate_proxy_url("http://user:secret@proxy.example.com:3128", &cfg).is_ok());
+        assert!(validate_proxy_url("http://127.0.0.1:3128", &cfg).is_err());
+        assert!(validate_proxy_url("http://169.254.169.254:80", &cfg).is_err());
+        assert_eq!(
+            redact_proxy_url("http://user:supersecret@proxy.example.com:3128"),
+            "http://***@proxy.example.com:3128/"
+        );
+    }
+
+    #[test]
+    fn forbidden_headers_and_cors_enforcement() {
+        assert!(is_forbidden_script_header("Cookie"));
+        assert!(is_forbidden_script_header("Origin"));
+        assert!(is_forbidden_script_header("Referer"));
+        assert!(is_forbidden_script_header("Sec-Fetch-Site"));
+        assert!(is_forbidden_script_header("Proxy-Authorization"));
+        assert!(!is_forbidden_script_header("X-Requested-With"));
+
+        let base = Fetched {
+            url: "https://api.other.example/data".into(),
+            status: 200,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-secret".into(), "hidden".into()),
+            ],
+            content_type: "application/json".into(),
+            body: "{\"ok\":true}".into(),
+            body_b64: None,
+            bytes: 11,
+            redirects: vec![],
+            from_cache: false,
+        };
+        assert!(enforce_cors_response(base.clone(), "https://app.example", false).is_err());
+
+        let mut wildcard = base.clone();
+        wildcard
+            .headers
+            .push(("access-control-allow-origin".into(), "*".into()));
+        // Wildcard allowed without credentials, disallowed with credentials.
+        let ok = enforce_cors_response(wildcard.clone(), "https://app.example", false).unwrap();
+        assert!(ok.headers.iter().all(|(k, _)| k != "x-secret"));
+        assert!(enforce_cors_response(wildcard, "https://app.example", true).is_err());
     }
 }

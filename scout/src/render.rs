@@ -61,12 +61,19 @@ pub struct Rendered {
     pub failed: Vec<Value>,
 }
 
+const MAX_RENDER_FETCHES: usize = 48;
+const MAX_RENDER_ASSET_BYTES: usize = 16 * 1024 * 1024;
+const RENDER_FETCH_DEADLINE_MS: u64 = 10_000;
+
 /// One render's fetch context: policy, jar, cache and byte budget.
 struct Ctx {
     cfg: Arc<Config>,
     client: reqwest::Client,
     handle: tokio::runtime::Handle,
     jar: Arc<CookieJar>,
+    page_base: String,
+    started: std::time::Instant,
+    fetches: AtomicUsize,
     budget: AtomicUsize,
     cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
 }
@@ -79,21 +86,49 @@ thread_local! {
 }
 
 impl Ctx {
-    fn new(scout: &Scout, jar: Arc<CookieJar>) -> Arc<Ctx> {
+    fn new(scout: &Scout, client: reqwest::Client, jar: Arc<CookieJar>, page_base: String) -> Arc<Ctx> {
         Arc::new(Ctx {
             cfg: scout.cfg.clone(),
-            client: scout.client.clone(),
+            client,
             handle: tokio::runtime::Handle::current(),
             jar,
-            budget: AtomicUsize::new(scout.cfg.max_response_bytes.saturating_mul(4)),
+            page_base,
+            started: std::time::Instant::now(),
+            fetches: AtomicUsize::new(0),
+            budget: AtomicUsize::new(0),
             cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn charge(&self, bytes: usize) -> bool {
+        let limit = self.cfg.max_response_bytes.saturating_mul(4).min(MAX_RENDER_ASSET_BYTES);
+        let mut cur = self.budget.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_add(bytes) else {
+                return false;
+            };
+            if next > limit {
+                return false;
+            }
+            match self.budget.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Fetch one asset under Scout's network policy. `None` means "the renderer
     /// renders without it", never "the policy was bypassed".
     fn fetch(&self, url: &str) -> Option<Vec<u8>> {
-        if let Some(data) = inline_data(url) {
+        if let Some(data) = inline_data(url, self.cfg.max_response_bytes.saturating_mul(4)) {
+            if !self.charge(data.len()) {
+                return None;
+            }
             return Some(data);
         }
         if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -102,6 +137,17 @@ impl Ctx {
         if let Some(hit) = self.cache.lock().ok()?.get(url) {
             return hit.clone();
         }
+        // Bound both total subresource count and total asset-fetch wall time so a
+        // media-heavy page with 200 lazy images or slow ad beacons renders promptly
+        // with what arrived in budget instead of stalling a blocking thread.
+        if self.started.elapsed().as_millis() as u64 >= RENDER_FETCH_DEADLINE_MS {
+            return None;
+        }
+        if self.fetches.fetch_add(1, Ordering::Relaxed) >= MAX_RENDER_FETCHES {
+            return None;
+        }
+        let per_asset_timeout = self.cfg.nav_timeout_ms.min(3_500);
+        let per_asset_max_bytes = self.cfg.max_response_bytes.min(4 * 1024 * 1024);
         // The engine calls this from a blocking thread inside `spawn_blocking`,
         // so driving Scout's async client to completion here cannot starve the
         // reactor.
@@ -117,10 +163,11 @@ impl Ctx {
                 )],
                 body: None,
                 jar: Some(&self.jar),
-                kind: FetchKind::Script,
-                referer: Some(&self.base_referer(url)),
-                timeout_ms: self.cfg.request_timeout_ms,
-                max_bytes: self.cfg.max_response_bytes,
+                cookie_mode: security::CookieMode::Subresource,
+                kind: FetchKind::Subresource,
+                referer: (!self.page_base.is_empty()).then_some(self.page_base.as_str()),
+                timeout_ms: per_asset_timeout,
+                max_bytes: per_asset_max_bytes,
             },
         ));
 
@@ -136,8 +183,7 @@ impl Ctx {
         // A shared budget across every asset of one render: a page that pulls in
         // a thousand fonts stops instead of filling the process.
         if let Some(b) = &bytes {
-            let spent = self.budget.fetch_add(b.len(), Ordering::Relaxed);
-            if spent + b.len() > self.cfg.max_response_bytes.saturating_mul(4) {
+            if !self.charge(b.len()) {
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.insert(url.to_string(), None);
                 }
@@ -149,23 +195,21 @@ impl Ctx {
         }
         bytes
     }
-
-    fn base_referer(&self, url: &str) -> String {
-        url::Url::parse(url)
-            .map(|u| format!("{}://{}/", u.scheme(), u.host_str().unwrap_or("")))
-            .unwrap_or_default()
-    }
 }
 
-/// `data:` URIs are inline content, not a fetch: decode them directly.
-fn inline_data(url: &str) -> Option<Vec<u8>> {
+/// `data:` URIs are inline content, not a fetch: decode them directly within `max_bytes`.
+fn inline_data(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
     let rest = url.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
-    if meta.ends_with(";base64") {
-        base64_decode(payload)
-    } else {
-        Some(payload.as_bytes().to_vec())
+    if payload.len() > max_bytes.saturating_mul(2) {
+        return None;
     }
+    let out = if meta.ends_with(";base64") {
+        base64_decode(payload)?
+    } else {
+        payload.as_bytes().to_vec()
+    };
+    (out.len() <= max_bytes).then_some(out)
 }
 
 pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
@@ -210,83 +254,112 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+static RENDER_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
 /// Render `req` and return geometry (and pixels, when `png` is set).
-pub async fn render(scout: &Scout, jar: Arc<CookieJar>, req: Render, png: bool) -> Result<Rendered> {
-    let ctx = Ctx::new(scout, jar);
-    // Ask the engine to route remote assets through this context from now on.
-    scout_render::image::set_fetcher(Some(Arc::new(|url: &str| {
-        CURRENT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.fetch(url)))
-    })));
+pub async fn render(
+    scout: &Scout,
+    client: reqwest::Client,
+    jar: Arc<CookieJar>,
+    req: Render,
+    png: bool,
+) -> Result<Rendered> {
+    let sem = RENDER_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(4));
+    let _permit = sem
+        .acquire()
+        .await
+        .map_err(|_| ScoutError::new(ErrorCode::ShuttingDown, "renderer shutting down"))?;
+    let max_asset_bytes = scout.cfg.max_response_bytes.saturating_mul(4).min(MAX_RENDER_ASSET_BYTES);
+    let ctx = Ctx::new(scout, client, jar, req.base.clone());
 
     let started = std::time::Instant::now();
     let work = tokio::task::spawn_blocking(move || -> Result<(Value, Option<Vec<u8>>, u32, u32, Vec<Value>)> {
         CURRENT.with(|c| *c.borrow_mut() = Some(ctx.clone()));
-        let result = (|| -> Result<(Value, Option<Vec<u8>>, u32, u32, Vec<Value>)> {
-            let viewport = scout_render::Viewport {
-                width: req.width.max(64.0),
-                height: req.height.max(64.0),
-            };
-            let mut fonts = scout_render::text::FontContext::new(scout_render::text::root_font_size());
-            // Deliberately offline: every byte the engine needs arrives through
-            // the fetcher above, which is Scout's own policy. `Offline` here means
-            // "do not load stylesheets yourself", not "render nothing".
-            let loader = Loader;
-            let (doc, styles, tree, failures) = scout_render::render_with(
-                &req.html,
-                &req.base,
-                viewport,
-                &mut fonts,
-                &loader,
-            );
+        let fetcher: scout_render::image::Fetcher = Arc::new(|url: &str| {
+            CURRENT.with(|c| c.borrow().as_ref().and_then(|ctx| ctx.fetch(url)))
+        });
+        let result = scout_render::image::with_render_scope(
+            &req.base,
+            fetcher,
+            max_asset_bytes,
+            || -> Result<(Value, Option<Vec<u8>>, u32, u32, Vec<Value>)> {
+                let vw = if req.width.is_finite() { req.width.clamp(64.0, 8192.0) } else { 1280.0 };
+                let vh = if req.height.is_finite() { req.height.clamp(64.0, 8192.0) } else { 800.0 };
+                let viewport = scout_render::Viewport {
+                    width: vw,
+                    height: vh,
+                };
+                let mut fonts = scout_render::text::FontContext::new(scout_render::text::root_font_size());
+                let loader = Loader;
+                let (doc, styles, tree, failures) = scout_render::render_with(
+                    &req.html,
+                    &req.base,
+                    viewport,
+                    &mut fonts,
+                    &loader,
+                );
 
-            let mut layout: Value = serde_json::from_str(&scout_render::snapshot_json(
-                &doc,
-                &styles,
-                &tree,
-                viewport,
-                &mut fonts,
-                false,
-                0,
-            ))
-            .unwrap_or_else(|_| json!({}));
-
-            // Truncation is explicit: an agent that gets 1500 boxes must know the
-            // page had more, or it will reason about half a document.
-            if let Some(elements) = layout.get_mut("elements").and_then(|e| e.as_array_mut()) {
-                let total = elements.len();
-                if total > req.max_elements {
-                    elements.truncate(req.max_elements);
-                    layout["truncated"] = json!({ "shown": req.max_elements, "total": total });
-                }
-            }
-            layout["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
-
-            let width = if req.full_page { tree.document_width.max(req.width) } else { req.width };
-            let height = if req.full_page { tree.document_height.max(req.height) } else { req.height };
-            let png = if png {
-                let canvas = scout_render::paint(
+                let mut layout: Value = serde_json::from_str(&scout_render::snapshot_json(
                     &doc,
                     &styles,
                     &tree,
+                    viewport,
                     &mut fonts,
-                    scout_render::paint::Options {
-                        width: width.ceil() as u32,
-                        height: height.ceil() as u32,
-                        ..Default::default()
-                    },
-                );
-                Some(canvas.to_png().map_err(|e| {
-                    ScoutError::new(ErrorCode::Internal, format!("png encode failed: {e}"))
-                })?)
-            } else {
-                None
-            };
-            let failed = failures
-                .into_iter()
-                .map(|(url, why)| json!({ "url": url, "reason": why }))
-                .collect();
-            Ok((layout, png, width.ceil() as u32, height.ceil() as u32, failed))
-        })();
+                    false,
+                    0,
+                ))
+                .unwrap_or_else(|_| json!({}));
+
+                // Truncation is explicit: an agent that gets 1500 boxes must know the
+                // page had more, or it will reason about half a document.
+                if let Some(elements) = layout.get_mut("elements").and_then(|e| e.as_array_mut()) {
+                    let total = elements.len();
+                    if total > req.max_elements {
+                        elements.truncate(req.max_elements);
+                        layout["truncated"] = json!({ "shown": req.max_elements, "total": total });
+                    }
+                }
+                layout["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+
+                let raw_w = if req.full_page && tree.document_width.is_finite() {
+                    tree.document_width.max(vw)
+                } else {
+                    vw
+                };
+                let raw_h = if req.full_page && tree.document_height.is_finite() {
+                    tree.document_height.max(vh)
+                } else {
+                    vh
+                };
+                let wanted_w = raw_w.clamp(1.0, scout_render::paint::MAX_CANVAS_DIM as f32).ceil() as u32;
+                let wanted_h = raw_h.clamp(1.0, scout_render::paint::MAX_CANVAS_DIM as f32).ceil() as u32;
+                let (cw, ch) = scout_render::paint::clamp_canvas_dimensions(wanted_w, wanted_h);
+
+                let png_out = if png {
+                    let canvas = scout_render::paint(
+                        &doc,
+                        &styles,
+                        &tree,
+                        &mut fonts,
+                        scout_render::paint::Options {
+                            width: cw,
+                            height: ch,
+                            ..Default::default()
+                        },
+                    );
+                    Some(canvas.to_png().map_err(|e| {
+                        ScoutError::new(ErrorCode::Internal, format!("png encode failed: {e}"))
+                    })?)
+                } else {
+                    None
+                };
+                let failed = failures
+                    .into_iter()
+                    .map(|(url, why)| json!({ "url": url, "reason": why }))
+                    .collect();
+                Ok((layout, png_out, cw, ch, failed))
+            },
+        );
         CURRENT.with(|c| *c.borrow_mut() = None);
         result
     })
@@ -294,6 +367,7 @@ pub async fn render(scout: &Scout, jar: Arc<CookieJar>, req: Render, png: bool) 
     .map_err(|e| ScoutError::new(ErrorCode::Internal, format!("render worker failed: {e}")))??;
 
     let (mut layout, png, width, height, failed) = work;
+    scout.resources.maybe_trim();
     layout["viewport"] = json!({ "width": width, "height": height });
     if !failed.is_empty() {
         layout["failed"] = Value::Array(failed.clone());
@@ -321,7 +395,8 @@ impl scout_render::resource::ResourceLoader for Loader {
 /// Geometry of the session's current page.
 pub async fn page_layout(scout: &Scout, owner: &str, session_id: &str, req: Render) -> Result<Value> {
     let session = scout.sessions.get(owner, session_id)?;
-    let rendered = render(scout, session.jar.clone(), req, false).await?;
+    let client = scout.session_client(&session)?;
+    let rendered = render(scout, client, session.jar.clone(), req, false).await?;
     Ok(rendered.layout)
 }
 
@@ -333,8 +408,9 @@ pub async fn page_screenshot(
     req: Render,
 ) -> Result<Value> {
     let session = scout.sessions.get(owner, session_id)?;
+    let client = scout.session_client(&session)?;
     let max = scout.cfg.max_response_bytes;
-    let rendered = render(scout, session.jar.clone(), req, true).await?;
+    let rendered = render(scout, client, session.jar.clone(), req, true).await?;
     let png = rendered.png.unwrap_or_default();
     if png.len() > max {
         return Err(ScoutError::invalid("Screenshot exceeds the response size limit")
@@ -358,7 +434,8 @@ pub async fn png_bytes(
     req: Render,
 ) -> Result<(Vec<u8>, u32, u32)> {
     let session = scout.sessions.get(owner, session_id)?;
-    let rendered = render(scout, session.jar.clone(), req, true).await?;
+    let client = scout.session_client(&session)?;
+    let rendered = render(scout, client, session.jar.clone(), req, true).await?;
     Ok((rendered.png.unwrap_or_default(), rendered.width, rendered.height))
 }
 
@@ -376,8 +453,9 @@ mod tests {
 
     #[test]
     fn data_uris_are_inline() {
-        assert_eq!(inline_data("data:text/css,body{}").unwrap(), b"body{}".to_vec());
-        assert_eq!(inline_data("data:text/css;base64,YSB7fQ==").unwrap(), b"a {}".to_vec());
-        assert!(inline_data("https://example.com/a.css").is_none());
+        assert_eq!(inline_data("data:text/css,body{}", 1024).unwrap(), b"body{}".to_vec());
+        assert_eq!(inline_data("data:text/css;base64,YSB7fQ==", 1024).unwrap(), b"a {}".to_vec());
+        assert!(inline_data("data:text/css,body{}", 2).is_none());
+        assert!(inline_data("https://example.com/a.css", 1024).is_none());
     }
 }

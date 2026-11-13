@@ -96,23 +96,31 @@ impl LayoutTree {
 
 // ---------------------------------------------------------------- lengths
 
-/// The viewport the current layout is being solved in. `vw`/`vh` need it, and
-/// threading a viewport through every length resolution would touch every call
-/// site for one rarely-used unit family.
-static VIEWPORT: std::sync::OnceLock<std::sync::Mutex<(f32, f32)>> = std::sync::OnceLock::new();
+// The viewport the current layout is being solved in. `vw`/`vh` need it, and
+// threading a viewport through every length resolution would touch every call
+// site for one rarely-used unit family.
+thread_local! {
+    /// The viewport the current layout is being solved in. Kept per-thread so
+    /// concurrent server renders with different viewports never race on `vw`/`vh`.
+    static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((800.0, 600.0)) };
+}
 
 fn viewport_size() -> (f32, f32) {
-    VIEWPORT
-        .get_or_init(|| std::sync::Mutex::new((800.0, 600.0)))
-        .lock()
-        .map(|v| *v)
-        .unwrap_or((800.0, 600.0))
+    VIEWPORT.with(|v| v.get())
 }
 
 /// Set the viewport for viewport-relative units. Called once per layout.
 pub fn set_viewport(width: f32, height: f32) {
-    if let Ok(mut v) = VIEWPORT.get_or_init(|| std::sync::Mutex::new((800.0, 600.0))).lock() {
-        *v = (width, height);
+    VIEWPORT.with(|v| v.set((width, height)));
+}
+
+fn width_key(cb_width: f32) -> u32 {
+    if !cb_width.is_finite() || cb_width >= 1_000_000.0 {
+        u32::MAX
+    } else if cb_width <= 0.0 {
+        0
+    } else {
+        (cb_width * 4.0).round() as u32
     }
 }
 
@@ -180,6 +188,10 @@ pub(crate) struct Ctx<'a> {
     positioned_ancestor: Option<NodeId>,
     /// `img` intrinsic sizes, read once per node.
     image_sizes: HashMap<NodeId, Option<(f32, f32)>>,
+    /// Memoised measurements to prevent exponential blowup on nested flex/table containers.
+    measure_cache: HashMap<(NodeId, u32), (f32, f32)>,
+    max_content_cache: HashMap<(NodeId, u32), f32>,
+    min_content_cache: HashMap<(NodeId, u32), f32>,
 }
 
 static FALLBACK_STYLE: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
@@ -205,6 +217,9 @@ pub fn layout(
         absolutes: Vec::new(),
         positioned_ancestor: None,
         image_sizes: HashMap::new(),
+        measure_cache: HashMap::new(),
+        max_content_cache: HashMap::new(),
+        min_content_cache: HashMap::new(),
     };
 
     let root = match doc.elements().into_iter().next() {
@@ -941,12 +956,17 @@ impl<'a> Ctx<'a> {
 
     /// Lay a box out into a throwaway tree to learn its size.
     pub(crate) fn measure_box(&mut self, id: NodeId, cb_width: f32) -> (f32, f32) {
+        let key = (id, width_key(cb_width));
+        if let Some(hit) = self.measure_cache.get(&key) {
+            return *hit;
+        }
         let saved = std::mem::take(&mut self.out);
         let saved_floats = std::mem::take(&mut self.floats);
         // A measurement must not leak the geometry a flex or table pass handed
         // its children: a stale `forced` entry would make the next measurement
         // of that box report the size it had last time instead of its content.
         let saved_forced = std::mem::take(&mut self.forced);
+        let saved_absolutes = std::mem::take(&mut self.absolutes);
         let depth = self.depth;
         let added = self.shrink_fit.insert(id);
         let block = self.layout_block(id, 0.0, cb_width, 0.0, 0.0, true);
@@ -956,8 +976,11 @@ impl<'a> Ctx<'a> {
         self.out = saved;
         self.floats = saved_floats;
         self.forced = saved_forced;
+        self.absolutes = saved_absolutes;
         self.depth = depth;
-        (block.rect.width, block.rect.height)
+        let out = (block.rect.width, block.rect.height);
+        self.measure_cache.insert(key, out);
+        out
     }
 
     /// The width a table's columns need. Maximum: the widest row, cells side by
@@ -1088,6 +1111,10 @@ impl<'a> Ctx<'a> {
     /// horizontal padding and borders. Text measurement is the engine's own, so a
     /// shrink-to-fit box is as wide as its line, not as wide as its container.
     pub(crate) fn max_content_width(&mut self, id: NodeId, cb_width: f32) -> f32 {
+        let key = (id, width_key(cb_width));
+        if let Some(hit) = self.max_content_cache.get(&key) {
+            return *hit;
+        }
         let style = self.style(id).clone();
         let fs = style.font_size;
         let root = self.root_font_size;
@@ -1099,10 +1126,14 @@ impl<'a> Ctx<'a> {
         // what makes a nav bar hug its links instead of collapsing to the widest
         // one, and it is how the container gets a sensible `flex-basis`.
         if let Some(intrinsic) = self.flex_intrinsic_width(id, &style, cb_width, true) {
-            return intrinsic + own;
+            let res = intrinsic + own;
+            self.max_content_cache.insert(key, res);
+            return res;
         }
         if let Some(intrinsic) = self.table_intrinsic_width(id, &style, cb_width, true) {
-            return intrinsic + own;
+            let res = intrinsic + own;
+            self.max_content_cache.insert(key, res);
+            return res;
         }
 
         let mut widest: f32 = 0.0;
@@ -1154,22 +1185,32 @@ impl<'a> Ctx<'a> {
                 _ => {}
             }
         }
-        widest.max(run).max(0.0) + own
+        let res = widest.max(run).max(0.0) + own;
+        self.max_content_cache.insert(key, res);
+        res
     }
 
     /// The narrowest this box can be before a word has to overflow: the widest
     /// unbreakable run of text, plus its own horizontal padding and borders.
     pub(crate) fn min_content_width(&mut self, id: NodeId, cb_width: f32) -> f32 {
+        let key = (id, width_key(cb_width));
+        if let Some(hit) = self.min_content_cache.get(&key) {
+            return *hit;
+        }
         let style = self.style(id).clone();
         let fs = style.font_size;
         let root = self.root_font_size;
         let padding = resolve_edges(style.padding, fs, root, cb_width);
         let border = style.border_width;
         if let Some(intrinsic) = self.flex_intrinsic_width(id, &style, cb_width, false) {
-            return intrinsic + padding.left + padding.right + border.left + border.right;
+            let res = intrinsic + padding.left + padding.right + border.left + border.right;
+            self.min_content_cache.insert(key, res);
+            return res;
         }
         if let Some(intrinsic) = self.table_intrinsic_width(id, &style, cb_width, false) {
-            return intrinsic + padding.left + padding.right + border.left + border.right;
+            let res = intrinsic + padding.left + padding.right + border.left + border.right;
+            self.min_content_cache.insert(key, res);
+            return res;
         }
         let mut widest: f32 = 0.0;
         let mut run: f32 = 0.0;
@@ -1209,7 +1250,9 @@ impl<'a> Ctx<'a> {
                 _ => {}
             }
         }
-        widest.max(run) + padding.left + padding.right + border.left + border.right
+        let res = widest.max(run) + padding.left + padding.right + border.left + border.right;
+        self.min_content_cache.insert(key, res);
+        res
     }
 
     fn word_width(&mut self, word: &str, style: &Style) -> f32 {

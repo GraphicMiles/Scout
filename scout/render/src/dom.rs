@@ -72,6 +72,9 @@ pub struct Document {
 }
 
 impl Document {
+    pub const MAX_DOM_DEPTH: usize = 256;
+    pub const MAX_DOM_NODES: usize = 150_000;
+
     pub fn parse(html: &str) -> Document {
         let dom = parse_document(RcDom::default(), Default::default())
             .from_utf8()
@@ -84,13 +87,48 @@ impl Document {
             stylesheets: Vec::new(),
             linked_stylesheets: Vec::new(),
         };
-        let root = doc.import(&dom.document, None);
+        let root = doc.import_iterative(&dom.document);
         doc.root = root;
         doc.collect_stylesheets();
+
+        // Dismantle RcDom iteratively before `dom` drops so pathological
+        // 10,000-deep markup cannot overflow the thread stack in Rc::drop.
+        let mut teardown = vec![dom.document.clone()];
+        while let Some(node) = teardown.pop() {
+            let mut kids = node.children.borrow_mut();
+            teardown.extend(kids.drain(..));
+            let _ = node.parent.take();
+        }
         doc
     }
 
-    fn import(&mut self, handle: &Handle, parent: Option<NodeId>) -> NodeId {
+    fn import_iterative(&mut self, root_handle: &Handle) -> NodeId {
+        let root_id = self.push_handle(root_handle, None);
+        let mut stack: Vec<(NodeId, Handle, usize)> = vec![(root_id, root_handle.clone(), 0)];
+        while let Some((parent_id, handle, depth)) = stack.pop() {
+            if depth >= Self::MAX_DOM_DEPTH {
+                continue;
+            }
+            let kids: Vec<Handle> = handle.children.borrow().clone();
+            let mut child_ids = Vec::with_capacity(kids.len());
+            for child in kids {
+                if self.nodes.len() >= Self::MAX_DOM_NODES {
+                    break;
+                }
+                let cid = self.push_handle(&child, Some(parent_id));
+                child_ids.push((cid, child));
+            }
+            for (cid, _) in &child_ids {
+                self.nodes[parent_id].children.push(*cid);
+            }
+            for (cid, child) in child_ids.into_iter().rev() {
+                stack.push((cid, child, depth + 1));
+            }
+        }
+        root_id
+    }
+
+    fn push_handle(&mut self, handle: &Handle, parent: Option<NodeId>) -> NodeId {
         let (kind, name, attrs, text) = match &handle.data {
             NodeData::Document => (Kind::Document, "#document".to_string(), Vec::new(), String::new()),
             NodeData::Doctype { .. } => (Kind::Comment, "#doctype".to_string(), Vec::new(), String::new()),
@@ -123,12 +161,6 @@ impl Document {
             parent,
             children: Vec::new(),
         });
-
-        let kids: Vec<Handle> = handle.children.borrow().clone();
-        for child in kids {
-            let child_id = self.import(&child, Some(id));
-            self.nodes[id].children.push(child_id);
-        }
         id
     }
 
