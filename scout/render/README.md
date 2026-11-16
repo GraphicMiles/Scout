@@ -32,7 +32,7 @@ let canvas = scout_render::paint::paint(&doc, &styles, &tree, &mut fonts, Defaul
 ```
 
 `render_with` takes a `ResourceLoader` and returns the assets it could not load,
-so an embedder supplies its own fetching policy — Scout routes stylesheets,
+so an embedder supplies its own fetching policy - Scout routes stylesheets,
 images and fonts through its guarded fetcher and its cookie jar.
 
 ## What it draws
@@ -46,7 +46,7 @@ does.
 
 Not drawn: canvas, video, WebGL, filters and 3D transforms. `display: grid` is
 not laid out as a grid: its children become blocks in document order. Stripe,
-with 105 grid containers, shows the cost — 3% of its boxes land within 2 px of
+with 105 grid containers, shows the cost - 3% of its boxes land within 2 px of
 Chromium's, against 12.2% across the benchmark as a whole.
 
 ## Measured

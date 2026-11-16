@@ -28,7 +28,7 @@ back. Scout keeps the useful part of a browser and drops the rest.
   actually for.
 - **Call it over HTTP** with a bearer key, so a service can use it from any
   language.
-- **Lay a page out and screenshot it** — boxes, computed styles and a PNG, with
+- **Lay a page out and screenshot it** - boxes, computed styles and a PNG, with
   no browser involved.
 - **Run it on a small machine.** One binary, no browser download; 5.8 MB without
   the renderer, 7.9 MB with it.
@@ -84,7 +84,7 @@ fixture gate, where Chromium's own screenshots are the reference, the median is
 
 It draws block, inline, flex and table layout, the CSS 2.1 box model, floats,
 positioning, gradients, shadows, background images, SVG, `@font-face`, and text
-shaped by HarfBuzz — Latin, Arabic, Hebrew, Devanagari and CJK. Memory stays
+shaped by HarfBuzz - Latin, Arabic, Hebrew, Devanagari and CJK. Memory stays
 flat: laying out example.com peaks at 7 MB of RSS and a 1280×800 screenshot at
 15 MB; a 23,000-pixel-tall Stripe page costs 14 MB to lay out and 23 MB to
 screenshot, and Wikipedia's front page, the heaviest in the benchmark, 45 and
